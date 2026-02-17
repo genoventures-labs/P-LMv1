@@ -70,6 +70,13 @@ It leverages the JIT model router to ensure optimal models are available.`,
 		}
 		return cmd.Help()
 	},
+	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		path := strings.ToLower(strings.TrimSpace(cmd.CommandPath()))
+		if strings.Contains(path, " update") || strings.HasSuffix(path, " version") {
+			return
+		}
+		maybeAutoUpdate()
+	},
 }
 
 func Execute() {
