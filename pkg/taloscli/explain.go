@@ -272,6 +272,27 @@ var capabilityDocs = []capabilityDoc{
 		Related: []string{"explain", "doctor"},
 	},
 	{
+		Name:    "benchmark",
+		Summary: "Runs model benchmark profiles and full recommendation orchestration.",
+		Usage: []string{
+			"talos benchmark run",
+			"talos benchmark toolcall",
+			"talos benchmark cognition",
+			"talos benchmark full",
+			"talos benchmark load --model llama3.2:latest --concurrency 4",
+		},
+		Abilities: []string{
+			"Benchmarks standard, chat, json, codegen, tool-call, and cognition profiles.",
+			"Runs full orchestration to produce ranking scores and recommended model list.",
+			"Supports load testing for one model with configurable concurrency.",
+		},
+		Examples: []string{
+			"talos benchmark full",
+			"talos benchmark toolcall",
+		},
+		Related: []string{"doctor", "research"},
+	},
+	{
 		Name:    "documentary",
 		Summary: "Runs documentary provisioning and daemon workflows.",
 		Usage: []string{

@@ -54,6 +54,7 @@ var rootCmd = &cobra.Command{
 It leverages the JIT model router to ensure optimal models are available.`,
 	Example: `  talos chat "Summarize latest telemetry"
   talos research run "What changed in X this week?"
+  talos benchmark full
   talos pipeline "research run 'What changed in X this week?' ; learn --from-research latest"
   talos "research run 'What changed in X this week?' ; learn --from-research latest"
   talos learn "Store this project note"

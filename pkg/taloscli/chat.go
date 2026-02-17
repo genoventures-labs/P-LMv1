@@ -282,6 +282,9 @@ func applyIntentCorrectionWithTimeout(raw string, sm *state.Manager, mm *memory.
 	if raw == "" {
 		return raw, ""
 	}
+	if isTrivialPrompt(raw) {
+		return raw, ""
+	}
 	timeout := durationFromEnv("PLM_INTENT_CORRECTION_TIMEOUT", 4*time.Second)
 	type result struct {
 		normalized    string
@@ -299,6 +302,22 @@ func applyIntentCorrectionWithTimeout(raw string, sm *state.Manager, mm *memory.
 		fmt.Printf("DEBUG: Intent correction timed out after %s; continuing with raw prompt.\n", timeout)
 		return raw, ""
 	}
+}
+
+func isTrivialPrompt(raw string) bool {
+	r := strings.TrimSpace(raw)
+	if len(r) > 24 || strings.Contains(r, "\n") {
+		return false
+	}
+	if len(strings.Fields(r)) > 3 {
+		return false
+	}
+	for _, marker := range []string{" and ", " then ", "because", "why", "compare", "analyze", "research"} {
+		if strings.Contains(strings.ToLower(r), marker) {
+			return false
+		}
+	}
+	return true
 }
 
 func buildIntentMissionContext(mm *memory.MemoryManager, raw string) state.MissionPlan {
@@ -415,7 +434,7 @@ const (
 )
 
 var (
-	llmFirstTokenTimeout = durationFromEnv("PLM_LLM_FIRST_TOKEN_TIMEOUT", 20*time.Second)
+	llmFirstTokenTimeout = durationFromEnv("PLM_LLM_FIRST_TOKEN_TIMEOUT", 10*time.Second)
 	llmChatTimeout       = durationFromEnv("PLM_LLM_CHAT_TIMEOUT", 120*time.Second)
 	totTimeout           = durationFromEnv("PLM_TOT_TIMEOUT", 45*time.Second)
 	mctsTimeout          = durationFromEnv("PLM_MCTS_TIMEOUT", 35*time.Second)
@@ -2894,6 +2913,7 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 
 	var sawFirstToken atomic.Bool
 	var firstTokenTimedOut atomic.Bool
+	var waitStopOnce sync.Once
 	firstTokenTimer := time.AfterFunc(llmFirstTokenTimeout, func() {
 		if !sawFirstToken.Load() {
 			firstTokenTimedOut.Store(true)
@@ -2902,6 +2922,9 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 	})
 	defer firstTokenTimer.Stop()
 	waitDone := make(chan struct{})
+	stopWaitLoop := func() {
+		waitStopOnce.Do(func() { close(waitDone) })
+	}
 	if depth == 0 {
 		go func() {
 			t := time.NewTicker(5 * time.Second)
@@ -2919,7 +2942,7 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 			}
 		}()
 	}
-	defer close(waitDone)
+	defer stopWaitLoop()
 
 	err := client.Chat(ctx, req, func(resp api.ChatResponse) error {
 		if !sawFirstToken.Load() {
@@ -2943,6 +2966,7 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 			} else {
 				fmt.Printf("DEBUG: Model %s timed out after %s. Falling back to %s.\n", modelName, llmChatTimeout, nextModel)
 			}
+			stopWaitLoop()
 			return performChatWithTools(client, mm, tc, resolvedCandidates, modelIndex+1, taskQuery, messages, history, depth, sm)
 		}
 		if depth > 0 && (isTotalTimeout || isFirstTokenTimeout || isTransient) {
@@ -3059,6 +3083,29 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 		}
 
 		fmt.Printf("DEBUG: Requesting next step/final answer with %d total messages...\n", len(messages))
+		return performChatWithTools(client, mm, tc, modelCandidates, modelIndex, taskQuery, messages, history, depth+1, sm)
+	}
+	if hasToolCalls && tc == nil {
+		if depth >= 2 {
+			msg := "Tool calls were requested, but tool client is unavailable in this session. Set GLM_API_KEY and GLM_CLIENT_ID or ask for a no-tools answer."
+			fmt.Println(msg)
+			if err := mm.AddMessage("assistant", msg); err != nil {
+				fmt.Printf("Warning: Error adding assistant message to memory: %v\n", err)
+			}
+			if history != nil {
+				*history = append(*history, api.Message{Role: "assistant", Content: msg})
+			}
+			return nil
+		}
+		fmt.Println("DEBUG: Tool calls requested but tool client unavailable; requesting direct answer without tools.")
+		messages = append(messages,
+			api.Message{Role: "assistant", Content: fullResponse},
+			api.Message{Role: "user", Content: "Tools are unavailable in this session. Do not emit tool calls. Provide a direct final answer now."},
+		)
+		if history != nil {
+			*history = append(*history, api.Message{Role: "assistant", Content: fullResponse})
+			*history = append(*history, api.Message{Role: "user", Content: "Tools are unavailable in this session. Do not emit tool calls. Provide a direct final answer now."})
+		}
 		return performChatWithTools(client, mm, tc, modelCandidates, modelIndex, taskQuery, messages, history, depth+1, sm)
 	}
 
@@ -4058,6 +4105,7 @@ func parseToolCalls(fullResponse string) ([]toolInvocation, bool) {
 	if trimmed == "" {
 		return nil, false
 	}
+	lowerTrimmed := strings.ToLower(trimmed)
 
 	var directCall toolInvocation
 	if err := json.Unmarshal([]byte(trimmed), &directCall); err == nil {
@@ -4097,6 +4145,18 @@ func parseToolCalls(fullResponse string) ([]toolInvocation, bool) {
 						return calls, true
 					}
 				}
+			}
+		}
+	}
+
+	// Handle markdown-like tool call wrappers:
+	// ### Tool Call: web_search
+	// {"tool":"web_search","args":{"query":"..."}}
+	if strings.Contains(lowerTrimmed, "tool call") {
+		jsonBlockRE := regexp.MustCompile(`(?s)\{.*\}`)
+		if block := strings.TrimSpace(jsonBlockRE.FindString(trimmed)); block != "" {
+			if calls, ok := parseToolCalls(block); ok {
+				return calls, true
 			}
 		}
 	}
