@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,9 +18,9 @@ import (
 )
 
 const (
-	embeddingModelName       = "nomic-embed-text:latest"
-	collectionName           = "conversation_history"
-	knowledgeCollection      = "knowledge_base"
+	defaultEmbeddingModel    = "nomic-embed-text:latest"
+	collectionNameBase       = "conversation_history"
+	knowledgeCollectionBase  = "knowledge_base"
 	ollamaAPIHostEnv         = "OLLAMA_HOST"
 	defaultBaseImportance    = 0.5
 	defaultFreshnessHalfLife = 24 * time.Hour
@@ -70,14 +71,34 @@ func NewMemoryManager() (*MemoryManager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Ollama client for embeddings: %w", err)
 	}
+	embeddingModel, err := resolveEmbeddingModel(client)
+	if err != nil {
+		return nil, err
+	}
+	var embedMu sync.Mutex
 
 	// Create custom embedding function
 	ef := func(ctx context.Context, text string) ([]float32, error) {
+		embedMu.Lock()
+		model := embeddingModel
+		embedMu.Unlock()
 		req := &api.EmbeddingRequest{
-			Model:  embeddingModelName,
+			Model:  model,
 			Prompt: text,
 		}
 		resp, err := client.Embeddings(ctx, req)
+		if err != nil {
+			// Model can disappear when VPS rotates tags; re-resolve once and retry.
+			if strings.Contains(strings.ToLower(err.Error()), "not found") {
+				if replacement, resolveErr := resolveEmbeddingModel(client); resolveErr == nil && replacement != "" && replacement != model {
+					embedMu.Lock()
+					embeddingModel = replacement
+					embedMu.Unlock()
+					req.Model = replacement
+					resp, err = client.Embeddings(ctx, req)
+				}
+			}
+		}
 		if err != nil {
 			return nil, fmt.Errorf("ollama embedding error: %w", err)
 		}
@@ -93,6 +114,9 @@ func NewMemoryManager() (*MemoryManager, error) {
 		return res, nil
 	}
 
+	historyCollectionName := collectionNameForModel(collectionNameBase, embeddingModel)
+	knowledgeCollectionName := collectionNameForModel(knowledgeCollectionBase, embeddingModel)
+
 	// Initialize chromem-go database with persistence
 	db, err := chromem.NewPersistentDB(".memory", true)
 	if err != nil {
@@ -100,13 +124,13 @@ func NewMemoryManager() (*MemoryManager, error) {
 	}
 
 	// Create or get collection for conversation history
-	hCol, err := db.GetOrCreateCollection(collectionName, nil, ef)
+	hCol, err := db.GetOrCreateCollection(historyCollectionName, nil, ef)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get or create history collection: %w", err)
 	}
 
 	// Create or get collection for general knowledge
-	kCol, err := db.GetOrCreateCollection(knowledgeCollection, nil, ef)
+	kCol, err := db.GetOrCreateCollection(knowledgeCollectionName, nil, ef)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get or create knowledge collection: %w", err)
 	}
@@ -118,6 +142,90 @@ func NewMemoryManager() (*MemoryManager, error) {
 		client:              client,
 		activeNamespace:     "",
 	}, nil
+}
+
+func resolveEmbeddingModel(client *api.Client) (string, error) {
+	if v := strings.TrimSpace(firstNonEmptyEnv("TALOS_EMBED_MODEL", "EMBEDDING_MODEL")); v != "" {
+		return v, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	listResp, err := client.List(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed listing ollama models for embedding resolution: %w", err)
+	}
+	if len(listResp.Models) == 0 {
+		return "", fmt.Errorf("no Ollama models available for embedding resolution")
+	}
+
+	candidates := make([]string, 0, len(listResp.Models)+1)
+	seen := make(map[string]bool)
+	add := func(m string) {
+		m = strings.TrimSpace(m)
+		if m == "" || seen[m] {
+			return
+		}
+		seen[m] = true
+		candidates = append(candidates, m)
+	}
+	add(defaultEmbeddingModel)
+	for _, m := range listResp.Models {
+		add(m.Name)
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return embeddingCandidateScore(candidates[i]) > embeddingCandidateScore(candidates[j])
+	})
+
+	for _, model := range candidates {
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), 6*time.Second)
+		resp, probeErr := client.Embeddings(probeCtx, &api.EmbeddingRequest{
+			Model:  model,
+			Prompt: "embedding-healthcheck",
+		})
+		probeCancel()
+		if probeErr == nil && len(resp.Embedding) > 0 {
+			return model, nil
+		}
+	}
+	return "", fmt.Errorf("no embedding-capable model resolved from current Ollama tags; set TALOS_EMBED_MODEL explicitly")
+}
+
+func embeddingCandidateScore(model string) int {
+	m := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case m == "nomic-embed-text:latest":
+		return 100
+	case strings.Contains(m, "embed"):
+		return 90
+	case strings.Contains(m, "embedding"):
+		return 80
+	case strings.Contains(m, "bge"), strings.Contains(m, "e5"), strings.Contains(m, "minilm"):
+		return 70
+	default:
+		return 10
+	}
+}
+
+func firstNonEmptyEnv(keys ...string) string {
+	for _, k := range keys {
+		v := strings.TrimSpace(os.Getenv(k))
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func collectionNameForModel(base, model string) string {
+	model = strings.ToLower(strings.TrimSpace(model))
+	model = strings.ReplaceAll(model, ":", "_")
+	model = strings.ReplaceAll(model, "/", "_")
+	model = strings.ReplaceAll(model, "-", "_")
+	if model == "" {
+		model = "default"
+	}
+	return base + "__" + model
 }
 
 // SetActiveNamespace scopes all Add/Retrieve operations to a namespace.

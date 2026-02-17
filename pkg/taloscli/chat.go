@@ -572,6 +572,9 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 		Models: r.Models,
 	})
 	modelCandidates := buildModelCandidates(r.Models, modelName)
+	if isTrivialPrompt(input) {
+		modelCandidates = prioritizeLowLatencyModels(modelCandidates)
+	}
 	if len(modelCandidates) == 0 {
 		return fmt.Errorf("no candidate models available")
 	}
@@ -4088,6 +4091,39 @@ func isChatCapableModelCandidate(model string) bool {
 		}
 	}
 	return true
+}
+
+func prioritizeLowLatencyModels(models []string) []string {
+	if len(models) < 2 {
+		return models
+	}
+	out := append([]string(nil), models...)
+	sort.SliceStable(out, func(i, j int) bool {
+		return latencyModelScore(out[i]) > latencyModelScore(out[j])
+	})
+	return out
+}
+
+func latencyModelScore(model string) int {
+	m := strings.ToLower(strings.TrimSpace(model))
+	score := 0
+	if strings.Contains(m, "1b") {
+		score += 40
+	} else if strings.Contains(m, "2b") || strings.Contains(m, "3b") {
+		score += 30
+	} else if strings.Contains(m, "4b") || strings.Contains(m, "7b") {
+		score += 20
+	}
+	if strings.Contains(m, "mini") || strings.Contains(m, "small") {
+		score += 10
+	}
+	if strings.Contains(m, "r1") || strings.Contains(m, "70b") {
+		score -= 20
+	}
+	if strings.Contains(m, ":latest") {
+		score += 2
+	}
+	return score
 }
 
 func limitModelCandidates(models []string, maxCount int) []string {
