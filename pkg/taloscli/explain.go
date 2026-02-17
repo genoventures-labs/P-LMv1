@@ -43,11 +43,16 @@ var capabilityDocs = []capabilityDoc{
 		Usage: []string{
 			"talos chat",
 			"talos chat <prompt>",
+			"talos chat --cognition auto|minimal|balanced|deep <prompt>",
+			"talos chat --timeout-profile quick|normal|deep <prompt>",
+			"talos chat --warmup=false <prompt>",
 		},
 		Abilities: []string{
 			"Runs interactive REPL when no prompt is supplied.",
 			"Sends a single prompt and exits when prompt args are supplied.",
 			"Uses routing, memory, and tool orchestration during response generation.",
+			"Supports cognition budgeting to avoid heavy reasoning on simple prompts.",
+			"Supports latency profiles and warmup behavior for chat responsiveness.",
 		},
 		Examples: []string{
 			`talos chat "Draft a release note from recent commits"`,
@@ -107,16 +112,24 @@ var capabilityDocs = []capabilityDoc{
 		Summary: "Runs an extended planner-researcher-verifier-synthesizer flow.",
 		Usage: []string{
 			"talos multi-agent <query>",
+			"talos multi-agent <query> --mode planning",
+			"talos multi-agent <query> --agents planner,researcher,verifier,synthesizer",
+			"talos multi-agent <query> --agents all --parallel",
 		},
 		Abilities: []string{
 			"Executes staged multi-agent analysis.",
 			"Performs source extraction and verification passes.",
 			"Returns synthesized output after arbitration.",
+			"Supports planner-only mode for initial task decomposition.",
+			"Supports targeted sub-agent execution in any requested order.",
+			"Supports parallel execution when explicit agent selection is provided.",
 		},
 		Examples: []string{
 			`talos multi-agent "What changed in dependency policy this week?"`,
+			`talos multi-agent "Prepare migration sequence" --mode planning`,
+			`talos multi-agent "Review architecture changes" --agents researcher,verifier,synthesizer`,
 		},
-		Related: []string{"chat", "doctor"},
+		Related: []string{"chat", "research", "doctor"},
 	},
 	{
 		Name:    "skills",
@@ -270,6 +283,63 @@ var capabilityDocs = []capabilityDoc{
 			"talos about",
 		},
 		Related: []string{"explain", "doctor"},
+	},
+	{
+		Name:    "version",
+		Summary: "Displays TALOS build and runtime version metadata.",
+		Usage: []string{
+			"talos version",
+		},
+		Abilities: []string{
+			"Prints semantic version, commit, and build date metadata.",
+			"Prints runtime target information (OS/architecture).",
+		},
+		Examples: []string{
+			"talos version",
+		},
+		Related: []string{"update", "doctor"},
+	},
+	{
+		Name:    "completion",
+		Summary: "Generates shell completion scripts for TALOS commands and flags.",
+		Usage: []string{
+			"talos completion bash",
+			"talos completion zsh",
+			"talos completion fish",
+			"talos completion powershell",
+		},
+		Abilities: []string{
+			"Outputs shell-specific completion scripts to stdout.",
+			"Supports Bash, Zsh, Fish, and PowerShell completions.",
+			"Improves operator speed and reduces command/flag typing errors.",
+		},
+		Examples: []string{
+			"talos completion bash > ~/.local/share/bash-completion/completions/talos",
+			"talos completion zsh > ~/.zfunc/_talos",
+		},
+		Related: []string{"monitor", "version", "update"},
+		Aliases: []string{"completions", "shell completion"},
+	},
+	{
+		Name:    "update",
+		Summary: "Checks for updates and applies new TALOS versions.",
+		Usage: []string{
+			"talos update check",
+			"talos update apply",
+			"talos update auto --enable --interval 24h",
+			"talos update auto --apply",
+		},
+		Abilities: []string{
+			"Checks current installed TALOS version against latest module version.",
+			"Applies updates through the Go install path.",
+			"Configures periodic auto-update checks with optional auto-apply.",
+			"Persists auto-update preferences and last-check metadata in local runtime state.",
+		},
+		Examples: []string{
+			"talos update check",
+			"talos update auto --enable --interval 24h",
+		},
+		Related: []string{"version", "doctor", "monitor"},
 	},
 	{
 		Name:    "benchmark",

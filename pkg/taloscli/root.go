@@ -53,8 +53,14 @@ var rootCmd = &cobra.Command{
 	Long: `talos is a CLI tool to interact with your personal LLM hosted on an Ollama VPS.
 It leverages the JIT model router to ensure optimal models are available.`,
 	Example: `  talos chat "Summarize latest telemetry"
+  talos chat --cognition minimal --timeout-profile quick "Online?"
   talos research run "What changed in X this week?"
   talos benchmark full
+  talos multi-agent "Design a rollout plan" --mode planning
+  talos multi-agent "Analyze release risk" --agents planner,researcher,verifier,synthesizer
+  talos version
+  talos update check
+  talos completion bash > ~/.local/share/bash-completion/completions/talos
   talos pipeline "research run 'What changed in X this week?' ; learn --from-research latest"
   talos "research run 'What changed in X this week?' ; learn --from-research latest"
   talos learn "Store this project note"
