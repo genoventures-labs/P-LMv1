@@ -1,0 +1,739 @@
+package rag
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Thynaptic/P-LMv1/pkg/memory"
+)
+
+const (
+	defaultRemoteTimeout    = 20 * time.Second
+	defaultRemoteMaxBytes   = int64(10 * 1024 * 1024)
+	defaultCrawlDepth       = 1
+	defaultMaxPages         = 200
+	defaultRateLimitPerSec  = 2.0
+	defaultHFDatasetAPIBase = "https://datasets-server.huggingface.co"
+)
+
+var (
+	htmlTagRE   = regexp.MustCompile(`(?s)<[^>]+>`)
+	htmlSpaceRE = regexp.MustCompile(`\s+`)
+	hrefRE      = regexp.MustCompile(`(?is)href\s*=\s*["']([^"'#]+)["']`)
+	hostLabelRE = regexp.MustCompile(`^[a-z0-9-]{1,63}$`)
+)
+
+type RemoteIndexOptions struct {
+	MaxChunkChars       int
+	ChunkOverlap        int
+	Timeout             time.Duration
+	MaxBytes            int64
+	Crawl               bool
+	CrawlDepth          int
+	MaxPages            int
+	RateLimitPerSec     float64
+	AllowedDomains      map[string]bool
+	UserAgent           string
+	AuthHeader          string
+	HFToken             string
+	HFAPIBaseURL        string
+	URLSafetyEnabled    bool
+	URLSafetyTimeout    time.Duration
+	URLSafetyCacheTTL   time.Duration
+	URLSafetyVisibility string
+	URLSafetyFailOpen   bool
+	URLSafetyAPIKey     string
+	URLSafetyBaseURL    string
+	OnEvent             func(RemoteEvent)
+	HTTPClient          *http.Client
+}
+
+type RemoteIndexStats struct {
+	ItemsFetched       int
+	ItemsIndexed       int
+	ChunksIndexed      int
+	BytesFetched       int64
+	PreflightFailures  int
+	SafetyBlocked      int
+	SafetyErrors       int
+	SafetyCacheHits    int
+	SafetyCacheMisses  int
+	SkippedDuplicate   int
+	SkippedDomain      int
+	SkippedUnsupported int
+	ParseErrors        int
+	HTTPErrors         int
+	IndexErrors        int
+}
+
+type RemoteEvent struct {
+	Source       string
+	Outcome      string
+	Detail       string
+	ItemsFetched int
+	ItemsIndexed int
+}
+
+type HFSpec struct {
+	DatasetID  string
+	Config     string
+	Split      string
+	MaxRecords int
+}
+
+func DefaultRemoteIndexOptions() RemoteIndexOptions {
+	return RemoteIndexOptions{
+		MaxChunkChars:       DefaultIndexOptions().MaxChunkChars,
+		ChunkOverlap:        DefaultIndexOptions().ChunkOverlap,
+		Timeout:             defaultRemoteTimeout,
+		MaxBytes:            defaultRemoteMaxBytes,
+		CrawlDepth:          defaultCrawlDepth,
+		MaxPages:            defaultMaxPages,
+		RateLimitPerSec:     defaultRateLimitPerSec,
+		UserAgent:           "talos/1.0 (+https://thynaptic.com)",
+		HFAPIBaseURL:        defaultHFDatasetAPIBase,
+		URLSafetyEnabled:    true,
+		URLSafetyTimeout:    45 * time.Second,
+		URLSafetyCacheTTL:   24 * time.Hour,
+		URLSafetyVisibility: "private",
+		URLSafetyFailOpen:   false,
+		URLSafetyBaseURL:    defaultURLSafetyBaseURL,
+	}
+}
+
+func IndexURLs(mm *memory.MemoryManager, seedURLs []string, opts RemoteIndexOptions) (RemoteIndexStats, error) {
+	var stats RemoteIndexStats
+	if mm == nil {
+		return stats, fmt.Errorf("memory manager is required")
+	}
+	opts = normalizeRemoteOptions(opts)
+	client := opts.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: opts.Timeout}
+	}
+
+	type queueItem struct {
+		URL   string
+		Depth int
+	}
+	seedHosts := make(map[string]bool)
+	queue := make([]queueItem, 0, len(seedURLs))
+	seen := make(map[string]bool)
+	for _, raw := range seedURLs {
+		n, host, err := normalizeHTTPURL(raw)
+		if err != nil {
+			emitRemoteEvent(opts, RemoteEvent{Source: raw, Outcome: "invalid-url", Detail: err.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			continue
+		}
+		seedHosts[host] = true
+		if !seen[n] {
+			seen[n] = true
+			queue = append(queue, queueItem{URL: n, Depth: 0})
+		}
+	}
+	if len(queue) == 0 {
+		return stats, fmt.Errorf("no valid URLs to index")
+	}
+
+	var nextAllowed time.Time
+	hostOnlineCache := make(map[string]bool)
+	for len(queue) > 0 {
+		if stats.ItemsFetched >= opts.MaxPages {
+			break
+		}
+		item := queue[0]
+		queue = queue[1:]
+		host := hostFromURL(item.URL)
+		if !isDomainAllowed(host, seedHosts, opts.AllowedDomains, opts.Crawl) {
+			stats.SkippedDomain++
+			emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "skipped-domain", ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			continue
+		}
+		if online, ok := hostOnlineCache[host]; ok && !online {
+			stats.PreflightFailures++
+			emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "preflight-failed", Detail: "host previously marked offline", ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			continue
+		}
+		if _, ok := hostOnlineCache[host]; !ok {
+			if err := preflightURLReachable(client, item.URL, opts); err != nil {
+				hostOnlineCache[host] = false
+				stats.PreflightFailures++
+				emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "preflight-failed", Detail: err.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+				continue
+			}
+			hostOnlineCache[host] = true
+		}
+		if opts.URLSafetyEnabled {
+			v, cacheHit, safetyErr := CheckURLSafety(context.Background(), item.URL, URLSafetyOptions{
+				APIKey:     strings.TrimSpace(opts.URLSafetyAPIKey),
+				BaseURL:    strings.TrimSpace(opts.URLSafetyBaseURL),
+				Timeout:    opts.URLSafetyTimeout,
+				Visibility: opts.URLSafetyVisibility,
+				CacheTTL:   opts.URLSafetyCacheTTL,
+				FailOpen:   opts.URLSafetyFailOpen,
+			}, client)
+			if cacheHit {
+				stats.SafetyCacheHits++
+				emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "safety-cache-hit", Detail: v.Status, ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			} else {
+				stats.SafetyCacheMisses++
+				emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "safety-cache-miss", ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			}
+			if safetyErr != nil {
+				stats.SafetyErrors++
+				emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "safety-error", Detail: safetyErr.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+				if !opts.URLSafetyFailOpen {
+					continue
+				}
+			} else if !v.Allowed {
+				stats.SafetyBlocked++
+				emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "safety-blocked", Detail: v.Reason, ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+				continue
+			} else {
+				emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "safety-allowed", Detail: v.Reason, ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			}
+		}
+
+		waitForRateLimit(opts.RateLimitPerSec, &nextAllowed)
+
+		body, contentType, status, fetchErr := fetchURL(client, item.URL, opts)
+		if fetchErr != nil {
+			stats.HTTPErrors++
+			emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "http-error", Detail: fetchErr.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			continue
+		}
+		stats.ItemsFetched++
+		stats.BytesFetched += int64(len(body))
+		if status < 200 || status >= 300 {
+			stats.HTTPErrors++
+			emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "http-status", Detail: strconv.Itoa(status), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			continue
+		}
+
+		text, isHTML, parseErr := parseFetchedContent(item.URL, contentType, body)
+		if parseErr != nil {
+			stats.ParseErrors++
+			emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "parse-error", Detail: parseErr.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+		} else {
+			chunks := chunkText(normalizeText(text), opts.MaxChunkChars, opts.ChunkOverlap)
+			if len(chunks) == 0 {
+				stats.SkippedUnsupported++
+				emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "empty", ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			} else {
+				if err := addRemoteChunks(mm, chunks, map[string]string{
+					"type":         "knowledge",
+					"source_type":  "url",
+					"source_url":   item.URL,
+					"source_host":  host,
+					"content_type": contentType,
+					"crawl_depth":  strconv.Itoa(item.Depth),
+				}); err != nil {
+					stats.IndexErrors++
+					emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "index-error", Detail: err.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+				} else {
+					stats.ItemsIndexed++
+					stats.ChunksIndexed += len(chunks)
+					emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "indexed", Detail: fmt.Sprintf("%d chunks", len(chunks)), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+				}
+			}
+		}
+
+		if opts.Crawl && isHTML && item.Depth < opts.CrawlDepth {
+			links := extractLinks(item.URL, body)
+			for _, l := range links {
+				norm, linkHost, err := normalizeHTTPURL(l)
+				if err != nil {
+					continue
+				}
+				if !isDomainAllowed(linkHost, seedHosts, opts.AllowedDomains, opts.Crawl) {
+					continue
+				}
+				if seen[norm] {
+					stats.SkippedDuplicate++
+					continue
+				}
+				seen[norm] = true
+				queue = append(queue, queueItem{URL: norm, Depth: item.Depth + 1})
+			}
+		}
+	}
+
+	return stats, nil
+}
+
+func IndexHFDatasets(mm *memory.MemoryManager, specs []HFSpec, opts RemoteIndexOptions) (RemoteIndexStats, error) {
+	var stats RemoteIndexStats
+	if mm == nil {
+		return stats, fmt.Errorf("memory manager is required")
+	}
+	opts = normalizeRemoteOptions(opts)
+	client := opts.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: opts.Timeout}
+	}
+
+	base := strings.TrimRight(strings.TrimSpace(opts.HFAPIBaseURL), "/")
+	if base == "" {
+		base = defaultHFDatasetAPIBase
+	}
+
+	for _, spec := range specs {
+		ds := strings.TrimSpace(spec.DatasetID)
+		if ds == "" {
+			continue
+		}
+		split := strings.TrimSpace(spec.Split)
+		if split == "" {
+			split = "train"
+		}
+		maxRecords := spec.MaxRecords
+		if maxRecords <= 0 {
+			maxRecords = 100
+		}
+
+		endpoint := base + "/first-rows?dataset=" + url.QueryEscape(ds) + "&split=" + url.QueryEscape(split)
+		if cfg := strings.TrimSpace(spec.Config); cfg != "" {
+			endpoint += "&config=" + url.QueryEscape(cfg)
+		}
+
+		body, _, status, err := fetchURL(client, endpoint, RemoteIndexOptions{
+			MaxBytes:   opts.MaxBytes,
+			UserAgent:  opts.UserAgent,
+			AuthHeader: bearerHeader(opts.HFToken),
+		})
+		if err != nil {
+			stats.HTTPErrors++
+			emitRemoteEvent(opts, RemoteEvent{Source: ds, Outcome: "hf-http-error", Detail: err.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			continue
+		}
+		stats.ItemsFetched++
+		stats.BytesFetched += int64(len(body))
+		if status < 200 || status >= 300 {
+			stats.HTTPErrors++
+			emitRemoteEvent(opts, RemoteEvent{Source: ds, Outcome: "hf-http-status", Detail: strconv.Itoa(status), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			continue
+		}
+
+		rows, parseErr := parseHFFirstRows(body)
+		if parseErr != nil {
+			stats.ParseErrors++
+			emitRemoteEvent(opts, RemoteEvent{Source: ds, Outcome: "hf-parse-error", Detail: parseErr.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			continue
+		}
+		if len(rows) > maxRecords {
+			rows = rows[:maxRecords]
+		}
+		for i, row := range rows {
+			text := normalizeText(row)
+			if text == "" {
+				continue
+			}
+			chunks := chunkText(text, opts.MaxChunkChars, opts.ChunkOverlap)
+			if len(chunks) == 0 {
+				continue
+			}
+			meta := map[string]string{
+				"type":         "knowledge",
+				"source_type":  "hf_dataset",
+				"hf_dataset":   ds,
+				"hf_split":     split,
+				"record_index": strconv.Itoa(i + 1),
+				"record_total": strconv.Itoa(len(rows)),
+				"source_url":   endpoint,
+				"fetched_at":   time.Now().UTC().Format(time.RFC3339),
+			}
+			if err := addRemoteChunks(mm, chunks, meta); err != nil {
+				stats.IndexErrors++
+				emitRemoteEvent(opts, RemoteEvent{Source: ds, Outcome: "hf-index-error", Detail: err.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+				continue
+			}
+			stats.ItemsIndexed++
+			stats.ChunksIndexed += len(chunks)
+			emitRemoteEvent(opts, RemoteEvent{Source: ds, Outcome: "hf-indexed-record", Detail: fmt.Sprintf("record %d", i+1), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+		}
+	}
+
+	return stats, nil
+}
+
+func normalizeRemoteOptions(opts RemoteIndexOptions) RemoteIndexOptions {
+	if opts.MaxChunkChars <= 0 {
+		opts.MaxChunkChars = DefaultIndexOptions().MaxChunkChars
+	}
+	if opts.ChunkOverlap < 0 {
+		opts.ChunkOverlap = 0
+	}
+	if opts.ChunkOverlap >= opts.MaxChunkChars {
+		opts.ChunkOverlap = opts.MaxChunkChars / 4
+	}
+	if opts.Timeout <= 0 {
+		opts.Timeout = defaultRemoteTimeout
+	}
+	if opts.MaxBytes <= 0 {
+		opts.MaxBytes = defaultRemoteMaxBytes
+	}
+	if opts.CrawlDepth < 0 {
+		opts.CrawlDepth = 0
+	}
+	if opts.CrawlDepth == 0 {
+		opts.CrawlDepth = defaultCrawlDepth
+	}
+	if opts.MaxPages <= 0 {
+		opts.MaxPages = defaultMaxPages
+	}
+	if opts.RateLimitPerSec <= 0 {
+		opts.RateLimitPerSec = defaultRateLimitPerSec
+	}
+	if strings.TrimSpace(opts.UserAgent) == "" {
+		opts.UserAgent = "talos/1.0 (+https://thynaptic.com)"
+	}
+	if opts.URLSafetyTimeout <= 0 {
+		opts.URLSafetyTimeout = 45 * time.Second
+	}
+	if opts.URLSafetyCacheTTL <= 0 {
+		opts.URLSafetyCacheTTL = 24 * time.Hour
+	}
+	if strings.TrimSpace(opts.URLSafetyVisibility) == "" {
+		opts.URLSafetyVisibility = "private"
+	}
+	switch strings.ToLower(strings.TrimSpace(opts.URLSafetyVisibility)) {
+	case "private", "unlisted", "public":
+	default:
+		opts.URLSafetyVisibility = "private"
+	}
+	if strings.TrimSpace(opts.URLSafetyBaseURL) == "" {
+		opts.URLSafetyBaseURL = defaultURLSafetyBaseURL
+	}
+	return opts
+}
+
+func fetchURL(client *http.Client, rawURL string, opts RemoteIndexOptions) ([]byte, string, int, error) {
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	if ua := strings.TrimSpace(opts.UserAgent); ua != "" {
+		req.Header.Set("User-Agent", ua)
+	}
+	if ah := strings.TrimSpace(opts.AuthHeader); ah != "" {
+		req.Header.Set("Authorization", ah)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	defer resp.Body.Close()
+
+	reader := io.LimitReader(resp.Body, opts.MaxBytes+1)
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, "", resp.StatusCode, err
+	}
+	if int64(len(body)) > opts.MaxBytes {
+		return nil, "", resp.StatusCode, fmt.Errorf("content exceeds max-bytes limit")
+	}
+	return body, resp.Header.Get("Content-Type"), resp.StatusCode, nil
+}
+
+func parseFetchedContent(rawURL, contentType string, body []byte) (string, bool, error) {
+	u, _ := url.Parse(rawURL)
+	ext := strings.ToLower(filepath.Ext(u.Path))
+	ct := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+	isHTML := strings.Contains(ct, "text/html") || ext == ".html" || ext == ".htm"
+	isPDF := strings.Contains(ct, "application/pdf") || ext == ".pdf"
+
+	if isPDF {
+		tmp, err := os.CreateTemp("", "talos_learn_*.pdf")
+		if err != nil {
+			return "", false, err
+		}
+		defer os.Remove(tmp.Name())
+		if _, err := tmp.Write(body); err != nil {
+			_ = tmp.Close()
+			return "", false, err
+		}
+		_ = tmp.Close()
+		text, err := readPDF(tmp.Name())
+		return text, false, err
+	}
+	if isHTML {
+		text := htmlToText(string(body))
+		return text, true, nil
+	}
+	if bytes.Contains(body, []byte{0}) {
+		return "", false, fmt.Errorf("binary content")
+	}
+	if strings.Contains(ct, "text/") ||
+		strings.Contains(ct, "application/json") ||
+		strings.Contains(ct, "application/xml") ||
+		strings.Contains(ct, "text/csv") ||
+		ext == ".txt" || ext == ".md" || ext == ".json" || ext == ".csv" || ext == ".yaml" || ext == ".yml" {
+		return string(body), false, nil
+	}
+	return "", false, fmt.Errorf("unsupported content type")
+}
+
+func htmlToText(s string) string {
+	s = regexp.MustCompile(`(?is)<script.*?>.*?</script>`).ReplaceAllString(s, " ")
+	s = regexp.MustCompile(`(?is)<style.*?>.*?</style>`).ReplaceAllString(s, " ")
+	s = htmlTagRE.ReplaceAllString(s, " ")
+	s = htmlSpaceRE.ReplaceAllString(s, " ")
+	return strings.TrimSpace(s)
+}
+
+func extractLinks(baseURL string, body []byte) []string {
+	matches := hrefRE.FindAllStringSubmatch(string(body), -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	seen := make(map[string]bool)
+	for _, m := range matches {
+		if len(m) < 2 {
+			continue
+		}
+		ref, err := url.Parse(strings.TrimSpace(m[1]))
+		if err != nil {
+			continue
+		}
+		resolved := u.ResolveReference(ref)
+		if resolved.Scheme != "http" && resolved.Scheme != "https" {
+			continue
+		}
+		s := resolved.String()
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func addRemoteChunks(mm *memory.MemoryManager, chunks []string, baseMeta map[string]string) error {
+	total := len(chunks)
+	for i, chunk := range chunks {
+		meta := make(map[string]string, len(baseMeta)+3)
+		for k, v := range baseMeta {
+			meta[k] = v
+		}
+		meta["chunk_index"] = strconv.Itoa(i + 1)
+		meta["chunk_total"] = strconv.Itoa(total)
+		meta["indexed_at"] = time.Now().UTC().Format(time.RFC3339)
+		if err := mm.AddKnowledge(chunk, meta); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func emitRemoteEvent(opts RemoteIndexOptions, ev RemoteEvent) {
+	if opts.OnEvent != nil {
+		opts.OnEvent(ev)
+	}
+}
+
+func waitForRateLimit(rate float64, nextAllowed *time.Time) {
+	if rate <= 0 {
+		return
+	}
+	interval := time.Duration(float64(time.Second) / rate)
+	now := time.Now()
+	if now.Before(*nextAllowed) {
+		time.Sleep(nextAllowed.Sub(now))
+	}
+	*nextAllowed = time.Now().Add(interval)
+}
+
+func normalizeHTTPURL(raw string) (string, string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "", "", err
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", "", fmt.Errorf("unsupported URL scheme")
+	}
+	if strings.TrimSpace(u.Host) == "" {
+		return "", "", fmt.Errorf("URL host is empty")
+	}
+	host := strings.ToLower(u.Hostname())
+	if !isValidDomainOrIP(host) {
+		return "", "", fmt.Errorf("invalid domain")
+	}
+	u.Fragment = ""
+	n := u.String()
+	return n, host, nil
+}
+
+func hostFromURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Hostname())
+}
+
+func isDomainAllowed(host string, seedHosts map[string]bool, allow map[string]bool, crawling bool) bool {
+	if host == "" {
+		return false
+	}
+	if len(allow) > 0 {
+		return allow[strings.ToLower(host)]
+	}
+	if !crawling {
+		return true
+	}
+	return seedHosts[strings.ToLower(host)]
+}
+
+func bearerHeader(token string) string {
+	t := strings.TrimSpace(token)
+	if t == "" {
+		return ""
+	}
+	return "Bearer " + t
+}
+
+func isValidDomainOrIP(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return true
+	}
+	if strings.HasSuffix(host, ".") {
+		host = strings.TrimSuffix(host, ".")
+	}
+	parts := strings.Split(host, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	for _, p := range parts {
+		if !hostLabelRE.MatchString(p) {
+			return false
+		}
+		if strings.HasPrefix(p, "-") || strings.HasSuffix(p, "-") {
+			return false
+		}
+	}
+	return true
+}
+
+func preflightURLReachable(client *http.Client, rawURL string, opts RemoteIndexOptions) error {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return err
+	}
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	if !isValidDomainOrIP(host) {
+		return fmt.Errorf("invalid domain")
+	}
+	if _, err := net.LookupHost(host); err != nil {
+		return fmt.Errorf("domain not resolvable: %w", err)
+	}
+
+	origin := u.Scheme + "://" + u.Host
+	req, err := http.NewRequest(http.MethodHead, origin, nil)
+	if err != nil {
+		return err
+	}
+	if ua := strings.TrimSpace(opts.UserAgent); ua != "" {
+		req.Header.Set("User-Agent", ua)
+	}
+	if ah := strings.TrimSpace(opts.AuthHeader); ah != "" {
+		req.Header.Set("Authorization", ah)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("host offline: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusNotImplemented {
+		reqGet, err := http.NewRequest(http.MethodGet, origin, nil)
+		if err != nil {
+			return err
+		}
+		if ua := strings.TrimSpace(opts.UserAgent); ua != "" {
+			reqGet.Header.Set("User-Agent", ua)
+		}
+		if ah := strings.TrimSpace(opts.AuthHeader); ah != "" {
+			reqGet.Header.Set("Authorization", ah)
+		}
+		resp2, err := client.Do(reqGet)
+		if err != nil {
+			return fmt.Errorf("host offline: %w", err)
+		}
+		defer resp2.Body.Close()
+	}
+	return nil
+}
+
+func parseHFFirstRows(body []byte) ([]string, error) {
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	rawRows, ok := payload["rows"].([]interface{})
+	if !ok || len(rawRows) == 0 {
+		return nil, fmt.Errorf("no rows in dataset response")
+	}
+	out := make([]string, 0, len(rawRows))
+	for _, item := range rawRows {
+		text := flattenHFRow(item)
+		if strings.TrimSpace(text) != "" {
+			out = append(out, text)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("rows were empty after flattening")
+	}
+	return out, nil
+}
+
+func flattenHFRow(row interface{}) string {
+	switch v := row.(type) {
+	case map[string]interface{}:
+		if inner, ok := v["row"]; ok {
+			return flattenHFRow(inner)
+		}
+		var lines []string
+		for k, val := range v {
+			lines = append(lines, fmt.Sprintf("%s: %s", k, flattenHFRow(val)))
+		}
+		return strings.Join(lines, "\n")
+	case []interface{}:
+		var parts []string
+		for _, e := range v {
+			parts = append(parts, flattenHFRow(e))
+		}
+		return strings.Join(parts, ", ")
+	case string:
+		return v
+	case float64, bool, int, int64:
+		return fmt.Sprintf("%v", v)
+	case nil:
+		return ""
+	default:
+		b, _ := json.Marshal(v)
+		return string(b)
+	}
+}

@@ -1,4 +1,4 @@
-package main
+package taloscli
 
 import (
 	"context"
@@ -43,7 +43,7 @@ var multiAgentCmd = &cobra.Command{
 	Long:  `Runs a Perplexity-style multi-agent pipeline with tool arbitration, source extraction, verification, and synthesis.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if len(args) == 0 {
-			fmt.Println("Please provide a query. Example: personal-llm multi-agent \"What changed in X this week?\"")
+			fmt.Println("Please provide a query. Example: talos multi-agent \"What changed in X this week?\"")
 			return
 		}
 		query := strings.TrimSpace(strings.Join(args, " "))

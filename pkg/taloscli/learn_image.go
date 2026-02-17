@@ -1,4 +1,4 @@
-package main
+package taloscli
 
 import (
 	"fmt"
@@ -26,16 +26,27 @@ Optionally links descriptors to an anchor text fragment for cross-modal retrieva
 			fmt.Println("Please provide at least one image path via --image or positional args.")
 			return
 		}
+		session := newLearnSession("LEARN_IMAGE", strings.Join(paths, ","), paths, map[string]string{
+			"namespace": strings.TrimSpace(learnImageNamespace),
+		})
 
 		meta, err := parseMetadataPairs(learnImageMeta)
 		if err != nil {
 			fmt.Printf("Error parsing metadata: %v\n", err)
+			session.finish("FAILED", "Image learning failed before processing.", err.Error(), map[string]int64{"images_indexed": 0, "errors": 1})
+			if logErr := appendLearnSessionRecord(session); logErr != nil {
+				fmt.Printf("Warning: Failed to write learn session log: %v\n", logErr)
+			}
 			return
 		}
 
 		mm, err := memory.NewMemoryManager()
 		if err != nil {
 			fmt.Printf("Error initializing memory manager: %v\n", err)
+			session.finish("FAILED", "Image learning failed during memory manager initialization.", err.Error(), map[string]int64{"images_indexed": 0, "errors": 1})
+			if logErr := appendLearnSessionRecord(session); logErr != nil {
+				fmt.Printf("Warning: Failed to write learn session log: %v\n", logErr)
+			}
 			return
 		}
 		if ns := strings.TrimSpace(learnImageNamespace); ns != "" {
@@ -47,20 +58,40 @@ Optionally links descriptors to an anchor text fragment for cross-modal retrieva
 			fmt.Printf("Processing image: %s\n", p)
 			res, err := mm.IngestImageKnowledge(p, learnImageAnchor, meta)
 			if err != nil {
-				fmt.Printf("  ❌ %v\n", err)
+				fmt.Printf("  Error: %v\n", err)
 				continue
 			}
 			success++
-			fmt.Printf("  ✅ Model: %s\n", res.Model)
-			fmt.Printf("  ✅ LinkID: %s\n", res.LinkID)
+			fmt.Printf("  Model: %s\n", res.Model)
+			fmt.Printf("  LinkID: %s\n", res.LinkID)
 			if strings.TrimSpace(res.LinkedTextDocID) != "" {
-				fmt.Printf("  ✅ Linked text doc: %s\n", res.LinkedTextDocID)
+				fmt.Printf("  Linked text doc: %s\n", res.LinkedTextDocID)
 			}
 		}
 
 		if success == 0 {
 			fmt.Println("No images were indexed.")
+			session.finish("FAILED", "No images were indexed.", "all image ingests failed", map[string]int64{
+				"images_total":   int64(len(paths)),
+				"images_indexed": 0,
+				"errors":         int64(len(paths)),
+			})
+			if logErr := appendLearnSessionRecord(session); logErr != nil {
+				fmt.Printf("Warning: Failed to write learn session log: %v\n", logErr)
+			}
 			return
+		}
+		status := "SUCCESS"
+		if success < len(paths) {
+			status = "PARTIAL"
+		}
+		session.finish(status, "Image learning run completed.", "", map[string]int64{
+			"images_total":   int64(len(paths)),
+			"images_indexed": int64(success),
+			"errors":         int64(len(paths) - success),
+		})
+		if logErr := appendLearnSessionRecord(session); logErr != nil {
+			fmt.Printf("Warning: Failed to write learn session log: %v\n", logErr)
 		}
 		fmt.Printf("Indexed %d/%d image(s) into multimodal memory.\n", success, len(paths))
 	},
