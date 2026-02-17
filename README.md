@@ -17,7 +17,8 @@ This keeps reasoning local while environment actions remain policy-governed.
 
 ## Runtime Components
 
-- `cmd/personal-llm`: operator interface and primary execution path
+- `cmd/talos`: operator interface and primary execution path
+- `cmd/personal-llm`: legacy-compatible TALOS entrypoint
 - `cmd/benchmark`: health, audit, and capability checks
 - `cmd/reflex-daemon`: runtime anomaly and pressure monitoring
 - `cmd/scout-daemon`: contradiction and evidence scanning
@@ -54,7 +55,103 @@ Tool requests follow the asynchronous plugin lifecycle in the substrate:
 Run TALOS:
 
 ```bash
-go run ./cmd/personal-llm
+go run ./cmd/talos
+```
+
+Learn an entire directory (all supported default document types):
+
+```bash
+talos learn --dir ./docs
+```
+
+Learn only specific file types in a directory:
+
+```bash
+talos learn --dir ./workspace --type .md --type .txt
+```
+
+Learn all file types in a directory (binary files are skipped):
+
+```bash
+talos learn --dir ./workspace --all-types
+```
+
+Learn from a URL:
+
+```bash
+URLSCAN_API_KEY=your_key talos learn --url https://example.com/guide
+```
+
+Learn from URLs with bounded crawling:
+
+```bash
+URLSCAN_API_KEY=your_key talos learn --url-file ./urls.txt --crawl --crawl-depth 1 --max-pages 200
+```
+
+Learn from a Hugging Face dataset:
+
+```bash
+HF_TOKEN=your_token talos learn --hf-dataset wikipedia --hf-split train --hf-max-records 100
+```
+
+Install TALOS for all terminals:
+
+```bash
+go run ./cmd/talos monitor install
+```
+
+Check terminal integration status:
+
+```bash
+talos monitor status
+```
+
+Remove terminal integration:
+
+```bash
+talos monitor uninstall
+```
+
+Run runtime diagnostics:
+
+```bash
+talos doctor
+```
+
+Run bounded research:
+
+```bash
+talos research run "What changed in dependency policy this week?"
+```
+
+Run deep multi-agent research:
+
+```bash
+talos research deep "Evaluate tradeoffs between vector stores for this repository"
+```
+
+List recent research sessions/artifacts:
+
+```bash
+talos research sessions --last 10
+```
+
+Run a chained research-to-learn pipeline:
+
+```bash
+talos pipeline "research run 'What changed in dependency policy this week?' ; learn --from-research latest"
+```
+
+Explain a capability:
+
+```bash
+talos explain <capability>
+```
+
+Review recent learning sessions:
+
+```bash
+talos learned --last 5
 ```
 
 Run audit:
