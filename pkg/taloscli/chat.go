@@ -86,8 +86,8 @@ var chatCmd = &cobra.Command{
 				fmt.Println(approvalMsg)
 				return
 			}
-			_, _ = cognition.AuditSkillInventory()
-			normalized, clarification := applyIntentCorrection(prompt, sm, mm)
+			go func() { _, _ = cognition.AuditSkillInventory() }()
+			normalized, clarification := applyIntentCorrectionWithTimeout(prompt, sm, mm)
 			if clarification != "" {
 				fmt.Printf("Clarification needed: %s\n", clarification)
 				return
@@ -194,7 +194,7 @@ var chatCmd = &cobra.Command{
 				continue
 			}
 
-			normalized, clarification := applyIntentCorrection(input, sm, mm)
+			normalized, clarification := applyIntentCorrectionWithTimeout(input, sm, mm)
 			if clarification != "" {
 				fmt.Printf("Clarification needed: %s\n", clarification)
 				continue
@@ -275,6 +275,30 @@ func applyIntentCorrection(raw string, sm *state.Manager, mm *memory.MemoryManag
 		}
 	}
 	return normalized, ""
+}
+
+func applyIntentCorrectionWithTimeout(raw string, sm *state.Manager, mm *memory.MemoryManager) (string, string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return raw, ""
+	}
+	timeout := durationFromEnv("PLM_INTENT_CORRECTION_TIMEOUT", 4*time.Second)
+	type result struct {
+		normalized    string
+		clarification string
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, c := applyIntentCorrection(raw, sm, mm)
+		done <- result{normalized: n, clarification: c}
+	}()
+	select {
+	case r := <-done:
+		return r.normalized, r.clarification
+	case <-time.After(timeout):
+		fmt.Printf("DEBUG: Intent correction timed out after %s; continuing with raw prompt.\n", timeout)
+		return raw, ""
+	}
 }
 
 func buildIntentMissionContext(mm *memory.MemoryManager, raw string) state.MissionPlan {
