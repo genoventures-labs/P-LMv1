@@ -1,0 +1,6 @@
+codex_output:normal
+final_output_style:casual_concise
+final_output_key_points:2-3_bullets
+final_output_requires_why_section:true
+final_output_constraints:concise,clear,readable,minimal
+effective_from:2026-02-16

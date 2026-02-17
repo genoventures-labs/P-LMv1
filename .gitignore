@@ -27,6 +27,15 @@ go.work.sum
 # env file
 .env
 
+# runtime state and generated local artifacts
+.memory/
+.skills/
+api_keys.yaml
+benchmark
+benchmark_results.json
+recommended_models.json
+talos_benchmark_report.json
+
 # Editor/IDE
 # .idea/
 # .vscode/
