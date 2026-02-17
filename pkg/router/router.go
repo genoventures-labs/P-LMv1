@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"sort"
 	"strings"
 	"time"
 )
@@ -17,18 +18,18 @@ type Router struct {
 	Models []string
 }
 
-// NewRouter initializes a Router with models from recommended_models.json.
-func NewRouter(recommendedModelsFile string) (*Router, error) {
-	data, err := os.ReadFile(recommendedModelsFile)
+type ollamaTagsResponse struct {
+	Models []struct {
+		Name string `json:"name"`
+	} `json:"models"`
+}
+
+// NewRouter initializes a Router with live model discovery from the Ollama VPS.
+func NewRouter() (*Router, error) {
+	models, err := discoverModels()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read recommended models: %w", err)
+		return nil, err
 	}
-
-	var models []string
-	if err := json.Unmarshal(data, &models); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal recommended models: %w", err)
-	}
-
 	return &Router{Models: models}, nil
 }
 
@@ -77,7 +78,9 @@ func (r *Router) SelectModel(prompt string) string {
 
 const (
 	defaultOrchestrationBaseURL = "http://85.31.233.157:8002/api/v1"
+	defaultOllamaHost           = "http://85.31.233.157:11434"
 	defaultResolveTimeout       = 6 * time.Second
+	defaultTagsTimeout          = 6 * time.Second
 )
 
 // ResolveRequest carries remote orchestration routing hints.
@@ -146,4 +149,50 @@ func ResolveRemote(req ResolveRequest) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("resolve response did not include model field")
+}
+
+func discoverModels() ([]string, error) {
+	host := strings.TrimSpace(os.Getenv("OLLAMA_HOST"))
+	if host == "" {
+		host = defaultOllamaHost
+	}
+	if !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
+		host = "http://" + host
+	}
+	host = strings.TrimRight(host, "/")
+	url := host + "/api/tags"
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create model discovery request: %w", err)
+	}
+	client := &http.Client{Timeout: defaultTagsTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("discover models from %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("discover models status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	var payload ollamaTagsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decode tags response: %w", err)
+	}
+	seen := make(map[string]bool)
+	var models []string
+	for _, m := range payload.Models {
+		name := strings.TrimSpace(m.Name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		models = append(models, name)
+	}
+	if len(models) == 0 {
+		return nil, fmt.Errorf("no models returned by %s", url)
+	}
+	sort.Strings(models)
+	return models, nil
 }

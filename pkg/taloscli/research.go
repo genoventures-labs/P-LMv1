@@ -250,7 +250,7 @@ Return plain text only.`
 }
 
 func initResearchRuntime(query string) (*researchRuntime, error) {
-	r, err := router.NewRouter("recommended_models.json")
+	r, err := router.NewRouter()
 	if err != nil {
 		return nil, fmt.Errorf("initializing router: %w", err)
 	}

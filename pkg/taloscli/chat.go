@@ -39,14 +39,11 @@ var chatCmd = &cobra.Command{
 	Short: "Start a chat session or send a single prompt to your personal LLM.",
 	Long:  `This command starts an interactive chat session if no prompt is provided. If a prompt is provided as an argument, it sends it to the LLM, prints the response, and exits.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		// 1. Read recommended model
-		recommendedModelsFile := "recommended_models.json"
-
-		// Initialize Router
-		r, err := router.NewRouter(recommendedModelsFile)
+		// Initialize router from live VPS model discovery.
+		r, err := router.NewRouter()
 		if err != nil {
 			fmt.Printf("Error initializing router: %v\n", err)
-			fmt.Println("Please run 'benchmark orchestrate' first to generate recommendations.")
+			fmt.Println("Ensure OLLAMA_HOST is reachable (default AI_API_Guide host is used when unset).")
 			return
 		}
 
@@ -3094,6 +3091,8 @@ func isTransientLLMError(err error) bool {
 		"502",
 		"503",
 		"504",
+		"model '",
+		" not found",
 	} {
 		if strings.Contains(s, marker) {
 			return true
@@ -3964,9 +3963,22 @@ func buildModelCandidates(models []string, selected string) []string {
 		seen[m] = true
 		out = append(out, m)
 	}
-	add(selected)
-	for _, m := range models {
+	addWithAliases := func(m string) {
+		m = strings.TrimSpace(m)
+		if m == "" {
+			return
+		}
+		if strings.Contains(m, ":") {
+			add(m)
+			return
+		}
+		// Ollama model lookup is tag-sensitive. Prefer :latest for bare identifiers.
+		add(m + ":latest")
 		add(m)
+	}
+	addWithAliases(selected)
+	for _, m := range models {
+		addWithAliases(m)
 	}
 	return out
 }

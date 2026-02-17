@@ -52,7 +52,7 @@ var multiAgentCmd = &cobra.Command{
 			return
 		}
 
-		r, err := router.NewRouter("recommended_models.json")
+		r, err := router.NewRouter()
 		if err != nil {
 			fmt.Printf("Error initializing router: %v\n", err)
 			return

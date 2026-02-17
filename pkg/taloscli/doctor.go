@@ -41,7 +41,6 @@ func runDoctorChecks(timeout time.Duration, noNetwork bool) []doctorCheck {
 	checks := []doctorCheck{
 		checkTalosInPath(),
 		checkWorkingDirectory(),
-		checkFileExists("recommended_models.json", "Run benchmark/audit to generate recommended model registry."),
 		checkDirectoryWritable(".memory", "Create and grant write access to .memory for state/telemetry."),
 		checkDirectoryWritable(".skills/permanent", "Create and grant write access to .skills/permanent for skill persistence."),
 		checkOllamaHost(),
