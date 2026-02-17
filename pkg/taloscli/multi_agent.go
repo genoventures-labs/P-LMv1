@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -24,7 +25,12 @@ var (
 	maMaxPlanSteps     int
 	maMaxResearchLoops int
 	maVerbose          bool
+	maAgents           string
+	maParallel         bool
+	maMode             string
 )
+
+var supportedSubAgents = []string{"planner", "researcher", "verifier", "synthesizer"}
 
 const (
 	maDefaultFirstTokenTimeout = 75 * time.Second
@@ -40,7 +46,7 @@ var (
 var multiAgentCmd = &cobra.Command{
 	Use:   "multi-agent [query]",
 	Short: "Run an extended multi-agent pipeline (planner -> researcher -> verifier -> synthesizer).",
-	Long:  `Runs a Perplexity-style multi-agent pipeline with tool arbitration, source extraction, verification, and synthesis.`,
+	Long:  `Runs a Perplexity-style multi-agent pipeline with tool arbitration, source extraction, verification, and synthesis. You can also target specific sub-agents in any order or run them in parallel.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if len(args) == 0 {
 			fmt.Println("Please provide a query. Example: talos multi-agent \"What changed in X this week?\"")
@@ -98,7 +104,42 @@ var multiAgentCmd = &cobra.Command{
 			fmt.Printf("Warning: Failed to store user query in memory: %v\n", err)
 		}
 
-		answer, refs, err := runMultiAgentPipeline(client, mm, tc, modelCandidates, query)
+		selectedAgents, selErr := parseSelectedSubAgents(maAgents)
+		if selErr != nil {
+			fmt.Printf("Error: %v\n", selErr)
+			return
+		}
+		mode := normalizeMultiAgentMode(maMode)
+		if mode == "" {
+			fmt.Printf("Error: unsupported --mode %q (supported: pipeline, planning)\n", strings.TrimSpace(maMode))
+			return
+		}
+		if mode == "planning" && len(selectedAgents) > 0 {
+			fmt.Println("Error: --mode planning cannot be combined with --agents.")
+			return
+		}
+		if mode == "planning" && maParallel {
+			fmt.Println("Error: --mode planning cannot be combined with --parallel.")
+			return
+		}
+		if maParallel && len(selectedAgents) == 0 {
+			fmt.Println("Error: --parallel requires --agents.")
+			return
+		}
+
+		var (
+			answer string
+			refs   []string
+		)
+		if mode == "planning" {
+			answer, refs, err = runPlanningMode(client, mm, modelCandidates, query)
+		} else if len(selectedAgents) == 0 {
+			answer, refs, err = runMultiAgentPipeline(client, mm, tc, modelCandidates, query)
+		} else if maParallel {
+			answer, refs, err = runSelectedSubAgentsParallel(client, tc, modelCandidates, query, selectedAgents)
+		} else {
+			answer, refs, err = runSelectedSubAgentsSequential(client, tc, modelCandidates, query, selectedAgents)
+		}
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
 			return
@@ -118,11 +159,241 @@ var multiAgentCmd = &cobra.Command{
 	},
 }
 
+func normalizeMultiAgentMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "pipeline", "default", "full":
+		return "pipeline"
+	case "planning", "plan", "planner":
+		return "planning"
+	default:
+		return ""
+	}
+}
+
 type evidenceRecord struct {
 	Step      string
 	Summary   string
 	ToolLogs  []string
 	SourceURL []string
+}
+
+type subAgentResult struct {
+	Agent   string
+	Output  string
+	ToolLog []string
+	Sources []string
+	Err     error
+}
+
+func plannerSystemPrompt() string {
+	return `You are the Planner agent.
+Break the user task into concrete research steps.
+Return JSON only in this format:
+{"steps":["step 1","step 2","step 3"]}`
+}
+
+func researcherSystemPrompt() string {
+	return `You are the Researcher agent.
+You may call tools to gather evidence.
+Prefer web_search for discovery, fetch_url for page content, http_request for APIs, vector_retrieve for semantic retrieval.
+When done, provide a concise factual summary with source domains if available.`
+}
+
+func verifierSystemPrompt() string {
+	return `You are the Verifier agent.
+Check consistency of collected evidence, identify conflicts/gaps, and produce concise verification notes.
+Return plain text.`
+}
+
+func synthesizerSystemPrompt() string {
+	return `You are the Synthesizer agent.
+Write the final answer using evidence and verifier notes.
+Use concise, high-signal prose.
+If sources are provided, cite with [n] markers that map to the numbered source list.`
+}
+
+func parseSelectedSubAgents(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	var out []string
+	seen := make(map[string]bool)
+	add := func(agent string) {
+		if agent == "" || seen[agent] {
+			return
+		}
+		seen[agent] = true
+		out = append(out, agent)
+	}
+	for _, part := range parts {
+		token := strings.ToLower(strings.TrimSpace(part))
+		switch token {
+		case "":
+			continue
+		case "all":
+			for _, a := range supportedSubAgents {
+				add(a)
+			}
+		case "planner", "plan":
+			add("planner")
+		case "researcher", "research":
+			add("researcher")
+		case "verifier", "verify":
+			add("verifier")
+		case "synthesizer", "synth", "synthesis", "final":
+			add("synthesizer")
+		default:
+			return nil, fmt.Errorf("unknown sub-agent %q (supported: planner,researcher,verifier,synthesizer,all)", token)
+		}
+	}
+	return out, nil
+}
+
+func runSubAgent(
+	client *api.Client,
+	tc *tools.GLMToolClient,
+	modelCandidates []string,
+	query string,
+	agent string,
+	priorContext string,
+) subAgentResult {
+	res := subAgentResult{Agent: agent}
+	var (
+		systemPrompt string
+		userPrompt   string
+		maxLoops     int
+		allowTools   bool
+		stage        string
+	)
+
+	basePrompt := "User query:\n" + query
+	if strings.TrimSpace(priorContext) != "" {
+		basePrompt += "\n\nPrior sub-agent outputs:\n" + priorContext
+	}
+
+	switch agent {
+	case "planner":
+		systemPrompt = plannerSystemPrompt()
+		userPrompt = basePrompt
+		maxLoops = 1
+		allowTools = false
+		stage = "plan"
+	case "researcher":
+		systemPrompt = researcherSystemPrompt()
+		userPrompt = basePrompt
+		maxLoops = maMaxResearchLoops
+		allowTools = true
+		stage = "research"
+	case "verifier":
+		systemPrompt = verifierSystemPrompt()
+		userPrompt = basePrompt
+		maxLoops = 1
+		allowTools = true
+		stage = "verify"
+	case "synthesizer":
+		systemPrompt = synthesizerSystemPrompt()
+		userPrompt = basePrompt + "\n\nProvide final answer now."
+		maxLoops = 1
+		allowTools = false
+		stage = "final"
+	default:
+		res.Err = fmt.Errorf("unsupported sub-agent: %s", agent)
+		return res
+	}
+
+	resp, toolLogs, err := runAgentLoop(client, tc, modelCandidates, systemPrompt, userPrompt, maxLoops, allowTools, query, stage, maFinalLatencyBudgetMS)
+	if err != nil {
+		res.Err = err
+		return res
+	}
+	res.Output = sanitizeModelOutput(resp)
+	res.ToolLog = toolLogs
+	res.Sources = uniqueStrings(extractURLs(strings.Join(toolLogs, "\n") + "\n" + res.Output))
+	return res
+}
+
+func runSelectedSubAgentsSequential(
+	client *api.Client,
+	tc *tools.GLMToolClient,
+	modelCandidates []string,
+	query string,
+	agents []string,
+) (string, []string, error) {
+	var (
+		priorContext strings.Builder
+		sections     []string
+		allSources   []string
+	)
+
+	for _, agent := range agents {
+		res := runSubAgent(client, tc, modelCandidates, query, agent, priorContext.String())
+		if res.Err != nil {
+			return "", nil, fmt.Errorf("%s failed: %w", agent, res.Err)
+		}
+		sections = append(sections, fmt.Sprintf("[%s]\n%s", strings.ToUpper(agent), strings.TrimSpace(res.Output)))
+		allSources = append(allSources, res.Sources...)
+		if strings.TrimSpace(res.Output) != "" {
+			if priorContext.Len() > 0 {
+				priorContext.WriteString("\n\n")
+			}
+			priorContext.WriteString(fmt.Sprintf("%s:\n%s", agent, strings.TrimSpace(res.Output)))
+		}
+	}
+
+	answer := strings.Join(sections, "\n\n")
+	if strings.TrimSpace(answer) == "" {
+		answer = "No sub-agent output was produced."
+	}
+	return answer, uniqueStrings(allSources), nil
+}
+
+func runSelectedSubAgentsParallel(
+	client *api.Client,
+	tc *tools.GLMToolClient,
+	modelCandidates []string,
+	query string,
+	agents []string,
+) (string, []string, error) {
+	results := make(map[string]subAgentResult)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, agent := range agents {
+		agent := agent
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res := runSubAgent(client, tc, modelCandidates, query, agent, "")
+			mu.Lock()
+			results[agent] = res
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	var (
+		sections   []string
+		allSources []string
+	)
+	for _, agent := range agents {
+		res, ok := results[agent]
+		if !ok {
+			return "", nil, fmt.Errorf("%s did not return a result", agent)
+		}
+		if res.Err != nil {
+			return "", nil, fmt.Errorf("%s failed: %w", agent, res.Err)
+		}
+		sections = append(sections, fmt.Sprintf("[%s]\n%s", strings.ToUpper(agent), strings.TrimSpace(res.Output)))
+		allSources = append(allSources, res.Sources...)
+	}
+
+	answer := strings.Join(sections, "\n\n")
+	if strings.TrimSpace(answer) == "" {
+		answer = "No sub-agent output was produced."
+	}
+	return answer, uniqueStrings(allSources), nil
 }
 
 func runMultiAgentPipeline(
@@ -132,23 +403,9 @@ func runMultiAgentPipeline(
 	modelCandidates []string,
 	query string,
 ) (string, []string, error) {
-	knowledgeCtx, _ := mm.RetrieveKnowledge(query, 4)
-	historyCtx, _ := mm.RetrieveContext(query, 3)
+	knowledgeCtx, _, plannerInput := buildPlannerInput(mm, query)
 
-	plannerInput := "User query:\n" + query
-	if len(knowledgeCtx) > 0 {
-		plannerInput += "\n\nRelevant knowledge:\n- " + strings.Join(knowledgeCtx, "\n- ")
-	}
-	if len(historyCtx) > 0 {
-		plannerInput += "\n\nRelevant history:\n- " + strings.Join(historyCtx, "\n- ")
-	}
-
-	plannerSystem := `You are the Planner agent.
-Break the user task into concrete research steps.
-Return JSON only in this format:
-{"steps":["step 1","step 2","step 3"]}`
-
-	plannerResp, _, err := runAgentLoop(client, tc, modelCandidates, plannerSystem, plannerInput, 1, false, query, "plan", 0)
+	plannerResp, _, err := runAgentLoop(client, tc, modelCandidates, plannerSystemPrompt(), plannerInput, 1, false, query, "plan", 0)
 	if err != nil {
 		return "", nil, fmt.Errorf("planner failed: %w", err)
 	}
@@ -167,18 +424,13 @@ Return JSON only in this format:
 	var evidence []evidenceRecord
 	allSources := make(map[string]bool)
 
-	researchSystem := `You are the Researcher agent.
-You may call tools to gather evidence.
-Prefer web_search for discovery, fetch_url for page content, http_request for APIs, vector_retrieve for semantic retrieval.
-When done, provide a concise factual summary with source domains if available.`
-
 	for i, step := range steps {
 		if maVerbose {
 			fmt.Printf("DEBUG: Research step %d/%d\n", i+1, len(steps))
 		}
 		researchResp, toolLogs, runErr := runAgentLoop(
 			client, tc, modelCandidates,
-			researchSystem,
+			researcherSystemPrompt(),
 			"Research step:\n"+step+"\n\nOriginal query:\n"+query,
 			maMaxResearchLoops,
 			true,
@@ -203,30 +455,23 @@ When done, provide a concise factual summary with source domains if available.`
 		})
 	}
 
-	verifierSystem := `You are the Verifier agent.
-Check consistency of collected evidence, identify conflicts/gaps, and produce concise verification notes.
-Return plain text.`
 	symbolicAudit := buildSymbolicSiblingAudit(query, evidence, knowledgeCtx)
 	verifierInput := "Original query:\n" + query +
 		"\n\nEvidence:\n" + formatEvidenceForVerifier(evidence) +
 		"\n\nSymbolic consistency audit:\n" + symbolicAudit
-	verifierResp, _, err := runAgentLoop(client, tc, modelCandidates, verifierSystem, verifierInput, 1, false, query, "verify", 0)
+	verifierResp, _, err := runAgentLoop(client, tc, modelCandidates, verifierSystemPrompt(), verifierInput, 1, false, query, "verify", 0)
 	if err != nil {
 		verifierResp = "Verifier unavailable: " + err.Error()
 	}
 
 	sourceList := mapKeysSorted(allSources)
-	synthSystem := `You are the Synthesizer agent.
-Write the final answer using evidence and verifier notes.
-Use concise, high-signal prose.
-If sources are provided, cite with [n] markers that map to the numbered source list.`
 	synthInput := "Query:\n" + query +
 		"\n\nEvidence:\n" + formatEvidenceForSynth(evidence, sourceList) +
 		"\n\nSymbolic consistency audit:\n" + symbolicAudit +
 		"\n\nVerifier notes:\n" + verifierResp +
 		"\n\nProvide final answer now."
 
-	finalResp, _, err := runAgentLoop(client, tc, modelCandidates, synthSystem, synthInput, 1, false, query, "final", maFinalLatencyBudgetMS)
+	finalResp, _, err := runAgentLoop(client, tc, modelCandidates, synthesizerSystemPrompt(), synthInput, 1, false, query, "final", maFinalLatencyBudgetMS)
 	if err != nil {
 		return fallbackSynthesisFromEvidence(query, evidence, sourceList), sourceList, nil
 	}
@@ -236,6 +481,54 @@ If sources are provided, cite with [n] markers that map to the numbered source l
 		finalAnswer = "I couldn't synthesize a final answer from the current evidence."
 	}
 	return finalAnswer, sourceList, nil
+}
+
+func buildPlannerInput(mm *memory.MemoryManager, query string) ([]string, []string, string) {
+	knowledgeCtx, _ := mm.RetrieveKnowledge(query, 4)
+	historyCtx, _ := mm.RetrieveContext(query, 3)
+
+	plannerInput := "User query:\n" + query
+	if len(knowledgeCtx) > 0 {
+		plannerInput += "\n\nRelevant knowledge:\n- " + strings.Join(knowledgeCtx, "\n- ")
+	}
+	if len(historyCtx) > 0 {
+		plannerInput += "\n\nRelevant history:\n- " + strings.Join(historyCtx, "\n- ")
+	}
+	return knowledgeCtx, historyCtx, plannerInput
+}
+
+func runPlanningMode(
+	client *api.Client,
+	mm *memory.MemoryManager,
+	modelCandidates []string,
+	query string,
+) (string, []string, error) {
+	_, _, plannerInput := buildPlannerInput(mm, query)
+	plannerResp, _, err := runAgentLoop(client, nil, modelCandidates, plannerSystemPrompt(), plannerInput, 1, false, query, "plan", 0)
+	if err != nil {
+		return "", nil, fmt.Errorf("planner failed: %w", err)
+	}
+	steps := parsePlanSteps(plannerResp, query, maMaxPlanSteps)
+	if len(steps) == 0 {
+		steps = []string{query}
+	}
+
+	var b strings.Builder
+	b.WriteString("PLANNING MODE\n")
+	b.WriteString("Objective:\n")
+	b.WriteString(query)
+	b.WriteString("\n\nPlan:\n")
+	for i, step := range steps {
+		fmt.Fprintf(&b, "%d. %s\n", i+1, strings.TrimSpace(step))
+	}
+	b.WriteString("\nExecution Handoff:\n")
+	b.WriteString("- Run full pipeline: talos multi-agent \"")
+	b.WriteString(query)
+	b.WriteString("\"\n")
+	b.WriteString("- Run selected sub-agents: talos multi-agent \"")
+	b.WriteString(query)
+	b.WriteString("\" --agents researcher,verifier,synthesizer")
+	return strings.TrimSpace(b.String()), nil, nil
 }
 
 func runAgentLoop(
@@ -579,5 +872,8 @@ func init() {
 	multiAgentCmd.Flags().IntVar(&maMaxPlanSteps, "max-plan-steps", 4, "Maximum planner decomposition steps")
 	multiAgentCmd.Flags().IntVar(&maMaxResearchLoops, "max-research-loops", 3, "Maximum researcher tool loops per step")
 	multiAgentCmd.Flags().BoolVar(&maVerbose, "verbose", false, "Enable verbose pipeline logs")
+	multiAgentCmd.Flags().StringVar(&maMode, "mode", "pipeline", "Execution mode: pipeline|planning")
+	multiAgentCmd.Flags().StringVar(&maAgents, "agents", "", "Comma-separated sub-agent order (planner,researcher,verifier,synthesizer or all)")
+	multiAgentCmd.Flags().BoolVar(&maParallel, "parallel", false, "Run selected sub-agents in parallel (requires --agents)")
 	rootCmd.AddCommand(multiAgentCmd)
 }
