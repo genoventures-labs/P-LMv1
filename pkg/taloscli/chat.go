@@ -391,8 +391,8 @@ const (
 )
 
 var (
-	llmFirstTokenTimeout = durationFromEnv("PLM_LLM_FIRST_TOKEN_TIMEOUT", 75*time.Second)
-	llmChatTimeout       = durationFromEnv("PLM_LLM_CHAT_TIMEOUT", 180*time.Second)
+	llmFirstTokenTimeout = durationFromEnv("PLM_LLM_FIRST_TOKEN_TIMEOUT", 20*time.Second)
+	llmChatTimeout       = durationFromEnv("PLM_LLM_CHAT_TIMEOUT", 120*time.Second)
 	totTimeout           = durationFromEnv("PLM_TOT_TIMEOUT", 45*time.Second)
 	mctsTimeout          = durationFromEnv("PLM_MCTS_TIMEOUT", 35*time.Second)
 	mctsCallTimeout      = durationFromEnv("PLM_MCTS_CALL_TIMEOUT", 12*time.Second)
@@ -2877,6 +2877,25 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 		}
 	})
 	defer firstTokenTimer.Stop()
+	waitDone := make(chan struct{})
+	if depth == 0 {
+		go func() {
+			t := time.NewTicker(5 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-waitDone:
+					return
+				case <-t.C:
+					if sawFirstToken.Load() {
+						return
+					}
+					fmt.Printf("\nDEBUG: Waiting for first token from %s...\n", modelName)
+				}
+			}
+		}()
+	}
+	defer close(waitDone)
 
 	err := client.Chat(ctx, req, func(resp api.ChatResponse) error {
 		if !sawFirstToken.Load() {
@@ -3957,7 +3976,7 @@ func buildModelCandidates(models []string, selected string) []string {
 	seen := make(map[string]bool)
 	add := func(m string) {
 		m = strings.TrimSpace(m)
-		if m == "" || seen[m] {
+		if m == "" || seen[m] || !isChatCapableModelCandidate(m) {
 			return
 		}
 		seen[m] = true
@@ -3981,6 +4000,23 @@ func buildModelCandidates(models []string, selected string) []string {
 		addWithAliases(m)
 	}
 	return out
+}
+
+func isChatCapableModelCandidate(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"embed",
+		"embedding",
+		"nomic-embed",
+	} {
+		if strings.Contains(m, marker) {
+			return false
+		}
+	}
+	return true
 }
 
 func limitModelCandidates(models []string, maxCount int) []string {

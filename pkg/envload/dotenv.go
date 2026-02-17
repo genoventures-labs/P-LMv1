@@ -9,6 +9,7 @@ import (
 )
 
 const envFileOverride = "PLM_ENV_FILE"
+const defaultOllamaHost = "http://85.31.233.157:11434"
 
 // Autoload loads .env variables into process env without overriding explicit shell vars.
 // Resolution order:
@@ -26,7 +27,7 @@ func Autoload() error {
 	}
 	targetDir, ok := findNearestEnvDir(dir)
 	if !ok {
-		return nil
+		return ensureRuntimeDefaults()
 	}
 
 	for _, name := range []string{".env", ".env.local"} {
@@ -39,6 +40,15 @@ func Autoload() error {
 		}
 		if err := loadFromPath(p); err != nil {
 			return err
+		}
+	}
+	return ensureRuntimeDefaults()
+}
+
+func ensureRuntimeDefaults() error {
+	if strings.TrimSpace(os.Getenv("OLLAMA_HOST")) == "" {
+		if err := os.Setenv("OLLAMA_HOST", defaultOllamaHost); err != nil {
+			return fmt.Errorf("set OLLAMA_HOST default: %w", err)
 		}
 	}
 	return nil

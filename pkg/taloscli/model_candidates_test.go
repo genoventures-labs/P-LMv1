@@ -15,6 +15,13 @@ func TestBuildModelCandidatesPrefersLatestForBareNames(t *testing.T) {
 	}
 }
 
+func TestBuildModelCandidatesSkipsEmbeddingModels(t *testing.T) {
+	got := buildModelCandidates([]string{"nomic-embed-text:latest", "llama3.2:latest"}, "nomic-embed-text:latest")
+	if len(got) != 1 || got[0] != "llama3.2:latest" {
+		t.Fatalf("expected only chat-capable models, got %v", got)
+	}
+}
+
 func TestIsTransientLLMErrorTreatsModelNotFoundAsRetryable(t *testing.T) {
 	err := isTransientLLMError(assertErr("404 Not Found: model 'llama3.1' not found"))
 	if !err {
