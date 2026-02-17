@@ -3,6 +3,7 @@ package taloscli
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -28,6 +29,21 @@ func intFromEnv(key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func boolFromEnv(key string, fallback bool) bool {
+	raw := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if raw == "" {
+		return fallback
+	}
+	switch raw {
+	case "1", "true", "yes", "y", "on":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func contextWindowFromEnv() int {

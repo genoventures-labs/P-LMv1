@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"go/format"
+	"io"
 	"math"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -78,6 +80,13 @@ var chatCmd = &cobra.Command{
 			fmt.Printf("Error creating Ollama client: %v\n", err)
 			return
 		}
+		profile := configureChatTimeouts(chatTimeoutProfile)
+		fmt.Printf("DEBUG: Timeout profile=%s first-token=%s chat=%s mcts=%s\n", profile, llmFirstTokenTimeout, llmChatTimeout, mctsTimeout)
+		if strings.TrimSpace(chatCognitionMode) == "" {
+			chatCognitionMode = strings.TrimSpace(os.Getenv("PLM_COGNITION_MODE"))
+		}
+		chatCognitionMode = normalizeCognitionMode(chatCognitionMode)
+		fmt.Printf("DEBUG: Cognition orchestrator default=%s\n", chatCognitionMode)
 
 		// Check if we have a prompt in arguments
 		if len(args) > 0 {
@@ -215,6 +224,9 @@ var chatCmd = &cobra.Command{
 }
 
 var chatRawOutput bool
+var chatTimeoutProfile string
+var chatWarmup bool
+var chatCognitionMode string
 
 func applyIntentCorrection(raw string, sm *state.Manager, mm *memory.MemoryManager) (string, string) {
 	raw = strings.TrimSpace(raw)
@@ -318,6 +330,94 @@ func isTrivialPrompt(raw string) bool {
 		}
 	}
 	return true
+}
+
+func normalizeTimeoutProfile(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "quick":
+		return "quick"
+	case "deep":
+		return "deep"
+	default:
+		return "normal"
+	}
+}
+
+func profileTimeouts(profile string) timeoutProfileDurations {
+	switch normalizeTimeoutProfile(profile) {
+	case "quick":
+		return timeoutProfileDurations{
+			FirstToken: 8 * time.Second,
+			Chat:       90 * time.Second,
+			ToT:        30 * time.Second,
+			MCTS:       25 * time.Second,
+			MCTSCall:   8 * time.Second,
+		}
+	case "deep":
+		return timeoutProfileDurations{
+			FirstToken: 45 * time.Second,
+			Chat:       240 * time.Second,
+			ToT:        120 * time.Second,
+			MCTS:       80 * time.Second,
+			MCTSCall:   25 * time.Second,
+		}
+	default:
+		return timeoutProfileDurations{
+			FirstToken: 20 * time.Second,
+			Chat:       150 * time.Second,
+			ToT:        60 * time.Second,
+			MCTS:       45 * time.Second,
+			MCTSCall:   15 * time.Second,
+		}
+	}
+}
+
+func configureChatTimeouts(profileOverride string) string {
+	profile := strings.TrimSpace(profileOverride)
+	if profile == "" {
+		profile = strings.TrimSpace(os.Getenv("PLM_CHAT_TIMEOUT_PROFILE"))
+	}
+	profile = normalizeTimeoutProfile(profile)
+	baseline := profileTimeouts(profile)
+
+	llmFirstTokenTimeout = durationFromEnv("PLM_LLM_FIRST_TOKEN_TIMEOUT", baseline.FirstToken)
+	llmChatTimeout = durationFromEnv("PLM_LLM_CHAT_TIMEOUT", baseline.Chat)
+	totTimeout = durationFromEnv("PLM_TOT_TIMEOUT", baseline.ToT)
+	mctsTimeout = durationFromEnv("PLM_MCTS_TIMEOUT", baseline.MCTS)
+	mctsCallTimeout = durationFromEnv("PLM_MCTS_CALL_TIMEOUT", baseline.MCTSCall)
+
+	return profile
+}
+
+func ollamaHostForChat() string {
+	host := strings.TrimSpace(os.Getenv("OLLAMA_HOST"))
+	if host == "" {
+		host = "http://85.31.233.157:11434"
+	}
+	if !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
+		host = "http://" + host
+	}
+	return strings.TrimRight(host, "/")
+}
+
+func warmupOllamaEndpoint(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ollamaHostForChat()+"/api/tags", nil)
+	if err != nil {
+		return fmt.Errorf("build warmup request: %w", err)
+	}
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return fmt.Errorf("warmup ping failed: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 2048))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("warmup ping status: %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func buildIntentMissionContext(mm *memory.MemoryManager, raw string) state.MissionPlan {
@@ -434,11 +534,13 @@ const (
 )
 
 var (
-	llmFirstTokenTimeout = durationFromEnv("PLM_LLM_FIRST_TOKEN_TIMEOUT", 10*time.Second)
-	llmChatTimeout       = durationFromEnv("PLM_LLM_CHAT_TIMEOUT", 120*time.Second)
-	totTimeout           = durationFromEnv("PLM_TOT_TIMEOUT", 45*time.Second)
-	mctsTimeout          = durationFromEnv("PLM_MCTS_TIMEOUT", 35*time.Second)
-	mctsCallTimeout      = durationFromEnv("PLM_MCTS_CALL_TIMEOUT", 12*time.Second)
+	llmFirstTokenTimeout = 20 * time.Second
+	llmChatTimeout       = 150 * time.Second
+	totTimeout           = 60 * time.Second
+	mctsTimeout          = 45 * time.Second
+	mctsCallTimeout      = 15 * time.Second
+	chatWarmupTimeout    = durationFromEnv("PLM_CHAT_WARMUP_TIMEOUT", 3*time.Second)
+	chatWarmupOnce       sync.Once
 	subAgentCredMu       sync.Mutex
 	subAgentCredCache    = map[string]tools.ProvisionedSubAgent{}
 	liveTelemetry        *state.CognitiveTelemetry
@@ -450,6 +552,14 @@ var (
 	workspaceMentalMapMu sync.RWMutex
 	workspaceMentalMap   skills.WorkspaceContext
 )
+
+type timeoutProfileDurations struct {
+	FirstToken time.Duration
+	Chat       time.Duration
+	ToT        time.Duration
+	MCTS       time.Duration
+	MCTSCall   time.Duration
+}
 
 type toolInvocation struct {
 	Tool string                 `json:"tool"`
@@ -564,6 +674,16 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 	}
 
 	tc = maybeProvisionSubAgentClient(tc, input)
+	cognitionPlan := planCognitionBudget(input, sm, chatCognitionMode)
+	fmt.Printf("DEBUG: Cognition mode=%s score=%d thoughtgraph=%t tot=%t mcts=%t context=(h:%d,k:%d)\n",
+		cognitionPlan.Mode,
+		cognitionPlan.ComplexityScore,
+		cognitionPlan.UseThoughtGraph,
+		cognitionPlan.UseTreeOfThought,
+		cognitionPlan.UseMCTS,
+		cognitionPlan.HistoryTopK,
+		cognitionPlan.KnowledgeTopK,
+	)
 
 	// 0. Select model based on complexity
 	modelName := r.ResolveModel(router.ResolveRequest{
@@ -575,12 +695,24 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 	if isTrivialPrompt(input) {
 		modelCandidates = prioritizeLowLatencyModels(modelCandidates)
 	}
+	if cognitionPlan.MaxLinearModels > 0 {
+		modelCandidates = limitModelCandidates(modelCandidates, cognitionPlan.MaxLinearModels)
+	}
 	if len(modelCandidates) == 0 {
 		return fmt.Errorf("no candidate models available")
 	}
 	fmt.Printf("DEBUG: Selected model: %s\n", modelCandidates[0])
+	if chatWarmup {
+		chatWarmupOnce.Do(func() {
+			if err := warmupOllamaEndpoint(chatWarmupTimeout); err != nil {
+				fmt.Printf("DEBUG: Warmup ping failed: %v\n", err)
+				return
+			}
+			fmt.Printf("DEBUG: Warmup ping OK (%s).\n", ollamaHostForChat())
+		})
+	}
 
-	if shouldUseThoughtGraph(input) {
+	if cognitionPlan.UseThoughtGraph && shouldUseThoughtGraph(input) {
 		fmt.Println("DEBUG: Complex query detected. Using ThoughtGraph orchestration.")
 		if err := executeThoughtGraphTurn(client, mm, tc, r, modelCandidates, input, history, sm); err == nil {
 			return nil
@@ -590,12 +722,12 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 	}
 
 	// 1. Retrieve context from memory
-	historyContext, err := mm.RetrieveDynamicContext(input, 3)
+	historyContext, err := mm.RetrieveDynamicContext(input, cognitionPlan.HistoryTopK)
 	if err != nil {
 		fmt.Printf("Warning: Error retrieving history: %v\n", err)
 	}
 
-	knowledgeContext, err := mm.RetrieveKnowledge(input, 3)
+	knowledgeContext, err := mm.RetrieveKnowledge(input, cognitionPlan.KnowledgeTopK)
 	if err != nil {
 		fmt.Printf("Warning: Error retrieving knowledge: %v\n", err)
 	}
@@ -635,7 +767,7 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 		fmt.Printf("Warning: Error adding user message to memory: %v\n", err)
 	}
 
-	return performChatWithTools(client, mm, tc, modelCandidates, 0, input, requestMessages, history, 0, sm)
+	return performChatWithTools(client, mm, tc, modelCandidates, 0, input, requestMessages, history, 0, sm, cognitionPlan)
 }
 
 func maybeHandleUserSkillCreate(input string, tc *tools.GLMToolClient) (bool, string) {
@@ -2841,7 +2973,7 @@ Return JSON only:
 	return score, nil
 }
 
-func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMToolClient, modelCandidates []string, modelIndex int, taskQuery string, messages []api.Message, history *[]api.Message, depth int, sm *state.Manager) error {
+func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMToolClient, modelCandidates []string, modelIndex int, taskQuery string, messages []api.Message, history *[]api.Message, depth int, sm *state.Manager, budget cognitionBudget) error {
 	turnStarted := time.Now()
 	if depth > 5 {
 		return fmt.Errorf("maximum tool call depth exceeded")
@@ -2970,7 +3102,7 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 				fmt.Printf("DEBUG: Model %s timed out after %s. Falling back to %s.\n", modelName, llmChatTimeout, nextModel)
 			}
 			stopWaitLoop()
-			return performChatWithTools(client, mm, tc, resolvedCandidates, modelIndex+1, taskQuery, messages, history, depth, sm)
+			return performChatWithTools(client, mm, tc, resolvedCandidates, modelIndex+1, taskQuery, messages, history, depth, sm, budget)
 		}
 		if depth > 0 && (isTotalTimeout || isFirstTokenTimeout || isTransient) {
 			if fallbackAnswer := buildFallbackAnswerFromToolResults(messages); fallbackAnswer != "" {
@@ -3004,9 +3136,11 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 	fullResponse := responseContent.String()
 	toolCalls, hasToolCalls := parseToolCalls(fullResponse)
 	if !hasToolCalls {
-		if shouldUseTreeOfThought(taskQuery, depth) {
-			if optimized, ok := runMonteCarloThoughtSearch(client, mm, modelName, taskQuery, sanitizeModelOutput(fullResponse)); ok {
-				fullResponse = optimized
+		if budget.UseTreeOfThought && shouldUseTreeOfThought(taskQuery, depth) {
+			if budget.UseMCTS {
+				if optimized, ok := runMonteCarloThoughtSearch(client, mm, modelName, taskQuery, sanitizeModelOutput(fullResponse)); ok {
+					fullResponse = optimized
+				}
 			}
 			if optimized, ok := runTreeOfThought(client, modelName, taskQuery, sanitizeModelOutput(fullResponse)); ok {
 				fullResponse = optimized
@@ -3086,7 +3220,7 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 		}
 
 		fmt.Printf("DEBUG: Requesting next step/final answer with %d total messages...\n", len(messages))
-		return performChatWithTools(client, mm, tc, modelCandidates, modelIndex, taskQuery, messages, history, depth+1, sm)
+		return performChatWithTools(client, mm, tc, modelCandidates, modelIndex, taskQuery, messages, history, depth+1, sm, budget)
 	}
 	if hasToolCalls && tc == nil {
 		if depth >= 2 {
@@ -3109,7 +3243,7 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 			*history = append(*history, api.Message{Role: "assistant", Content: fullResponse})
 			*history = append(*history, api.Message{Role: "user", Content: "Tools are unavailable in this session. Do not emit tool calls. Provide a direct final answer now."})
 		}
-		return performChatWithTools(client, mm, tc, modelCandidates, modelIndex, taskQuery, messages, history, depth+1, sm)
+		return performChatWithTools(client, mm, tc, modelCandidates, modelIndex, taskQuery, messages, history, depth+1, sm, budget)
 	}
 
 	safeOutput := sanitizeModelOutput(fullResponse)
@@ -5839,5 +5973,8 @@ func getArgWarRoomBoxes(args map[string]interface{}, key string) []skills.WarRoo
 
 func init() {
 	chatCmd.Flags().BoolVarP(&chatRawOutput, "raw", "r", false, "Bypass breath-aware output cadence and print responses immediately")
+	chatCmd.Flags().StringVar(&chatTimeoutProfile, "timeout-profile", "", "Timeout profile: quick|normal|deep (default from PLM_CHAT_TIMEOUT_PROFILE or normal)")
+	chatCmd.Flags().BoolVar(&chatWarmup, "warmup", boolFromEnv("PLM_CHAT_WARMUP", true), "Run one-time Ollama warmup ping before first chat inference")
+	chatCmd.Flags().StringVar(&chatCognitionMode, "cognition", "", "Cognition orchestration mode: auto|minimal|balanced|deep (default from PLM_COGNITION_MODE or auto)")
 	rootCmd.AddCommand(chatCmd)
 }
