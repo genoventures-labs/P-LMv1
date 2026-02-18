@@ -38,6 +38,30 @@ var explainCmd = &cobra.Command{
 
 var capabilityDocs = []capabilityDoc{
 	{
+		Name:    "profile-gen",
+		Summary: "Generates domain-based baseline profiles for learn and research workflows.",
+		Usage: []string{
+			"talos learn profile-gen <domain>",
+			"talos learn profile-gen --list-domains",
+			"talos learn profile-gen security --set-default",
+			"talos research profile-gen <domain>",
+			"talos research profile-gen --list-domains",
+			"talos research profile-gen compliance --set-default",
+		},
+		Abilities: []string{
+			"Builds deterministic profile presets from built-in domains.",
+			"Supports dry-run preview without saving profile records.",
+			"Uses safe collision behavior by default and requires --force to overwrite existing profile names.",
+			"Can set generated profiles as defaults for learn or research workflows.",
+		},
+		Examples: []string{
+			"talos learn profile-gen security --set-default",
+			"talos research profile-gen compliance --category audit --set-default",
+		},
+		Related: []string{"learn profile", "research profile", "learn", "research"},
+		Aliases: []string{"profile generator", "generate profile"},
+	},
+	{
 		Name:    "find",
 		Summary: "Searches TALOS commands by keyword across command names and descriptions.",
 		Usage: []string{

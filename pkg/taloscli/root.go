@@ -77,6 +77,7 @@ It leverages the JIT model router to ensure optimal models are available.`,
   talos learn profile import --in .memory/talos_profiles_bundle.json --merge
   talos learn profile-gen security --set-default
   talos research profile-gen compliance --set-default
+  talos learn profile-gen --list-domains
   talos benchmark full
   talos multi-agent "Design a rollout plan" --mode planning
   talos multi-agent "Analyze release risk" --agents planner,researcher,verifier,synthesizer
