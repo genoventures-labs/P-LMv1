@@ -24,10 +24,12 @@ func TestRootHelpTemplate(t *testing.T) {
 	}
 
 	requiredSections := []string{
-		"TALOS CLI",
+		"TALOS CLI HELP",
 		"USAGE",
-		"AVAILABLE COMMANDS",
-		"MORE INFO",
+		"COMMANDS",
+		"EXAMPLES",
+		"MORE",
+		"talos /next",
 	}
 	for _, section := range requiredSections {
 		if !strings.Contains(rendered, section) {

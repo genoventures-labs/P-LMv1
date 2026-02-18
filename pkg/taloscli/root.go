@@ -48,6 +48,15 @@ MORE INFO
   Use "{{.CommandPath}} [command] --help" for more details on a command.
 `
 
+var nextCmd = &cobra.Command{
+	Use:     "next",
+	Aliases: []string{"/next"},
+	Short:   "Show next page of root help output.",
+	Run: func(cmd *cobra.Command, args []string) {
+		renderRootHelpPage(cmd.OutOrStdout(), false)
+	},
+}
+
 var rootCmd = &cobra.Command{
 	Use:     "talos",
 	Aliases: []string{"personal-llm"},
@@ -72,6 +81,8 @@ It leverages the JIT model router to ensure optimal models are available.`,
   talos version
   talos update check
   talos completion bash > ~/.local/share/bash-completion/completions/talos
+  talos --help
+  talos /next
   talos pipeline "research run 'What changed in X this week?' --skill analyst ; learn --from-research latest --skill memory_curator"
   talos pipeline "research run 'What changed in X this week?' ; learn --from-research latest"
   talos "research run 'What changed in X this week?' ; learn --from-research latest"
@@ -98,7 +109,7 @@ It leverages the JIT model router to ensure optimal models are available.`,
 	},
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		path := strings.ToLower(strings.TrimSpace(cmd.CommandPath()))
-		if strings.Contains(path, " update") || strings.HasSuffix(path, " version") || strings.HasSuffix(path, " release-check") {
+		if strings.Contains(path, " update") || strings.HasSuffix(path, " version") || strings.HasSuffix(path, " release-check") || strings.HasSuffix(path, " next") || strings.HasSuffix(path, " /next") {
 			return
 		}
 		maybeAutoUpdate()
@@ -115,5 +126,14 @@ func Execute() {
 func init() {
 	rootCmd.SetHelpTemplate(talosHelpTemplate)
 	rootCmd.SetUsageTemplate(talosHelpTemplate)
+	defaultHelpFunc := rootCmd.HelpFunc()
+	rootCmd.SetHelpFunc(func(cmd *cobra.Command, args []string) {
+		if cmd == rootCmd {
+			renderRootHelpPage(cmd.OutOrStdout(), true)
+			return
+		}
+		defaultHelpFunc(cmd, args)
+	})
 	rootCmd.PersistentFlags().StringVar(&requestedSkill, "skill", "", "Use a specific enabled TALOS skill by ID, name, or path fragment")
+	rootCmd.AddCommand(nextCmd)
 }

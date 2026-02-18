@@ -58,6 +58,13 @@ Run TALOS:
 go run ./cmd/talos
 ```
 
+View paged help:
+
+```bash
+talos --help
+talos /next
+```
+
 Use a specific skill for chat:
 
 ```bash

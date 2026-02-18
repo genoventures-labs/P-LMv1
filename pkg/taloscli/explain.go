@@ -38,6 +38,26 @@ var explainCmd = &cobra.Command{
 
 var capabilityDocs = []capabilityDoc{
 	{
+		Name:    "help",
+		Summary: "Displays paged root help with command table and example pagination.",
+		Usage: []string{
+			"talos --help",
+			"talos /next",
+			"talos next",
+		},
+		Abilities: []string{
+			"Renders root help as a professional ASCII command table.",
+			"Shows up to 10 commands per page and up to 3 examples per page.",
+			"Persists help page state and advances with /next until complete.",
+		},
+		Examples: []string{
+			"talos --help",
+			"talos /next",
+		},
+		Related: []string{"explain", "completion"},
+		Aliases: []string{"next", "/next", "help pager"},
+	},
+	{
 		Name:    "chat",
 		Summary: "Primary conversational interface for interactive or one-shot prompts.",
 		Usage: []string{
