@@ -127,8 +127,15 @@ func runUpdateApply() error {
 		return nil
 	}
 	primaryErr := fmt.Errorf("go install failed: %w\n%s", err, strings.TrimSpace(string(out)))
+	if localErr := installFromLocalCheckout(); localErr == nil {
+		binPath := resolveTalosBinPath()
+		fmt.Println("Update complete (local checkout fallback).")
+		fmt.Printf("Binary path: %s\n", binPath)
+		fmt.Println("Run: talos version")
+		return nil
+	}
 	if fallbackErr := installFromOriginHead(latest); fallbackErr != nil {
-		return fmt.Errorf("%v\nfallback install failed: %v", primaryErr, fallbackErr)
+		return fmt.Errorf("%v\nlocal checkout fallback failed.\norigin fallback install failed: %v", primaryErr, fallbackErr)
 	}
 	binPath := resolveTalosBinPath()
 	fmt.Println("Update complete (origin fallback).")
@@ -439,6 +446,25 @@ func installFromOriginHead(_ string) error {
 	installOut, installErr := installCmd.CombinedOutput()
 	if installErr != nil {
 		return fmt.Errorf("go install ./cmd/talos failed: %w: %s", installErr, strings.TrimSpace(string(installOut)))
+	}
+	return nil
+}
+
+func installFromLocalCheckout() error {
+	wd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(wd, "go.mod")); err != nil {
+		return fmt.Errorf("go.mod not found in current directory")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "install", "./cmd/talos")
+	cmd.Dir = wd
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("go install ./cmd/talos failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
