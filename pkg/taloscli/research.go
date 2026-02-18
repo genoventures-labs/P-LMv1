@@ -56,6 +56,8 @@ var (
 	researchDeepSeedURLs         []string
 
 	researchSessionsLast int
+	researchRunDryRun    bool
+	researchDeepDryRun   bool
 )
 
 var researchCmd = &cobra.Command{
@@ -66,14 +68,27 @@ var researchCmd = &cobra.Command{
 var researchRunCmd = &cobra.Command{
 	Use:   "run [query]",
 	Short: "Run bounded research workflow with tool-assisted discovery and synthesis.",
-	Args:  cobra.MinimumNArgs(1),
+	Args:  cobra.ArbitraryArgs,
 	Run: func(cmd *cobra.Command, args []string) {
 		query := strings.TrimSpace(strings.Join(args, " "))
-		if query == "" {
-			fmt.Println("Query cannot be empty.")
+		resolvedQuery, err := resolveResearchProfileForRun(cmd, "run", query)
+		if err != nil {
+			fmt.Printf("Error resolving research profile: %v\n", err)
 			return
 		}
-		report, _, err := executeResearchMode("run", query)
+		if strings.TrimSpace(resolvedQuery) == "" {
+			fmt.Println("Query cannot be empty. Provide a query or set --query-template in the selected profile.")
+			return
+		}
+		ctx := researchExecutionContext{
+			ProfileName:       researchProfileApplied,
+			ProfileCategories: append([]string(nil), researchCategoriesApplied...),
+		}
+		if researchRunDryRun {
+			fmt.Println(renderResearchDryRunPlan("run", resolvedQuery, ctx))
+			return
+		}
+		report, _, err := executeResearchMode("run", resolvedQuery, ctx)
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
 			return
@@ -85,14 +100,27 @@ var researchRunCmd = &cobra.Command{
 var researchDeepCmd = &cobra.Command{
 	Use:   "deep [query]",
 	Short: "Run advanced deep research with expanded depth and multi-agent pipeline.",
-	Args:  cobra.MinimumNArgs(1),
+	Args:  cobra.ArbitraryArgs,
 	Run: func(cmd *cobra.Command, args []string) {
 		query := strings.TrimSpace(strings.Join(args, " "))
-		if query == "" {
-			fmt.Println("Query cannot be empty.")
+		resolvedQuery, err := resolveResearchProfileForRun(cmd, "deep", query)
+		if err != nil {
+			fmt.Printf("Error resolving research profile: %v\n", err)
 			return
 		}
-		report, _, err := executeResearchMode("deep", query)
+		if strings.TrimSpace(resolvedQuery) == "" {
+			fmt.Println("Query cannot be empty. Provide a query or set --query-template in the selected profile.")
+			return
+		}
+		ctx := researchExecutionContext{
+			ProfileName:       researchProfileApplied,
+			ProfileCategories: append([]string(nil), researchCategoriesApplied...),
+		}
+		if researchDeepDryRun {
+			fmt.Println(renderResearchDryRunPlan("deep", resolvedQuery, ctx))
+			return
+		}
+		report, _, err := executeResearchMode("deep", resolvedQuery, ctx)
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
 			return
@@ -117,7 +145,12 @@ var researchSessionsCmd = &cobra.Command{
 	},
 }
 
-func executeResearchMode(mode, query string) (researchReport, string, error) {
+type researchExecutionContext struct {
+	ProfileName       string
+	ProfileCategories []string
+}
+
+func executeResearchMode(mode, query string, ctx researchExecutionContext) (researchReport, string, error) {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	if mode != "run" && mode != "deep" {
 		return researchReport{}, "", fmt.Errorf("unsupported research mode: %s", mode)
@@ -180,7 +213,7 @@ Return plain text only.`
 		if runErr != nil {
 			report := buildResearchReport("run", query, "", nil, nil, nil)
 			report.Risks = append(report.Risks, "Research execution failed: "+runErr.Error())
-			rec, persistErr := persistResearchSession(query, "run", report, "FAILED", runErr.Error(), len(toolLogs))
+			rec, persistErr := persistResearchSession(query, "run", report, "FAILED", runErr.Error(), len(toolLogs), ctx)
 			if persistErr != nil {
 				fmt.Printf("Warning: Failed to write research session log: %v\n", persistErr)
 			}
@@ -191,7 +224,7 @@ Return plain text only.`
 		sourceList := uniqueStrings(extractURLs(strings.Join(toolLogs, "\n") + "\n" + resp))
 		findings := buildFindings(resp, sourceList)
 		report := buildResearchReport("run", query, sanitizeModelOutput(resp), findings, sourceList, toolLogs)
-		rec, persistErr := persistResearchSession(query, "run", report, "SUCCESS", "", len(toolLogs))
+		rec, persistErr := persistResearchSession(query, "run", report, "SUCCESS", "", len(toolLogs), ctx)
 		if persistErr != nil {
 			fmt.Printf("Warning: Failed to write research session log: %v\n", persistErr)
 		}
@@ -232,7 +265,7 @@ Return plain text only.`
 	if deepErr != nil {
 		report := buildResearchReport("deep", query, "", nil, nil, nil)
 		report.Risks = append(report.Risks, "Deep research execution failed: "+deepErr.Error())
-		rec, persistErr := persistResearchSession(query, "deep", report, "FAILED", deepErr.Error(), 0)
+		rec, persistErr := persistResearchSession(query, "deep", report, "FAILED", deepErr.Error(), 0, ctx)
 		if persistErr != nil {
 			fmt.Printf("Warning: Failed to write research session log: %v\n", persistErr)
 		}
@@ -242,7 +275,7 @@ Return plain text only.`
 	fmt.Println("Phase: Synthesis")
 	findings := buildFindings(answer, refs)
 	report := buildResearchReport("deep", query, sanitizeModelOutput(answer), findings, refs, nil)
-	rec, persistErr := persistResearchSession(query, "deep", report, "SUCCESS", "", 0)
+	rec, persistErr := persistResearchSession(query, "deep", report, "SUCCESS", "", 0, ctx)
 	if persistErr != nil {
 		fmt.Printf("Warning: Failed to write research session log: %v\n", persistErr)
 	}
@@ -447,6 +480,9 @@ func init() {
 	researchRunCmd.Flags().DurationVar(&researchRunTimeout, "timeout", 120*time.Second, "Total LLM timeout budget for run mode")
 	researchRunCmd.Flags().BoolVar(&researchRunVerbose, "verbose", false, "Enable verbose research logs")
 	researchRunCmd.Flags().StringSliceVar(&researchRunSeedURLs, "seed-url", nil, "Seed URL(s) to prioritize during run mode")
+	researchRunCmd.Flags().StringVar(&researchProfileForRun, "profile", "", "Apply a saved research profile")
+	researchRunCmd.Flags().StringVar(&researchCategoryForRun, "category", "", "Optional category assertion for --profile")
+	researchRunCmd.Flags().BoolVar(&researchRunDryRun, "dry-run", false, "Print resolved research plan without execution")
 
 	researchDeepCmd.Flags().IntVar(&researchDeepMaxPages, "max-pages", 80, "Maximum pages/sources to consider during deep mode")
 	researchDeepCmd.Flags().IntVar(&researchDeepCrawlDepth, "crawl-depth", 2, "Crawl depth budget hint for deep mode")
@@ -455,9 +491,13 @@ func init() {
 	researchDeepCmd.Flags().DurationVar(&researchDeepTimeout, "timeout", 240*time.Second, "Total LLM timeout budget for deep mode")
 	researchDeepCmd.Flags().BoolVar(&researchDeepVerbose, "verbose", false, "Enable verbose deep research logs")
 	researchDeepCmd.Flags().StringSliceVar(&researchDeepSeedURLs, "seed-url", nil, "Seed URL(s) to prioritize during deep mode")
+	researchDeepCmd.Flags().StringVar(&researchProfileForRun, "profile", "", "Apply a saved research profile")
+	researchDeepCmd.Flags().StringVar(&researchCategoryForRun, "category", "", "Optional category assertion for --profile")
+	researchDeepCmd.Flags().BoolVar(&researchDeepDryRun, "dry-run", false, "Print resolved deep research plan without execution")
 
 	researchSessionsCmd.Flags().IntVar(&researchSessionsLast, "last", 10, "Number of recent sessions to show")
 
+	installResearchProfileCommands()
 	researchCmd.AddCommand(researchRunCmd)
 	researchCmd.AddCommand(researchDeepCmd)
 	researchCmd.AddCommand(researchSessionsCmd)

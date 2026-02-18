@@ -100,6 +100,21 @@ Learn from a Hugging Face dataset:
 HF_TOKEN=your_token talos learn --hf-dataset wikipedia --hf-split train --hf-max-records 100
 ```
 
+Create and use a reusable learn profile:
+
+```bash
+talos learn profile create --name hf-train-default --hf-dataset TeichAI/claude-4.5-opus-high-reasoning-250x --hf-config default --hf-split train
+talos learn profile set-default --name hf-train-default
+talos learn --profile hf-train-default
+```
+
+Export and import unified learn/research profile bundles:
+
+```bash
+talos learn profile export --out .memory/talos_profiles_bundle.json
+talos learn profile import --in .memory/talos_profiles_bundle.json --merge
+```
+
 Install TALOS for all terminals:
 
 ```bash
@@ -124,16 +139,36 @@ Run runtime diagnostics:
 talos doctor
 ```
 
+Run strict pre-release gate checks:
+
+```bash
+talos release-check
+```
+
 Run bounded research:
 
 ```bash
 talos research run "What changed in dependency policy this week?"
 ```
 
+Run research with a saved/default profile or dry-run:
+
+```bash
+talos research profiles set-default --name market-scan
+talos research run --profile market-scan "What changed in dependency policy this week?"
+talos research run --dry-run --category crypto "What changed in dependency policy this week?"
+```
+
 Run deep multi-agent research:
 
 ```bash
 talos research deep "Evaluate tradeoffs between vector stores for this repository"
+```
+
+Preview learn execution without indexing:
+
+```bash
+talos learn --profile hf-train-default --dry-run
 ```
 
 List recent research sessions/artifacts:

@@ -12,6 +12,7 @@ import (
 	"github.com/Thynaptic/P-LMv1/pkg/memory"
 	"github.com/Thynaptic/P-LMv1/pkg/rag"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 var learnFile string
@@ -45,21 +46,35 @@ var learnURLSafetyFailOpen bool
 var learnFromResearch string
 var learnIncludeResearchSources bool
 var learnIncludeResearchSummary bool
+var learnDryRun bool
 
 var learnCmd = &cobra.Command{
 	Use:   "learn [text]",
 	Short: "Add knowledge to your personal LLM's memory.",
 	Long:  `This command allows you to teach your personal LLM new information by adding text, files, directories, URLs, or Hugging Face datasets into its persistent knowledge base.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		mm, err := memory.NewMemoryManager()
-		if err != nil {
-			fmt.Printf("Error initializing memory manager: %v\n", err)
+		if _, err := resolveLearnProfileForRun(cmd); err != nil {
+			fmt.Printf("Error resolving learn profile: %v\n", err)
+			return
+		}
+		if learnDryRun {
+			plan, err := renderLearnDryRunPlan(args)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+				return
+			}
+			fmt.Println(plan)
 			return
 		}
 		if strings.TrimSpace(learnFromResearch) != "" {
 			if err := executeLearnFromResearch(learnFromResearch, learnIncludeResearchSummary, learnIncludeResearchSources); err != nil {
 				fmt.Printf("Error learning from research artifact: %v\n", err)
 			}
+			return
+		}
+		mm, err := memory.NewMemoryManager()
+		if err != nil {
+			fmt.Printf("Error initializing memory manager: %v\n", err)
 			return
 		}
 
@@ -69,6 +84,7 @@ var learnCmd = &cobra.Command{
 				"chunk_chars":   fmt.Sprintf("%d", learnChunkChars),
 				"chunk_overlap": fmt.Sprintf("%d", learnChunkOverlap),
 			})
+			annotateLearnSessionWithProfile(&session, learnProfileApplied)
 			opts := rag.DefaultIndexOptions()
 			opts.Recursive = learnRecursive
 			opts.MaxChunkChars = learnChunkChars
@@ -203,6 +219,7 @@ var learnCmd = &cobra.Command{
 				"url_safety":           fmt.Sprintf("%t", learnURLSafety),
 				"url_safety_fail_open": fmt.Sprintf("%t", learnURLSafetyFailOpen),
 			})
+			annotateLearnSessionWithProfile(&session, learnProfileApplied)
 			totalStats := rag.RemoteIndexStats{}
 			if len(seedURLs) > 0 {
 				if remoteOpts.URLSafetyEnabled && strings.TrimSpace(remoteOpts.URLSafetyAPIKey) == "" && !remoteOpts.URLSafetyFailOpen {
@@ -297,6 +314,7 @@ var learnCmd = &cobra.Command{
 			if err != nil {
 				fmt.Printf("Error reading file %s: %v\n", learnFile, err)
 				session := newLearnSession("FILE", learnFile, []string{learnFile}, nil)
+				annotateLearnSessionWithProfile(&session, learnProfileApplied)
 				session.finish("FAILED", "File learning failed.", err.Error(), map[string]int64{"items_indexed": 0, "errors": 1})
 				if logErr := appendLearnSessionRecord(session); logErr != nil {
 					fmt.Printf("Warning: Failed to write learn session log: %v\n", logErr)
@@ -319,6 +337,7 @@ var learnCmd = &cobra.Command{
 		if err != nil {
 			fmt.Printf("Error adding knowledge to memory: %v\n", err)
 			session := newLearnSession(mode, target, []string{target}, nil)
+			annotateLearnSessionWithProfile(&session, learnProfileApplied)
 			session.finish("FAILED", "Inline/file learning failed.", err.Error(), map[string]int64{"items_indexed": 0, "errors": 1})
 			if logErr := appendLearnSessionRecord(session); logErr != nil {
 				fmt.Printf("Warning: Failed to write learn session log: %v\n", logErr)
@@ -326,6 +345,7 @@ var learnCmd = &cobra.Command{
 			return
 		}
 		session := newLearnSession(mode, target, []string{target}, nil)
+		annotateLearnSessionWithProfile(&session, learnProfileApplied)
 		session.finish("SUCCESS", "Inline/file learning completed successfully.", "", map[string]int64{"items_indexed": 1, "chunks_indexed": 1})
 		if logErr := appendLearnSessionRecord(session); logErr != nil {
 			fmt.Printf("Warning: Failed to write learn session log: %v\n", logErr)
@@ -336,41 +356,58 @@ var learnCmd = &cobra.Command{
 }
 
 func init() {
-	learnCmd.Flags().StringVarP(&learnFile, "file", "f", "", "Path to a file to learn from")
-	learnCmd.Flags().StringVarP(&learnDir, "dir", "d", "", "Path to a directory of documents to index")
-	learnCmd.Flags().BoolVarP(&learnRecursive, "recursive", "r", true, "Recursively index subdirectories when using --dir")
-	learnCmd.Flags().IntVar(&learnChunkChars, "chunk-chars", 1200, "Maximum characters per indexed chunk when using --dir")
-	learnCmd.Flags().IntVar(&learnChunkOverlap, "chunk-overlap", 200, "Overlap between chunks when using --dir")
-	learnCmd.Flags().StringVar(&learnExtensions, "extensions", "", "Comma-separated extensions to index with --dir (e.g. .pdf,.md,.txt)")
-	learnCmd.Flags().StringSliceVar(&learnTypes, "type", nil, "Repeatable file extension filter with --dir (e.g. --type .md --type .txt)")
-	learnCmd.Flags().BoolVar(&learnAllTypes, "all-types", false, "Index all file types under --dir (binary files are skipped)")
-	learnCmd.Flags().StringArrayVar(&learnURLs, "url", nil, "URL to index (repeatable)")
-	learnCmd.Flags().StringVar(&learnURLFile, "url-file", "", "Path to a newline-delimited URL list")
-	learnCmd.Flags().BoolVar(&learnCrawl, "crawl", false, "Follow links while indexing URLs")
-	learnCmd.Flags().IntVar(&learnCrawlDepth, "crawl-depth", 1, "Crawl depth when --crawl is enabled")
-	learnCmd.Flags().IntVar(&learnMaxPages, "max-pages", 200, "Maximum fetched pages/items per remote run")
-	learnCmd.Flags().Float64Var(&learnRateLimit, "rate-limit", 2.0, "Remote request rate limit in requests/sec")
-	learnCmd.Flags().StringSliceVar(&learnAllowedDomains, "allowed-domain", nil, "Allowed domain for URL crawling (repeatable)")
-	learnCmd.Flags().StringVar(&learnUserAgent, "user-agent", "talos/1.0 (+https://thynaptic.com)", "User agent for remote requests")
-	learnCmd.Flags().DurationVar(&learnRemoteTimeout, "remote-timeout", 20*time.Second, "Timeout for each remote request")
-	learnCmd.Flags().Int64Var(&learnMaxBytes, "max-bytes", 10*1024*1024, "Maximum bytes per remote item")
-	learnCmd.Flags().StringVar(&learnAuthHeaderEnv, "auth-header-env", "", "Environment variable containing Authorization header value for URL fetches")
-	learnCmd.Flags().BoolVar(&learnURLSafety, "url-safety", true, "Run URL safety verdict checks before indexing URL content")
-	learnCmd.Flags().DurationVar(&learnURLSafetyTimeout, "url-safety-timeout", 45*time.Second, "Timeout budget for URL safety scan verdict")
-	learnCmd.Flags().DurationVar(&learnURLSafetyCacheTTL, "url-safety-cache-ttl", 24*time.Hour, "Cache TTL for URL safety verdicts")
-	learnCmd.Flags().StringVar(&learnURLSafetyVisibility, "url-safety-visibility", "private", "URL safety scan visibility: private|unlisted|public")
-	learnCmd.Flags().BoolVar(&learnURLSafetyFailOpen, "url-safety-fail-open", false, "Allow URL ingest when safety service errors/unavailable")
-	learnCmd.Flags().StringArrayVar(&learnHFDatasets, "hf-dataset", nil, "Hugging Face dataset id to index (repeatable)")
-	learnCmd.Flags().StringVar(&learnHFConfig, "hf-config", "", "Hugging Face dataset config")
-	learnCmd.Flags().StringVar(&learnHFSplit, "hf-split", "train", "Hugging Face dataset split")
-	learnCmd.Flags().IntVar(&learnHFMaxRecords, "hf-max-records", 100, "Maximum records per HF dataset to index")
-	learnCmd.Flags().StringVar(&learnFromResearch, "from-research", "", "Ingest from a research artifact id or 'latest'")
-	learnCmd.Flags().BoolVar(&learnIncludeResearchSummary, "include-research-summary", true, "Include research summary/findings text during --from-research ingest")
-	learnCmd.Flags().BoolVar(&learnIncludeResearchSources, "include-research-sources", true, "Include source URL indexing during --from-research ingest")
+	learnCmd.Flags().StringVar(&learnProfile, "profile", "", "Learn profile name to apply (falls back to default profile when omitted)")
+	learnCmd.Flags().BoolVar(&learnDryRun, "dry-run", false, "Print resolved learn execution plan without indexing")
+	bindLearnConfigFlags(learnCmd.Flags())
 	if f := learnCmd.Flags().Lookup("from-research"); f != nil {
 		f.NoOptDefVal = "latest"
 	}
+	installLearnProfileCommands()
 	rootCmd.AddCommand(learnCmd)
+}
+
+func bindLearnConfigFlags(fs *pflag.FlagSet) {
+	fs.StringVarP(&learnFile, "file", "f", "", "Path to a file to learn from")
+	fs.StringVarP(&learnDir, "dir", "d", "", "Path to a directory of documents to index")
+	fs.BoolVarP(&learnRecursive, "recursive", "r", true, "Recursively index subdirectories when using --dir")
+	fs.IntVar(&learnChunkChars, "chunk-chars", 1200, "Maximum characters per indexed chunk when using --dir")
+	fs.IntVar(&learnChunkOverlap, "chunk-overlap", 200, "Overlap between chunks when using --dir")
+	fs.StringVar(&learnExtensions, "extensions", "", "Comma-separated extensions to index with --dir (e.g. .pdf,.md,.txt)")
+	fs.StringSliceVar(&learnTypes, "type", nil, "Repeatable file extension filter with --dir (e.g. --type .md --type .txt)")
+	fs.BoolVar(&learnAllTypes, "all-types", false, "Index all file types under --dir (binary files are skipped)")
+	fs.StringArrayVar(&learnURLs, "url", nil, "URL to index (repeatable)")
+	fs.StringVar(&learnURLFile, "url-file", "", "Path to a newline-delimited URL list")
+	fs.BoolVar(&learnCrawl, "crawl", false, "Follow links while indexing URLs")
+	fs.IntVar(&learnCrawlDepth, "crawl-depth", 1, "Crawl depth when --crawl is enabled")
+	fs.IntVar(&learnMaxPages, "max-pages", 200, "Maximum fetched pages/items per remote run")
+	fs.Float64Var(&learnRateLimit, "rate-limit", 2.0, "Remote request rate limit in requests/sec")
+	fs.StringSliceVar(&learnAllowedDomains, "allowed-domain", nil, "Allowed domain for URL crawling (repeatable)")
+	fs.StringVar(&learnUserAgent, "user-agent", "talos/1.0 (+https://thynaptic.com)", "User agent for remote requests")
+	fs.DurationVar(&learnRemoteTimeout, "remote-timeout", 20*time.Second, "Timeout for each remote request")
+	fs.Int64Var(&learnMaxBytes, "max-bytes", 10*1024*1024, "Maximum bytes per remote item")
+	fs.StringVar(&learnAuthHeaderEnv, "auth-header-env", "", "Environment variable containing Authorization header value for URL fetches")
+	fs.BoolVar(&learnURLSafety, "url-safety", true, "Run URL safety verdict checks before indexing URL content")
+	fs.DurationVar(&learnURLSafetyTimeout, "url-safety-timeout", 45*time.Second, "Timeout budget for URL safety scan verdict")
+	fs.DurationVar(&learnURLSafetyCacheTTL, "url-safety-cache-ttl", 24*time.Hour, "Cache TTL for URL safety verdicts")
+	fs.StringVar(&learnURLSafetyVisibility, "url-safety-visibility", "private", "URL safety scan visibility: private|unlisted|public")
+	fs.BoolVar(&learnURLSafetyFailOpen, "url-safety-fail-open", false, "Allow URL ingest when safety service errors/unavailable")
+	fs.StringArrayVar(&learnHFDatasets, "hf-dataset", nil, "Hugging Face dataset id to index (repeatable)")
+	fs.StringVar(&learnHFConfig, "hf-config", "", "Hugging Face dataset config")
+	fs.StringVar(&learnHFSplit, "hf-split", "train", "Hugging Face dataset split")
+	fs.IntVar(&learnHFMaxRecords, "hf-max-records", 100, "Maximum records per HF dataset to index")
+	fs.StringVar(&learnFromResearch, "from-research", "", "Ingest from a research artifact id or 'latest'")
+	fs.BoolVar(&learnIncludeResearchSummary, "include-research-summary", true, "Include research summary/findings text during --from-research ingest")
+	fs.BoolVar(&learnIncludeResearchSources, "include-research-sources", true, "Include source URL indexing during --from-research ingest")
+}
+
+func annotateLearnSessionWithProfile(session *LearnSessionRecord, profileName string) {
+	if session == nil || strings.TrimSpace(profileName) == "" {
+		return
+	}
+	if session.ConfigSnapshot == nil {
+		session.ConfigSnapshot = map[string]string{}
+	}
+	session.ConfigSnapshot["profile_name"] = strings.TrimSpace(profileName)
 }
 
 func executeLearnFromResearch(selector string, includeSummary bool, includeSources bool) error {

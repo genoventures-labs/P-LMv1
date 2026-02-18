@@ -58,6 +58,14 @@ It leverages the JIT model router to ensure optimal models are available.`,
   talos chat --cognition minimal --timeout-profile quick "Online?"
   talos --skill report2markdown chat "Convert this into markdown release notes"
   talos research run "What changed in X this week?"
+  talos research run --profile market-scan "What changed in X this week?"
+  talos research run --category crypto "What changed in X this week?"
+  talos research run --profile market-scan --dry-run
+  talos research profiles create --name market-scan --category crypto --query-template "Weekly market scan" --max-pages 60 --crawl-depth 2
+  talos research profiles set-default --name market-scan
+  talos learn --profile hf-train-default --dry-run
+  talos learn profile export --out .memory/talos_profiles_bundle.json
+  talos learn profile import --in .memory/talos_profiles_bundle.json --merge
   talos benchmark full
   talos multi-agent "Design a rollout plan" --mode planning
   talos multi-agent "Analyze release risk" --agents planner,researcher,verifier,synthesizer
@@ -67,12 +75,15 @@ It leverages the JIT model router to ensure optimal models are available.`,
   talos pipeline "research run 'What changed in X this week?' --skill analyst ; learn --from-research latest --skill memory_curator"
   talos pipeline "research run 'What changed in X this week?' ; learn --from-research latest"
   talos "research run 'What changed in X this week?' ; learn --from-research latest"
+  talos learn profile create --name hf-train-default --hf-dataset TeichAI/claude-4.5-opus-high-reasoning-250x --hf-config default --hf-split train
+  talos learn --profile hf-train-default
   talos learn "Store this project note"
   talos learned --last 5
   talos skills create --name report2markdown --description "Converts research reports to markdown files"
   talos skills preflight --name report2markdown --description "Converts research reports to markdown files"
   talos tools admin list
-  talos skills list`,
+  talos skills list
+  talos release-check`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 1 {
 			chain := strings.TrimSpace(args[0])
@@ -87,7 +98,7 @@ It leverages the JIT model router to ensure optimal models are available.`,
 	},
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		path := strings.ToLower(strings.TrimSpace(cmd.CommandPath()))
-		if strings.Contains(path, " update") || strings.HasSuffix(path, " version") {
+		if strings.Contains(path, " update") || strings.HasSuffix(path, " version") || strings.HasSuffix(path, " release-check") {
 			return
 		}
 		maybeAutoUpdate()
