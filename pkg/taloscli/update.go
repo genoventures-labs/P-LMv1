@@ -127,7 +127,7 @@ func runUpdateApply() error {
 		return nil
 	}
 	primaryErr := fmt.Errorf("go install failed: %w\n%s", err, strings.TrimSpace(string(out)))
-	if fallbackErr := installFromOriginTag(latest); fallbackErr != nil {
+	if fallbackErr := installFromOriginHead(latest); fallbackErr != nil {
 		return fmt.Errorf("%v\nfallback install failed: %v", primaryErr, fallbackErr)
 	}
 	binPath := resolveTalosBinPath()
@@ -414,7 +414,7 @@ func resolveOriginRemoteURL() string {
 	return strings.TrimSpace(string(out))
 }
 
-func installFromOriginTag(tag string) error {
+func installFromOriginHead(_ string) error {
 	remote := resolveOriginRemoteURL()
 	if remote == "" {
 		return errors.New("git origin URL not found")
@@ -427,7 +427,7 @@ func installFromOriginTag(tag string) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	cloneOut, cloneErr := exec.CommandContext(ctx, "git", "clone", "--depth", "1", "--branch", tag, remote, tmpDir).CombinedOutput()
+	cloneOut, cloneErr := exec.CommandContext(ctx, "git", "clone", "--depth", "1", remote, tmpDir).CombinedOutput()
 	if cloneErr != nil {
 		return fmt.Errorf("git clone failed: %w: %s", cloneErr, strings.TrimSpace(string(cloneOut)))
 	}
