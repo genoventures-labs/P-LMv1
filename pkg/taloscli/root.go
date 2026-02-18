@@ -8,6 +8,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var requestedSkill string
+
 const talosHelpTemplate = `TALOS CLI
 
 USAGE
@@ -54,6 +56,7 @@ var rootCmd = &cobra.Command{
 It leverages the JIT model router to ensure optimal models are available.`,
 	Example: `  talos chat "Summarize latest telemetry"
   talos chat --cognition minimal --timeout-profile quick "Online?"
+  talos --skill report2markdown chat "Convert this into markdown release notes"
   talos research run "What changed in X this week?"
   talos benchmark full
   talos multi-agent "Design a rollout plan" --mode planning
@@ -61,6 +64,7 @@ It leverages the JIT model router to ensure optimal models are available.`,
   talos version
   talos update check
   talos completion bash > ~/.local/share/bash-completion/completions/talos
+  talos pipeline "research run 'What changed in X this week?' --skill analyst ; learn --from-research latest --skill memory_curator"
   talos pipeline "research run 'What changed in X this week?' ; learn --from-research latest"
   talos "research run 'What changed in X this week?' ; learn --from-research latest"
   talos learn "Store this project note"
@@ -71,6 +75,9 @@ It leverages the JIT model router to ensure optimal models are available.`,
 		if len(args) == 1 {
 			chain := strings.TrimSpace(args[0])
 			if strings.Contains(chain, ";") || strings.Contains(chain, "|") {
+				if strings.TrimSpace(requestedSkill) != "" {
+					return fmt.Errorf("global --skill is not supported for pipeline chains; use per-step --skill within the quoted chain")
+				}
 				return runPipelineChain(chain)
 			}
 		}
@@ -95,4 +102,5 @@ func Execute() {
 func init() {
 	rootCmd.SetHelpTemplate(talosHelpTemplate)
 	rootCmd.SetUsageTemplate(talosHelpTemplate)
+	rootCmd.PersistentFlags().StringVar(&requestedSkill, "skill", "", "Use a specific enabled TALOS skill by ID, name, or path fragment")
 }

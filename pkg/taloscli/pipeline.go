@@ -5,17 +5,21 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/Thynaptic/P-LMv1/pkg/skills"
 	"github.com/spf13/cobra"
 )
 
 type pipelineStep struct {
-	Raw  string
-	Args []string
+	Raw      string
+	Args     []string
+	SkillRef string
 }
 
 type pipelineState struct {
 	LastResearchSessionID string
 }
+
+var pipelineSkillResolver = resolveRequestedSkillSelection
 
 var pipelineCmd = &cobra.Command{
 	Use:   "pipeline <chain>",
@@ -40,12 +44,13 @@ func runPipelineChain(chain string) error {
 	if err != nil {
 		return err
 	}
-	if err := validatePipelineSteps(steps); err != nil {
+	skillBindings, err := validatePipelineSteps(steps)
+	if err != nil {
 		return err
 	}
 	state := &pipelineState{}
 	for i, step := range steps {
-		if err := executePipelineStep(step, state); err != nil {
+		if err := executePipelineStep(step, state, skillBindings[i]); err != nil {
 			return fmt.Errorf("pipeline failed at step %d (%s): %w", i+1, step.Raw, err)
 		}
 	}
@@ -67,12 +72,63 @@ func parsePipelineChain(chain string) ([]pipelineStep, error) {
 		if len(argv) == 0 {
 			continue
 		}
-		steps = append(steps, pipelineStep{Raw: strings.TrimSpace(seg), Args: argv})
+		skillRef, cleanedArgs, err := extractPipelineStepSkill(argv)
+		if err != nil {
+			return nil, fmt.Errorf("invalid step %q: %w", seg, err)
+		}
+		if len(cleanedArgs) == 0 {
+			return nil, fmt.Errorf("invalid step %q: command tokens missing after skill extraction", seg)
+		}
+		steps = append(steps, pipelineStep{
+			Raw:      strings.TrimSpace(seg),
+			Args:     cleanedArgs,
+			SkillRef: skillRef,
+		})
 	}
 	if len(steps) == 0 {
 		return nil, fmt.Errorf("no pipeline steps found")
 	}
 	return steps, nil
+}
+
+func extractPipelineStepSkill(args []string) (string, []string, error) {
+	if len(args) == 0 {
+		return "", nil, nil
+	}
+	cleaned := make([]string, 0, len(args))
+	skillRef := ""
+	for i := 0; i < len(args); i++ {
+		tok := strings.TrimSpace(args[i])
+		if strings.EqualFold(tok, "--skill") {
+			if skillRef != "" {
+				return "", nil, fmt.Errorf("duplicate --skill flag")
+			}
+			if i+1 >= len(args) {
+				return "", nil, fmt.Errorf("--skill requires a value")
+			}
+			next := strings.TrimSpace(args[i+1])
+			if next == "" || strings.HasPrefix(next, "--") {
+				return "", nil, fmt.Errorf("--skill requires a non-flag value")
+			}
+			skillRef = next
+			i++
+			continue
+		}
+		lowerTok := strings.ToLower(tok)
+		if strings.HasPrefix(lowerTok, "--skill=") {
+			if skillRef != "" {
+				return "", nil, fmt.Errorf("duplicate --skill flag")
+			}
+			val := strings.TrimSpace(tok[len("--skill="):])
+			if val == "" {
+				return "", nil, fmt.Errorf("--skill requires a value")
+			}
+			skillRef = val
+			continue
+		}
+		cleaned = append(cleaned, args[i])
+	}
+	return strings.TrimSpace(skillRef), cleaned, nil
 }
 
 func splitPipelineSegments(chain string) ([]string, error) {
@@ -202,9 +258,23 @@ func normalizePipelineAction(step pipelineStep) string {
 	return strings.ToLower(step.Args[0])
 }
 
-func validatePipelineSteps(steps []pipelineStep) error {
+func validatePipelineSteps(steps []pipelineStep) ([]*skills.SkillRecord, error) {
 	if len(steps) < 2 {
-		return fmt.Errorf("pipeline must contain at least 2 steps")
+		return nil, fmt.Errorf("pipeline must contain at least 2 steps")
+	}
+	skillBindings := make([]*skills.SkillRecord, len(steps))
+	for i, step := range steps {
+		if strings.TrimSpace(step.SkillRef) == "" {
+			continue
+		}
+		rec, err := pipelineSkillResolver(step.SkillRef)
+		if err != nil {
+			return nil, fmt.Errorf("step %d skill resolution failed (%s): %w", i+1, step.SkillRef, err)
+		}
+		if rec == nil {
+			return nil, fmt.Errorf("step %d skill resolution failed (%s): no matching enabled skill", i+1, step.SkillRef)
+		}
+		skillBindings[i] = rec
 	}
 	for i := 0; i < len(steps)-1; i++ {
 		from := normalizePipelineAction(steps[i])
@@ -212,12 +282,15 @@ func validatePipelineSteps(steps []pipelineStep) error {
 		if (from == "research/run" || from == "research/deep") && to == "learn/from-research" {
 			continue
 		}
-		return fmt.Errorf("invalid chain transition: %s -> %s (allowed: research run|deep -> learn --from-research)", from, to)
+		return nil, fmt.Errorf("invalid chain transition: %s -> %s (allowed: research run|deep -> learn --from-research)", from, to)
 	}
-	return nil
+	return skillBindings, nil
 }
 
-func executePipelineStep(step pipelineStep, st *pipelineState) error {
+func executePipelineStep(step pipelineStep, st *pipelineState, skillRec *skills.SkillRecord) error {
+	if skillRec != nil {
+		fmt.Printf("PIPELINE STEP\n  skill_id: %s\n  skill_name: %s\n", strings.TrimSpace(skillRec.SkillID), strings.TrimSpace(skillRec.Name))
+	}
 	action := normalizePipelineAction(step)
 	switch action {
 	case "research/run":

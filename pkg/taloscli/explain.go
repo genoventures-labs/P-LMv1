@@ -43,6 +43,7 @@ var capabilityDocs = []capabilityDoc{
 		Usage: []string{
 			"talos chat",
 			"talos chat <prompt>",
+			"talos --skill <skill_id|name> chat <prompt>",
 			"talos chat --cognition auto|minimal|balanced|deep <prompt>",
 			"talos chat --timeout-profile quick|normal|deep <prompt>",
 			"talos chat --warmup=false <prompt>",
@@ -51,6 +52,7 @@ var capabilityDocs = []capabilityDoc{
 			"Runs interactive REPL when no prompt is supplied.",
 			"Sends a single prompt and exits when prompt args are supplied.",
 			"Uses routing, memory, and tool orchestration during response generation.",
+			"Supports explicit skill selection with global --skill flag.",
 			"Supports cognition budgeting to avoid heavy reasoning on simple prompts.",
 			"Supports latency profiles and warmup behavior for chat responsiveness.",
 		},
@@ -236,15 +238,19 @@ var capabilityDocs = []capabilityDoc{
 		Name:    "pipeline",
 		Summary: "Executes strict, allowlisted command chains with structured handoff.",
 		Usage: []string{
+			`talos pipeline "research run 'query' --skill analyst ; learn --from-research latest --skill memory_curator"`,
 			`talos pipeline "research run 'query' ; learn --from-research latest"`,
 			`talos "research deep 'query' ; learn --from-research latest"`,
 		},
 		Abilities: []string{
 			"Parses semicolon/pipe-separated step chains from a single quoted argument.",
 			"Enforces allowlisted transitions only (v1: research run/deep -> learn --from-research).",
+			"Supports per-step --skill bindings with fail-fast validation for missing/disabled skills.",
+			"Rejects global --skill for chain mode to keep skill scope explicit per step.",
 			"Stops on first step failure and reports the failing step.",
 		},
 		Examples: []string{
+			`talos pipeline "research run 'incident review checklist' --skill researcher_v1 ; learn --from-research latest --skill kb_ingestor"`,
 			`talos pipeline "research run 'incident review checklist' ; learn --from-research latest"`,
 		},
 		Related: []string{"research", "learn"},
