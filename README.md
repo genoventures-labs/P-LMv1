@@ -63,6 +63,7 @@ View paged help:
 ```bash
 talos --help
 talos /next
+talos find research
 ```
 
 Use a specific skill for chat:

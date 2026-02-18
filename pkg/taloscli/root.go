@@ -83,6 +83,7 @@ It leverages the JIT model router to ensure optimal models are available.`,
   talos completion bash > ~/.local/share/bash-completion/completions/talos
   talos --help
   talos /next
+  talos find research
   talos pipeline "research run 'What changed in X this week?' --skill analyst ; learn --from-research latest --skill memory_curator"
   talos pipeline "research run 'What changed in X this week?' ; learn --from-research latest"
   talos "research run 'What changed in X this week?' ; learn --from-research latest"

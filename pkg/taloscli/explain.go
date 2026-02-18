@@ -38,6 +38,26 @@ var explainCmd = &cobra.Command{
 
 var capabilityDocs = []capabilityDoc{
 	{
+		Name:    "find",
+		Summary: "Searches TALOS commands by keyword across command names and descriptions.",
+		Usage: []string{
+			"talos find <keyword>",
+			"talos find research",
+			"talos find profile",
+		},
+		Abilities: []string{
+			"Searches root and subcommands for keyword matches.",
+			"Matches command name, use-line, aliases, and summary text.",
+			"Returns a professional ASCII table of matching command paths.",
+		},
+		Examples: []string{
+			"talos find research",
+			"talos find doctor",
+		},
+		Related: []string{"help", "explain"},
+		Aliases: []string{"search command", "lookup command"},
+	},
+	{
 		Name:    "help",
 		Summary: "Displays paged root help with command table and example pagination.",
 		Usage: []string{
