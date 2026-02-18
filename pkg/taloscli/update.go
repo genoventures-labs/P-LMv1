@@ -18,8 +18,8 @@ import (
 )
 
 const (
-	updateModulePath       = "github.com/Thynaptic/P-LMv1"
-	updateCmdPath          = "github.com/Thynaptic/P-LMv1/cmd/talos"
+	updateModulePath       = "github.com/cassianwolfe/P-LMv1"
+	updateCmdPath          = "github.com/cassianwolfe/P-LMv1/cmd/talos"
 	defaultAutoUpdateHours = 24
 )
 
@@ -117,7 +117,8 @@ func runUpdateApply() error {
 	fmt.Printf("Installing TALOS %s ...\n", latest)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "go", "install", updateCmdPath+"@latest").CombinedOutput()
+	target := configuredUpdateCmdPath()
+	out, err := exec.CommandContext(ctx, "go", "install", target+"@latest").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("go install failed: %w\n%s", err, strings.TrimSpace(string(out)))
 	}
@@ -274,7 +275,7 @@ func fetchLatestVersion(timeout time.Duration) (string, error) {
 func fetchLatestVersionFromModule(timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "go", "list", "-m", "-json", updateModulePath+"@latest").CombinedOutput()
+	out, err := exec.CommandContext(ctx, "go", "list", "-m", "-json", configuredUpdateModulePath()+"@latest").CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -349,6 +350,52 @@ func resolveTalosBinPath() string {
 		return "talos (path unknown)"
 	}
 	return filepath.Join(gopath, "bin", "talos")
+}
+
+func configuredUpdateModulePath() string {
+	if v := strings.TrimSpace(os.Getenv("TALOS_UPDATE_MODULE_PATH")); v != "" {
+		return v
+	}
+	if fromOrigin := resolveModulePathFromOrigin(); fromOrigin != "" {
+		return fromOrigin
+	}
+	return updateModulePath
+}
+
+func configuredUpdateCmdPath() string {
+	if v := strings.TrimSpace(os.Getenv("TALOS_UPDATE_CMD_PATH")); v != "" {
+		return v
+	}
+	return configuredUpdateModulePath() + "/cmd/talos"
+}
+
+func resolveModulePathFromOrigin() string {
+	out, err := exec.Command("git", "remote", "get-url", "origin").Output()
+	if err != nil {
+		return ""
+	}
+	url := strings.TrimSpace(string(out))
+	if url == "" {
+		return ""
+	}
+	url = strings.TrimSuffix(url, ".git")
+	url = strings.TrimPrefix(url, "https://")
+	url = strings.TrimPrefix(url, "http://")
+	url = strings.TrimPrefix(url, "ssh://")
+	if strings.Contains(url, "@") && strings.Contains(url, ":") {
+		parts := strings.SplitN(url, "@", 2)
+		hostAndPath := parts[1]
+		hostAndPath = strings.Replace(hostAndPath, ":", "/", 1)
+		url = hostAndPath
+	}
+	url = strings.TrimPrefix(url, "git@")
+	if !strings.Contains(url, "/") {
+		return ""
+	}
+	if strings.HasPrefix(url, "github.com/") {
+		return url
+	}
+	return ""
 }
 
 func compareSemver(a, b string) int {
