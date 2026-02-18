@@ -58,6 +58,7 @@ var capabilityDocs = []capabilityDoc{
 		},
 		Examples: []string{
 			`talos chat "Draft a release note from recent commits"`,
+			`talos --skill report2markdown chat "Convert this report into markdown with headings"`,
 			"talos chat",
 		},
 		Related: []string{"multi-agent", "learn", "doctor"},
@@ -139,16 +140,22 @@ var capabilityDocs = []capabilityDoc{
 		Usage: []string{
 			"talos skills list",
 			"talos skills show --id <skill_id>",
+			"talos skills create --name <name> --intent <intent>",
 			"talos skills create --name <name> --description <text>",
-			"talos skills preflight --goal <intent>",
+			"talos skills preflight --name <name> --intent <intent>",
+			"talos skills preflight --name <name> --description <text>",
 		},
 		Abilities: []string{
 			"Lists and inspects available skills.",
 			"Creates new skills from operator requests.",
+			"Accepts --description as intent fallback when --intent is omitted.",
 			"Runs preflight checks before synthesis or activation.",
+			"Can be selected at runtime with global --skill for chat commands.",
 		},
 		Examples: []string{
 			"talos skills list",
+			`talos skills create --name report2markdown --description "Converts reports to markdown"`,
+			`talos skills preflight --name report2markdown --description "Converts reports to markdown"`,
 			"talos skills show --id talos_user_skill",
 		},
 		Related: []string{"learn", "tools admin"},
@@ -251,9 +258,10 @@ var capabilityDocs = []capabilityDoc{
 		},
 		Examples: []string{
 			`talos pipeline "research run 'incident review checklist' --skill researcher_v1 ; learn --from-research latest --skill kb_ingestor"`,
+			`talos "research run 'incident review checklist' --skill researcher_v1 ; learn --from-research latest --skill kb_ingestor"`,
 			`talos pipeline "research run 'incident review checklist' ; learn --from-research latest"`,
 		},
-		Related: []string{"research", "learn"},
+		Related: []string{"research", "learn", "skills"},
 	},
 	{
 		Name:    "learned",

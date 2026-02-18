@@ -69,6 +69,8 @@ It leverages the JIT model router to ensure optimal models are available.`,
   talos "research run 'What changed in X this week?' ; learn --from-research latest"
   talos learn "Store this project note"
   talos learned --last 5
+  talos skills create --name report2markdown --description "Converts research reports to markdown files"
+  talos skills preflight --name report2markdown --description "Converts research reports to markdown files"
   talos tools admin list
   talos skills list`,
 	RunE: func(cmd *cobra.Command, args []string) error {

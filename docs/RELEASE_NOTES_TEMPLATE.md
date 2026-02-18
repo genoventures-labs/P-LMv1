@@ -32,10 +32,13 @@ One paragraph describing the release objective and scope.
   - `go test ./cmd/... ./pkg/...`
 - Operational checks:
   - `go run ./cmd/benchmark talos-audit ...`
+- Documentation sync checks:
+  - `talos --help` examples reflect new/changed commands and flags.
+  - `talos explain <capability>` entries updated for all affected capabilities.
+  - `README.md` quick-start/workflow examples updated when operator behavior changes.
 
 ### Known Limitations
 - Any deferred cleanup or known non-blocking issues.
 
 ### Full Scope
 - Link to PR/commit range/tag compare.
-

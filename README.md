@@ -58,6 +58,12 @@ Run TALOS:
 go run ./cmd/talos
 ```
 
+Use a specific skill for chat:
+
+```bash
+talos --skill report2markdown chat "Convert this report into markdown with headings"
+```
+
 Learn an entire directory (all supported default document types):
 
 ```bash
@@ -142,6 +148,19 @@ Run a chained research-to-learn pipeline:
 talos pipeline "research run 'What changed in dependency policy this week?' ; learn --from-research latest"
 ```
 
+Run a skill-chained research-to-learn pipeline (per-step skill binding):
+
+```bash
+talos pipeline "research run 'What changed in dependency policy this week?' --skill analyst ; learn --from-research latest --skill memory_curator"
+```
+
+Create and preflight a user skill:
+
+```bash
+talos skills create --name report2markdown --description "Converts research reports to markdown files"
+talos skills preflight --name report2markdown --description "Converts research reports to markdown files"
+```
+
 Explain a capability:
 
 ```bash
@@ -174,3 +193,13 @@ go test ./cmd/... ./pkg/...
 - `docs/STRATA_ Sovereign AI Tool Foundry.md`
 - `docs/RELEASE_NOTES_TEMPLATE.md`
 - `CHANGELOG.md`
+
+## CLI Documentation Maintenance Policy
+
+When any TALOS feature, command, flag, or behavior changes, the same change must include updates to:
+
+1. `talos --help` examples (root and command-specific help text as applicable)
+2. `talos explain <capability>` content for affected capabilities
+3. `README.md` command examples when user-facing workflows are impacted
+
+No feature update is considered complete without synchronized help/explain documentation updates.

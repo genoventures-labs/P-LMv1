@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Thynaptic/P-LMv1/pkg/skills"
 	"github.com/Thynaptic/P-LMv1/pkg/tools"
@@ -36,8 +37,9 @@ var skillsCreateCmd = &cobra.Command{
 			fmt.Println("Error: --name is required")
 			return
 		}
-		if strings.TrimSpace(userSkillIntent) == "" {
-			fmt.Println("Error: --intent is required")
+		intent := resolvedSkillIntent(userSkillIntent, userSkillDescription)
+		if intent == "" {
+			fmt.Println("Error: --intent is required (or use --description)")
 			return
 		}
 		tc, err := tools.NewGLMToolClient()
@@ -53,7 +55,7 @@ var skillsCreateCmd = &cobra.Command{
 		}
 		res, err := creator.Create(context.Background(), skills.UserSkillCreateRequest{
 			Name:             strings.TrimSpace(userSkillName),
-			Intent:           strings.TrimSpace(userSkillIntent),
+			Intent:           intent,
 			Description:      strings.TrimSpace(userSkillDescription),
 			ReasoningTier:    strings.TrimSpace(userSkillReasoningTier),
 			TaskType:         strings.TrimSpace(userSkillTaskType),
@@ -86,8 +88,9 @@ var skillsPreflightCmd = &cobra.Command{
 			fmt.Println("Error: --name is required")
 			return
 		}
-		if strings.TrimSpace(userSkillIntent) == "" {
-			fmt.Println("Error: --intent is required")
+		intent := resolvedSkillIntent(userSkillIntent, userSkillDescription)
+		if intent == "" {
+			fmt.Println("Error: --intent is required (or use --description)")
 			return
 		}
 		tc, err := tools.NewGLMToolClient()
@@ -102,7 +105,7 @@ var skillsPreflightCmd = &cobra.Command{
 		}
 		resp, err := tc.SkillPreflight(tools.SkillPreflightRequest{
 			SkillName:        strings.TrimSpace(userSkillName),
-			Intent:           strings.TrimSpace(userSkillIntent),
+			Intent:           intent,
 			RequestedTools:   reqTools,
 			RequestedDomains: dedupeSkillStrings(userSkillRequestedDomains),
 		})
@@ -134,16 +137,18 @@ var skillsListCmd = &cobra.Command{
 			sort.SliceStable(recs, func(i, j int) bool {
 				return recs[i].UpdatedAt.After(recs[j].UpdatedAt)
 			})
-			fmt.Printf("Found %d enabled skill(s):\n", len(recs))
-			for _, rec := range recs {
-				line := "- " + strings.TrimSpace(rec.RootDir)
-				if strings.TrimSpace(rec.SkillID) != "" {
-					line += " skill_id=" + strings.TrimSpace(rec.SkillID)
+			fmt.Printf("TALOS SKILLS\n\nSUMMARY\n  Enabled skills: %d\n\nSKILLS\n", len(recs))
+			for i, rec := range recs {
+				name := strings.TrimSpace(rec.Name)
+				if name == "" {
+					name = "(unnamed skill)"
 				}
-				if strings.TrimSpace(rec.Name) != "" {
-					line += " name=" + strings.TrimSpace(rec.Name)
-				}
-				fmt.Println(line)
+				fmt.Printf("  %d. %s\n", i+1, name)
+				fmt.Printf("     id: %s\n", valueOrPlaceholder(rec.SkillID))
+				fmt.Printf("     intent: %s\n", valueOrPlaceholder(rec.Intent))
+				fmt.Printf("     tier/task: %s / %s\n", valueOrPlaceholder(rec.ReasoningTier), valueOrPlaceholder(rec.TaskType))
+				fmt.Printf("     updated: %s\n", formatSkillTime(rec.UpdatedAt))
+				fmt.Printf("     path: %s\n", valueOrPlaceholder(rec.RootDir))
 			}
 			return
 		}
@@ -156,17 +161,15 @@ var skillsListCmd = &cobra.Command{
 			fmt.Println("No user skills found.")
 			return
 		}
-		fmt.Printf("Found %d skill(s):\n", len(paths))
+		fmt.Printf("TALOS SKILLS\n\nSUMMARY\n  Enabled skills: %d\n\nSKILLS\n", len(paths))
 		for _, p := range paths {
 			id, name := readSkillIdentity(p)
-			line := "- " + filepath.Dir(p)
-			if strings.TrimSpace(id) != "" {
-				line += " skill_id=" + id
+			if strings.TrimSpace(name) == "" {
+				name = "(unnamed skill)"
 			}
-			if strings.TrimSpace(name) != "" {
-				line += " name=" + name
-			}
-			fmt.Println(line)
+			fmt.Printf("  - %s\n", name)
+			fmt.Printf("    id: %s\n", valueOrPlaceholder(id))
+			fmt.Printf("    path: %s\n", valueOrPlaceholder(filepath.Dir(p)))
 		}
 	},
 }
@@ -218,15 +221,16 @@ var skillsShowCmd = &cobra.Command{
 
 func init() {
 	skillsCreateCmd.Flags().StringVar(&userSkillName, "name", "", "Skill name")
-	skillsCreateCmd.Flags().StringVar(&userSkillIntent, "intent", "", "Intent/capability description")
-	skillsCreateCmd.Flags().StringVar(&userSkillDescription, "description", "", "Optional description")
+	skillsCreateCmd.Flags().StringVar(&userSkillIntent, "intent", "", "Primary intent/capability description")
+	skillsCreateCmd.Flags().StringVar(&userSkillDescription, "description", "", "Description (also used as intent if --intent is omitted)")
 	skillsCreateCmd.Flags().StringVar(&userSkillReasoningTier, "reasoning-tier", "t2", "Reasoning tier tag")
 	skillsCreateCmd.Flags().StringVar(&userSkillTaskType, "task-type", "general", "Task type tag")
 	skillsCreateCmd.Flags().StringSliceVar(&userSkillRequestedTools, "requested-tool", nil, "Requested tool in kind:name format (repeatable)")
 	skillsCreateCmd.Flags().StringSliceVar(&userSkillRequestedDomains, "requested-domain", nil, "Requested external domain (repeatable)")
 
 	skillsPreflightCmd.Flags().StringVar(&userSkillName, "name", "", "Skill name")
-	skillsPreflightCmd.Flags().StringVar(&userSkillIntent, "intent", "", "Intent/capability description")
+	skillsPreflightCmd.Flags().StringVar(&userSkillIntent, "intent", "", "Primary intent/capability description")
+	skillsPreflightCmd.Flags().StringVar(&userSkillDescription, "description", "", "Description (also used as intent if --intent is omitted)")
 	skillsPreflightCmd.Flags().StringSliceVar(&userSkillRequestedTools, "requested-tool", nil, "Requested tool in kind:name format (repeatable)")
 	skillsPreflightCmd.Flags().StringSliceVar(&userSkillRequestedDomains, "requested-domain", nil, "Requested external domain (repeatable)")
 
@@ -318,4 +322,27 @@ func dedupeSkillStrings(in []string) []string {
 		out = append(out, t)
 	}
 	return out
+}
+
+func resolvedSkillIntent(intent, description string) string {
+	intent = strings.TrimSpace(intent)
+	if intent != "" {
+		return intent
+	}
+	return strings.TrimSpace(description)
+}
+
+func valueOrPlaceholder(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "n/a"
+	}
+	return s
+}
+
+func formatSkillTime(ts time.Time) string {
+	if ts.IsZero() {
+		return "n/a"
+	}
+	return ts.UTC().Format(time.RFC3339)
 }

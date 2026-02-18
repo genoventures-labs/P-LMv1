@@ -80,6 +80,14 @@ var chatCmd = &cobra.Command{
 			fmt.Printf("Error creating Ollama client: %v\n", err)
 			return
 		}
+		selectedSkill, err := resolveRequestedSkillSelection(requestedSkill)
+		if err != nil {
+			fmt.Printf("Error selecting skill: %v\n", err)
+			return
+		}
+		if selectedSkill != nil {
+			fmt.Printf("DEBUG: Active skill=%s (%s)\n", strings.TrimSpace(selectedSkill.SkillID), strings.TrimSpace(selectedSkill.Name))
+		}
 		profile := configureChatTimeouts(chatTimeoutProfile)
 		fmt.Printf("DEBUG: Timeout profile=%s first-token=%s chat=%s mcts=%s\n", profile, llmFirstTokenTimeout, llmChatTimeout, mctsTimeout)
 		if strings.TrimSpace(chatCognitionMode) == "" {
@@ -105,7 +113,7 @@ var chatCmd = &cobra.Command{
 				sm.SetPrimaryGoal(normalized)
 				_ = sm.Save()
 			}
-			err := handleChatTurn(client, mm, tc, r, normalized, nil, sm)
+			err := handleChatTurn(client, mm, tc, r, normalized, nil, sm, selectedSkill)
 			if err != nil {
 				fmt.Printf("Error: %v\n", err)
 			}
@@ -212,7 +220,7 @@ var chatCmd = &cobra.Command{
 				sm.SetPrimaryGoal(normalized)
 				_ = sm.Save()
 			}
-			err := handleChatTurn(client, mm, tc, r, normalized, &conversationHistory, sm)
+			err := handleChatTurn(client, mm, tc, r, normalized, &conversationHistory, sm, selectedSkill)
 			if err != nil {
 				fmt.Printf("Error during chat: %v\n", err)
 				continue
@@ -615,7 +623,7 @@ type delegationJob struct {
 }
 
 // handleChatTurn performs a single chat interaction (retrieval, request, display, storage).
-func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMToolClient, r *router.Router, input string, history *[]api.Message, sm *state.Manager) error {
+func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMToolClient, r *router.Router, input string, history *[]api.Message, sm *state.Manager, selectedSkill *skills.SkillRecord) error {
 	if shouldUseArchiveHistoryQuestion(input) {
 		if historyAnswer, ok := buildArchiveHistoryAnswer(input); ok {
 			if history == nil {
@@ -734,6 +742,9 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 
 	// 2. Build the context-enriched message
 	var contextParts []string
+	if skillCtx := skillContextBlock(selectedSkill); skillCtx != "" {
+		contextParts = append(contextParts, skillCtx)
+	}
 	if len(historyContext) > 0 {
 		contextParts = append(contextParts, "Relevant conversation history:\n"+strings.Join(historyContext, "\n"))
 	}
