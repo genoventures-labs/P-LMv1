@@ -28,3 +28,14 @@ func TestParseSemver(t *testing.T) {
 		t.Fatalf("parseSemver mismatch: got=%v want=%v", got, want)
 	}
 }
+
+func TestExtractLatestSemverTag(t *testing.T) {
+	raw := "abc123\trefs/tags/v0.2.0\nfff999\trefs/tags/v0.10.0\nzzz111\trefs/tags/not-semver\n"
+	got, err := extractLatestSemverTag(raw)
+	if err != nil {
+		t.Fatalf("extractLatestSemverTag error: %v", err)
+	}
+	if got != "v0.10.0" {
+		t.Fatalf("expected v0.10.0, got %s", got)
+	}
+}

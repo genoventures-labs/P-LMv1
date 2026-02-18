@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -257,11 +258,25 @@ func saveUpdateConfig(cfg updateConfig) error {
 }
 
 func fetchLatestVersion(timeout time.Duration) (string, error) {
+	v, err := fetchLatestVersionFromModule(timeout)
+	if err == nil {
+		return v, nil
+	}
+	moduleErr := err
+
+	v, err = fetchLatestVersionFromGitTags(timeout)
+	if err == nil {
+		return v, nil
+	}
+	return "", fmt.Errorf("failed querying latest module version: %v; git tag fallback failed: %v", moduleErr, err)
+}
+
+func fetchLatestVersionFromModule(timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "go", "list", "-m", "-json", updateModulePath+"@latest").CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("failed querying latest module version: %w", err)
+		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
 	var payload struct {
 		Version string `json:"Version"`
@@ -274,6 +289,51 @@ func fetchLatestVersion(timeout time.Duration) (string, error) {
 		return "", errors.New("latest module version is empty")
 	}
 	return v, nil
+}
+
+func fetchLatestVersionFromGitTags(timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "git", "ls-remote", "--tags", "--refs", "origin").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return extractLatestSemverTag(string(out))
+}
+
+func extractLatestSemverTag(raw string) (string, error) {
+	lines := strings.Split(raw, "\n")
+	tags := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		parts := strings.Fields(ln)
+		if len(parts) < 2 {
+			continue
+		}
+		ref := strings.TrimSpace(parts[1])
+		if !strings.HasPrefix(ref, "refs/tags/") {
+			continue
+		}
+		tag := strings.TrimPrefix(ref, "refs/tags/")
+		tag = strings.TrimSpace(tag)
+		if tag == "" {
+			continue
+		}
+		if parseSemver(tag) == [3]int{} {
+			continue
+		}
+		tags = append(tags, tag)
+	}
+	if len(tags) == 0 {
+		return "", errors.New("no semantic version tags found on origin")
+	}
+	sort.SliceStable(tags, func(i, j int) bool {
+		return compareSemver(tags[i], tags[j]) > 0
+	})
+	return tags[0], nil
 }
 
 func resolveTalosBinPath() string {
