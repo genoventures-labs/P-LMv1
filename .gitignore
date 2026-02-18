@@ -31,7 +31,7 @@ go.work.sum
 .memory/
 .skills/
 api_keys.yaml
-benchmark
+/benchmark
 benchmark_results.json
 recommended_models.json
 talos_benchmark_report.json
