@@ -75,6 +75,8 @@ It leverages the JIT model router to ensure optimal models are available.`,
   talos learn --profile hf-train-default --dry-run
   talos learn profile export --out .memory/talos_profiles_bundle.json
   talos learn profile import --in .memory/talos_profiles_bundle.json --merge
+  talos learn profile-gen security --set-default
+  talos research profile-gen compliance --set-default
   talos benchmark full
   talos multi-agent "Design a rollout plan" --mode planning
   talos multi-agent "Analyze release risk" --agents planner,researcher,verifier,synthesizer

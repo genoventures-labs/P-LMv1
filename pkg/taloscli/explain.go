@@ -143,6 +143,7 @@ var capabilityDocs = []capabilityDoc{
 		Summary: "Creates, manages, and applies saved TALOS learning configurations.",
 		Usage: []string{
 			"talos learn profile create --name <name> [learn flags]",
+			"talos learn profile-gen <domain>",
 			"talos learn profile update --name <name> [learn flags]",
 			"talos learn profile show --name <name>",
 			"talos learn profile list",
@@ -155,6 +156,7 @@ var capabilityDocs = []capabilityDoc{
 		},
 		Abilities: []string{
 			"Saves reusable learn configurations including HF dataset args, URL crawl settings, and chunking options.",
+			"Generates domain-specific profile baselines via `talos learn profile-gen <domain>`.",
 			"Supports default profile auto-apply when learn runs without --profile.",
 			"Applies explicit CLI flags as runtime overrides on top of profile values.",
 			"Stores only env-var references for secrets (no raw token persistence in profiles).",
@@ -162,6 +164,7 @@ var capabilityDocs = []capabilityDoc{
 		},
 		Examples: []string{
 			`talos learn profile create --name hf-train-default --hf-dataset TeichAI/claude-4.5-opus-high-reasoning-250x --hf-config default --hf-split train`,
+			"talos learn profile-gen security --set-default",
 			"talos learn profile set-default --name hf-train-default",
 			"talos learn --profile hf-train-default --hf-max-records 250",
 		},
@@ -335,6 +338,7 @@ var capabilityDocs = []capabilityDoc{
 		Summary: "Creates, manages, and applies saved TALOS research configurations.",
 		Usage: []string{
 			"talos research profiles create --name <name> [--category <tag>] [research flags]",
+			"talos research profile-gen <domain>",
 			"talos research profiles update --name <name> [--category <tag>] [research flags]",
 			"talos research profiles show --name <name>",
 			"talos research profiles list",
@@ -349,6 +353,7 @@ var capabilityDocs = []capabilityDoc{
 		},
 		Abilities: []string{
 			"Saves reusable research defaults for crawl depth, page budgets, loop budgets, timeout, and seed URLs.",
+			"Generates domain-specific research profile baselines via `talos research profile-gen <domain>`.",
 			"Supports query templates so run/deep can execute without positional query text.",
 			"Supports category tags for profile grouping and filtered listing.",
 			"Supports default profile auto-apply when run/deep omits --profile and --category.",
@@ -357,6 +362,7 @@ var capabilityDocs = []capabilityDoc{
 		},
 		Examples: []string{
 			"talos research profiles create --name market-scan --category crypto --query-template \"weekly BTC market scan\" --max-pages 60 --crawl-depth 2",
+			"talos research profile-gen compliance --set-default",
 			"talos research profiles list --category crypto",
 			"talos research profiles set-default --name market-scan",
 			"talos research deep --profile market-scan",

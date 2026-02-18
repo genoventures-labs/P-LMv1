@@ -123,6 +123,13 @@ talos learn profile export --out .memory/talos_profiles_bundle.json
 talos learn profile import --in .memory/talos_profiles_bundle.json --merge
 ```
 
+Generate domain-specific profile baselines:
+
+```bash
+talos learn profile-gen security --set-default
+talos research profile-gen compliance --set-default
+```
+
 Install TALOS for all terminals:
 
 ```bash
