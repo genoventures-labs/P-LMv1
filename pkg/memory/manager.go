@@ -1,10 +1,13 @@
 package memory
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -188,6 +191,21 @@ func resolveEmbeddingModel(client *api.Client) (string, error) {
 			return model, nil
 		}
 	}
+
+	// If VPS rotation removed embedding models, auto-pull a known embed model and retry once.
+	if shouldAutoPullEmbeddingModel() {
+		if err := pullEmbeddingModel(defaultEmbeddingModel); err == nil {
+			retryCtx, retryCancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer retryCancel()
+			retryResp, retryErr := client.Embeddings(retryCtx, &api.EmbeddingRequest{
+				Model:  defaultEmbeddingModel,
+				Prompt: "embedding-healthcheck",
+			})
+			if retryErr == nil && len(retryResp.Embedding) > 0 {
+				return defaultEmbeddingModel, nil
+			}
+		}
+	}
 	return "", fmt.Errorf("no embedding-capable model resolved from current Ollama tags; set TALOS_EMBED_MODEL explicitly")
 }
 
@@ -215,6 +233,55 @@ func firstNonEmptyEnv(keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func shouldAutoPullEmbeddingModel() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("TALOS_AUTO_PULL_EMBED_MODEL")))
+	switch v {
+	case "", "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+func pullEmbeddingModel(model string) error {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return fmt.Errorf("embedding model name is empty")
+	}
+	host := strings.TrimSpace(os.Getenv(ollamaAPIHostEnv))
+	if host == "" {
+		host = "http://85.31.233.157:11434"
+	}
+	if !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
+		host = "http://" + host
+	}
+	host = strings.TrimRight(host, "/")
+
+	payload, _ := json.Marshal(map[string]interface{}{
+		"name":   model,
+		"stream": false,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, host+"/api/pull", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return fmt.Errorf("ollama pull failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 func collectionNameForModel(base, model string) string {

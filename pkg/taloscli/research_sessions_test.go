@@ -23,7 +23,10 @@ func TestPersistResearchSessionAndResolveLatest(t *testing.T) {
 		Findings:  []researchFinding{{Text: "f1", Verified: true, Refs: []int{1}}},
 		Sources:   []string{"https://example.com"},
 	}
-	rec, err := persistResearchSession("q", "run", report, "SUCCESS", "", 2)
+	rec, err := persistResearchSession("q", "run", report, "SUCCESS", "", 2, researchExecutionContext{
+		ProfileName:       "market-scan",
+		ProfileCategories: []string{"crypto", "daily"},
+	})
 	if err != nil {
 		t.Fatalf("persist session: %v", err)
 	}
@@ -48,5 +51,8 @@ func TestPersistResearchSessionAndResolveLatest(t *testing.T) {
 	}
 	if artifact.Query != "q" || len(artifact.Sources) != 1 {
 		t.Fatalf("unexpected artifact data: %+v", artifact)
+	}
+	if artifact.ProfileName != "market-scan" {
+		t.Fatalf("expected profile metadata in artifact, got %+v", artifact)
 	}
 }

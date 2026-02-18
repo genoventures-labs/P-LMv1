@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -322,7 +323,16 @@ func IndexHFDatasets(mm *memory.MemoryManager, specs []HFSpec, opts RemoteIndexO
 		stats.BytesFetched += int64(len(body))
 		if status < 200 || status >= 300 {
 			stats.HTTPErrors++
-			emitRemoteEvent(opts, RemoteEvent{Source: ds, Outcome: "hf-http-status", Detail: strconv.Itoa(status), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			detail := strconv.Itoa(status)
+			if msg := extractHFErrorMessage(body); msg != "" {
+				detail += ": " + msg
+			}
+			if status == http.StatusBadRequest || status == http.StatusUnprocessableEntity {
+				if hint, hintErr := fetchHFSplitHint(client, base, ds, opts); hintErr == nil && strings.TrimSpace(hint) != "" {
+					detail += " | " + hint
+				}
+			}
+			emitRemoteEvent(opts, RemoteEvent{Source: ds, Outcome: "hf-http-status", Detail: detail, ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
 			continue
 		}
 
@@ -707,6 +717,91 @@ func parseHFFirstRows(body []byte) ([]string, error) {
 		return nil, fmt.Errorf("rows were empty after flattening")
 	}
 	return out, nil
+}
+
+func extractHFErrorMessage(body []byte) string {
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		msg := strings.TrimSpace(string(body))
+		if msg == "" {
+			return ""
+		}
+		if len(msg) > 200 {
+			msg = msg[:200] + "..."
+		}
+		return msg
+	}
+	for _, k := range []string{"error", "message", "cause"} {
+		if v, ok := payload[k]; ok {
+			msg := strings.TrimSpace(flattenHFRow(v))
+			if msg != "" {
+				if len(msg) > 200 {
+					msg = msg[:200] + "..."
+				}
+				return msg
+			}
+		}
+	}
+	return ""
+}
+
+func fetchHFSplitHint(client *http.Client, base, datasetID string, opts RemoteIndexOptions) (string, error) {
+	endpoint := strings.TrimRight(base, "/") + "/splits?dataset=" + url.QueryEscape(strings.TrimSpace(datasetID))
+	body, _, status, err := fetchURL(client, endpoint, RemoteIndexOptions{
+		MaxBytes:   opts.MaxBytes,
+		UserAgent:  opts.UserAgent,
+		AuthHeader: bearerHeader(opts.HFToken),
+	})
+	if err != nil {
+		return "", err
+	}
+	if status < 200 || status >= 300 {
+		return "", fmt.Errorf("splits endpoint status %d", status)
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", err
+	}
+	raw, ok := payload["splits"].([]interface{})
+	if !ok || len(raw) == 0 {
+		return "", fmt.Errorf("no split data returned")
+	}
+	configs := map[string]bool{}
+	splits := map[string]bool{}
+	for _, item := range raw {
+		rec, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		cfg := strings.TrimSpace(fmt.Sprintf("%v", rec["config"]))
+		spl := strings.TrimSpace(fmt.Sprintf("%v", rec["split"]))
+		if cfg != "" && cfg != "<nil>" {
+			configs[cfg] = true
+		}
+		if spl != "" && spl != "<nil>" {
+			splits[spl] = true
+		}
+	}
+	if len(configs) == 0 && len(splits) == 0 {
+		return "", fmt.Errorf("split/config metadata empty")
+	}
+	return fmt.Sprintf("available configs=%s splits=%s", joinSortedKeys(configs), joinSortedKeys(splits)), nil
+}
+
+func joinSortedKeys(m map[string]bool) string {
+	if len(m) == 0 {
+		return "n/a"
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if len(keys) > 8 {
+		keys = append(keys[:8], "...")
+	}
+	return strings.Join(keys, ",")
 }
 
 func flattenHFRow(row interface{}) string {

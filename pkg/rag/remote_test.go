@@ -89,3 +89,30 @@ func TestPreflightURLReachable(t *testing.T) {
 		t.Fatalf("expected preflight success, got error: %v", err)
 	}
 }
+
+func TestExtractHFErrorMessageJSON(t *testing.T) {
+	msg := extractHFErrorMessage([]byte(`{"error":"The split train does not exist."}`))
+	if !strings.Contains(msg, "split train") {
+		t.Fatalf("expected parsed error message, got %q", msg)
+	}
+}
+
+func TestFetchHFSplitHint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/splits" {
+			_, _ = w.Write([]byte(`{"splits":[{"config":"default","split":"validation"},{"config":"default","split":"test"}]}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	opts := DefaultRemoteIndexOptions()
+	hint, err := fetchHFSplitHint(srv.Client(), srv.URL, "demo/ds", opts)
+	if err != nil {
+		t.Fatalf("expected split hint success, got error: %v", err)
+	}
+	if !strings.Contains(hint, "default") || !strings.Contains(hint, "validation") {
+		t.Fatalf("unexpected hint: %q", hint)
+	}
+}

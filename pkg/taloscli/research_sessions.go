@@ -28,6 +28,8 @@ type ResearchSessionRecord struct {
 	Status       string `json:"status"`
 	Mode         string `json:"mode"`
 	Query        string `json:"query"`
+	ProfileName  string `json:"profile_name,omitempty"`
+	CategoryList string `json:"category_list,omitempty"`
 	ArtifactPath string `json:"artifact_path,omitempty"`
 	SourceCount  int    `json:"source_count"`
 	FindingCount int    `json:"finding_count"`
@@ -41,6 +43,8 @@ type ResearchArtifact struct {
 	CreatedAt        string            `json:"created_at"`
 	Mode             string            `json:"mode"`
 	Query            string            `json:"query"`
+	ProfileName      string            `json:"profile_name,omitempty"`
+	Categories       []string          `json:"categories,omitempty"`
 	Status           string            `json:"status"`
 	ExecutiveSummary string            `json:"executive_summary"`
 	Findings         []researchFinding `json:"findings"`
@@ -52,14 +56,18 @@ type ResearchArtifact struct {
 	Error            string            `json:"error,omitempty"`
 }
 
-func persistResearchSession(query, mode string, report researchReport, status, errText string, toolLogCount int) (ResearchSessionRecord, error) {
+func persistResearchSession(query, mode string, report researchReport, status, errText string, toolLogCount int, ctx researchExecutionContext) (ResearchSessionRecord, error) {
 	now := time.Now().UTC()
 	sessionID := fmt.Sprintf("research-%d", now.UnixNano())
+	categories := normalizeResearchTags(ctx.ProfileCategories)
+	categoryList := strings.Join(categories, ",")
 	artifact := ResearchArtifact{
 		SessionID:        sessionID,
 		CreatedAt:        now.Format(time.RFC3339),
 		Mode:             strings.ToLower(strings.TrimSpace(mode)),
 		Query:            strings.TrimSpace(query),
+		ProfileName:      strings.TrimSpace(ctx.ProfileName),
+		Categories:       categories,
 		Status:           strings.ToUpper(strings.TrimSpace(status)),
 		ExecutiveSummary: strings.TrimSpace(report.Executive),
 		Findings:         report.Findings,
@@ -79,6 +87,8 @@ func persistResearchSession(query, mode string, report researchReport, status, e
 		Status:       artifact.Status,
 		Mode:         strings.ToUpper(artifact.Mode),
 		Query:        artifact.Query,
+		ProfileName:  artifact.ProfileName,
+		CategoryList: categoryList,
 		ArtifactPath: artifactPath,
 		SourceCount:  len(artifact.Sources),
 		FindingCount: len(artifact.Findings),
@@ -228,6 +238,12 @@ func renderResearchSessions(records []ResearchSessionRecord, corrupt int, last i
 		b.WriteString(fmt.Sprintf("     session_id: %s\n", rec.SessionID))
 		if strings.TrimSpace(rec.Query) != "" {
 			b.WriteString(fmt.Sprintf("     query: %s\n", rec.Query))
+		}
+		if strings.TrimSpace(rec.ProfileName) != "" {
+			b.WriteString(fmt.Sprintf("     profile: %s\n", rec.ProfileName))
+		}
+		if strings.TrimSpace(rec.CategoryList) != "" {
+			b.WriteString(fmt.Sprintf("     categories: %s\n", rec.CategoryList))
 		}
 		b.WriteString(fmt.Sprintf("     findings: %d\n", rec.FindingCount))
 		b.WriteString(fmt.Sprintf("     sources: %d\n", rec.SourceCount))

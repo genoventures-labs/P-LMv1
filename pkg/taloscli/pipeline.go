@@ -304,7 +304,7 @@ func executePipelineStep(step pipelineStep, st *pipelineState, skillRec *skills.
 		if query == "" {
 			return fmt.Errorf("research query cannot be empty")
 		}
-		report, sessionID, err := executeResearchMode(mode, query)
+		report, sessionID, err := executeResearchMode(mode, query, researchExecutionContext{})
 		if err != nil {
 			return err
 		}
@@ -319,7 +319,7 @@ func executePipelineStep(step pipelineStep, st *pipelineState, skillRec *skills.
 		if query == "" {
 			return fmt.Errorf("research query cannot be empty")
 		}
-		report, sessionID, err := executeResearchMode("deep", query)
+		report, sessionID, err := executeResearchMode("deep", query, researchExecutionContext{})
 		if err != nil {
 			return err
 		}
