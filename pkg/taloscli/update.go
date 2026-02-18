@@ -119,11 +119,19 @@ func runUpdateApply() error {
 	defer cancel()
 	target := configuredUpdateCmdPath()
 	out, err := exec.CommandContext(ctx, "go", "install", target+"@latest").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("go install failed: %w\n%s", err, strings.TrimSpace(string(out)))
+	if err == nil {
+		binPath := resolveTalosBinPath()
+		fmt.Println("Update complete.")
+		fmt.Printf("Binary path: %s\n", binPath)
+		fmt.Println("Run: talos version")
+		return nil
+	}
+	primaryErr := fmt.Errorf("go install failed: %w\n%s", err, strings.TrimSpace(string(out)))
+	if fallbackErr := installFromOriginTag(latest); fallbackErr != nil {
+		return fmt.Errorf("%v\nfallback install failed: %v", primaryErr, fallbackErr)
 	}
 	binPath := resolveTalosBinPath()
-	fmt.Println("Update complete.")
+	fmt.Println("Update complete (origin fallback).")
 	fmt.Printf("Binary path: %s\n", binPath)
 	fmt.Println("Run: talos version")
 	return nil
@@ -396,6 +404,43 @@ func resolveModulePathFromOrigin() string {
 		return url
 	}
 	return ""
+}
+
+func resolveOriginRemoteURL() string {
+	out, err := exec.Command("git", "remote", "get-url", "origin").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func installFromOriginTag(tag string) error {
+	remote := resolveOriginRemoteURL()
+	if remote == "" {
+		return errors.New("git origin URL not found")
+	}
+	tmpDir, err := os.MkdirTemp("", "talos-update-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	cloneOut, cloneErr := exec.CommandContext(ctx, "git", "clone", "--depth", "1", "--branch", tag, remote, tmpDir).CombinedOutput()
+	if cloneErr != nil {
+		return fmt.Errorf("git clone failed: %w: %s", cloneErr, strings.TrimSpace(string(cloneOut)))
+	}
+
+	installCtx, installCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer installCancel()
+	installCmd := exec.CommandContext(installCtx, "go", "install", "./cmd/talos")
+	installCmd.Dir = tmpDir
+	installOut, installErr := installCmd.CombinedOutput()
+	if installErr != nil {
+		return fmt.Errorf("go install ./cmd/talos failed: %w: %s", installErr, strings.TrimSpace(string(installOut)))
+	}
+	return nil
 }
 
 func compareSemver(a, b string) int {
