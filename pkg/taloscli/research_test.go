@@ -23,6 +23,9 @@ func TestRenderResearchReportSections(t *testing.T) {
 
 	required := []string{
 		"TALOS RESEARCH REPORT",
+		"COMMAND",
+		"STATUS",
+		"RESULTS",
 		"MODE",
 		"QUERY",
 		"EXECUTIVE SUMMARY",

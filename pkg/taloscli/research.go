@@ -635,10 +635,22 @@ func applyResearchSymbolicSupervision(sm *state.Manager, query, answer string, s
 func renderResearchReport(r researchReport) string {
 	var b strings.Builder
 	b.WriteString("TALOS RESEARCH REPORT\n\n")
+	b.WriteString("COMMAND\n")
+	b.WriteString("  talos research " + strings.ToLower(strings.TrimSpace(r.Mode)) + "\n\n")
+	status := "SUCCESS"
+	if r.UnverifiedCount > 0 {
+		status = "PARTIAL"
+	}
+	b.WriteString("STATUS\n")
+	b.WriteString("  " + status + "\n\n")
 	b.WriteString("MODE\n")
 	b.WriteString("  " + strings.ToUpper(strings.TrimSpace(r.Mode)) + "\n\n")
 	b.WriteString("QUERY\n")
 	b.WriteString("  " + strings.TrimSpace(r.Query) + "\n\n")
+	b.WriteString("RESULTS\n")
+	b.WriteString(fmt.Sprintf("  findings: %d\n", len(r.Findings)))
+	b.WriteString(fmt.Sprintf("  sources: %d\n", len(r.Sources)))
+	b.WriteString(fmt.Sprintf("  unverified_findings: %d\n\n", r.UnverifiedCount))
 	b.WriteString("EXECUTIVE SUMMARY\n")
 	b.WriteString("  " + strings.TrimSpace(r.Executive) + "\n\n")
 

@@ -130,6 +130,18 @@ Learn from a Hugging Face dataset:
 HF_TOKEN=your_token talos learn --hf-dataset wikipedia --hf-split train --hf-max-records 100
 ```
 
+Learn from a Kaggle dataset:
+
+```bash
+KAGGLE_USERNAME=your_user KAGGLE_KEY=your_key talos learn --kaggle-dataset zillow/zecon --kaggle-max-records 100
+```
+
+Chain multiple training sources in a fixed order:
+
+```bash
+talos learn --chain "url,books,hf,kaggle" --url https://example.com --book-search "frankenstein" --hf-dataset wikipedia --kaggle-dataset zillow/zecon
+```
+
 Create and use a reusable learn profile:
 
 ```bash

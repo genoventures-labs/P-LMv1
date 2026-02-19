@@ -11,10 +11,18 @@ var versionCmd = &cobra.Command{
 	Short: "Show TALOS version and build metadata.",
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Println("TALOS VERSION")
-		fmt.Printf("  Version:    %s\n", currentTalosVersion())
-		fmt.Printf("  Commit:     %s\n", currentTalosCommit())
-		fmt.Printf("  Build Date: %s\n", currentTalosBuildDate())
-		fmt.Printf("  Runtime:    %s\n", runtimeDescriptor())
+		fmt.Println()
+		fmt.Println("COMMAND")
+		fmt.Println("  talos version")
+		fmt.Println()
+		fmt.Println("STATUS")
+		fmt.Println("  SUCCESS")
+		fmt.Println()
+		fmt.Println("RESULTS")
+		fmt.Printf("  version:    %s\n", currentTalosVersion())
+		fmt.Printf("  commit:     %s\n", currentTalosCommit())
+		fmt.Printf("  build_date: %s\n", currentTalosBuildDate())
+		fmt.Printf("  runtime:    %s\n", runtimeDescriptor())
 	},
 }
 

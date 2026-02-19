@@ -62,6 +62,9 @@ type LearnProfileConfig struct {
 	HFConfig               string   `json:"hf_config,omitempty"`
 	HFSplit                string   `json:"hf_split,omitempty"`
 	HFMaxRecords           int      `json:"hf_max_records"`
+	KaggleDatasets         []string `json:"kaggle_datasets,omitempty"`
+	KaggleFiles            []string `json:"kaggle_files,omitempty"`
+	KaggleMaxRecords       int      `json:"kaggle_max_records"`
 	URLSafety              bool     `json:"url_safety"`
 	URLSafetyTimeout       string   `json:"url_safety_timeout,omitempty"`
 	URLSafetyCacheTTL      string   `json:"url_safety_cache_ttl,omitempty"`
@@ -145,6 +148,9 @@ type learnRuntimeSnapshot struct {
 	learnHFConfig               string
 	learnHFSplit                string
 	learnHFMaxRecords           int
+	learnKaggleDatasets         []string
+	learnKaggleFiles            []string
+	learnKaggleMaxRecords       int
 	learnURLSafety              bool
 	learnURLSafetyTimeout       time.Duration
 	learnURLSafetyCacheTTL      time.Duration
@@ -403,7 +409,7 @@ func runLearnProfileList(cmd *cobra.Command, args []string) {
 		fmt.Printf("  %d. %s%s\n", i+1, p.Name, mark)
 		fmt.Printf("     desc: %s\n", emptyAsNA(p.Description))
 		fmt.Printf("     updated: %s\n", emptyAsNA(p.UpdatedAt))
-		fmt.Printf("     mode hints: hf_datasets=%d urls=%d dir=%t file=%t\n", len(p.Config.HFDatasets), len(p.Config.URLs), strings.TrimSpace(p.Config.Dir) != "", strings.TrimSpace(p.Config.File) != "")
+		fmt.Printf("     mode hints: hf_datasets=%d kaggle_datasets=%d urls=%d dir=%t file=%t\n", len(p.Config.HFDatasets), len(p.Config.KaggleDatasets), len(p.Config.URLs), strings.TrimSpace(p.Config.Dir) != "", strings.TrimSpace(p.Config.File) != "")
 	}
 }
 
@@ -562,6 +568,9 @@ func currentLearnProfileConfigFromGlobals() LearnProfileConfig {
 		HFConfig:               strings.TrimSpace(learnHFConfig),
 		HFSplit:                strings.TrimSpace(learnHFSplit),
 		HFMaxRecords:           learnHFMaxRecords,
+		KaggleDatasets:         append([]string(nil), learnKaggleDatasets...),
+		KaggleFiles:            append([]string(nil), learnKaggleFiles...),
+		KaggleMaxRecords:       learnKaggleMaxRecords,
 		URLSafety:              learnURLSafety,
 		URLSafetyTimeout:       learnURLSafetyTimeout.String(),
 		URLSafetyCacheTTL:      learnURLSafetyCacheTTL.String(),
@@ -623,6 +632,9 @@ func applyLearnProfileConfig(cfg LearnProfileConfig) {
 	learnHFConfig = strings.TrimSpace(cfg.HFConfig)
 	learnHFSplit = strings.TrimSpace(cfg.HFSplit)
 	learnHFMaxRecords = cfg.HFMaxRecords
+	learnKaggleDatasets = append([]string(nil), cfg.KaggleDatasets...)
+	learnKaggleFiles = append([]string(nil), cfg.KaggleFiles...)
+	learnKaggleMaxRecords = cfg.KaggleMaxRecords
 	learnURLSafety = cfg.URLSafety
 	if d, err := time.ParseDuration(strings.TrimSpace(cfg.URLSafetyTimeout)); err == nil && d > 0 {
 		learnURLSafetyTimeout = d
@@ -692,6 +704,9 @@ func validateLearnProfileConfig(cfg LearnProfileConfig) error {
 	}
 	if cfg.HFMaxRecords <= 0 {
 		return fmt.Errorf("hf_max_records must be > 0")
+	}
+	if len(cfg.KaggleDatasets) > 0 && cfg.KaggleMaxRecords <= 0 {
+		return fmt.Errorf("kaggle_max_records must be > 0")
 	}
 	if cfg.RemoteTimeout != "" {
 		if d, err := time.ParseDuration(cfg.RemoteTimeout); err != nil || d <= 0 {
@@ -817,6 +832,9 @@ func captureLearnRuntimeSnapshot() learnRuntimeSnapshot {
 		learnHFConfig:               learnHFConfig,
 		learnHFSplit:                learnHFSplit,
 		learnHFMaxRecords:           learnHFMaxRecords,
+		learnKaggleDatasets:         append([]string(nil), learnKaggleDatasets...),
+		learnKaggleFiles:            append([]string(nil), learnKaggleFiles...),
+		learnKaggleMaxRecords:       learnKaggleMaxRecords,
 		learnURLSafety:              learnURLSafety,
 		learnURLSafetyTimeout:       learnURLSafetyTimeout,
 		learnURLSafetyCacheTTL:      learnURLSafetyCacheTTL,
@@ -928,6 +946,15 @@ func restoreVisitedLearnFlags(cmd *cobra.Command, snap learnRuntimeSnapshot) {
 	}
 	if visited["hf-max-records"] {
 		learnHFMaxRecords = snap.learnHFMaxRecords
+	}
+	if visited["kaggle-dataset"] {
+		learnKaggleDatasets = append([]string(nil), snap.learnKaggleDatasets...)
+	}
+	if visited["kaggle-file"] {
+		learnKaggleFiles = append([]string(nil), snap.learnKaggleFiles...)
+	}
+	if visited["kaggle-max-records"] {
+		learnKaggleMaxRecords = snap.learnKaggleMaxRecords
 	}
 	if visited["url-safety"] {
 		learnURLSafety = snap.learnURLSafety
@@ -1101,6 +1128,15 @@ func patchLearnProfileFromVisited(cmd *cobra.Command, p *LearnProfile) {
 	}
 	if visited["hf-max-records"] {
 		cfg.HFMaxRecords = learnHFMaxRecords
+	}
+	if visited["kaggle-dataset"] {
+		cfg.KaggleDatasets = append([]string(nil), learnKaggleDatasets...)
+	}
+	if visited["kaggle-file"] {
+		cfg.KaggleFiles = append([]string(nil), learnKaggleFiles...)
+	}
+	if visited["kaggle-max-records"] {
+		cfg.KaggleMaxRecords = learnKaggleMaxRecords
 	}
 	if visited["url-safety"] {
 		cfg.URLSafety = learnURLSafety

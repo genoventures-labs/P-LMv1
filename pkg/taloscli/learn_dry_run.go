@@ -3,6 +3,8 @@ package taloscli
 import (
 	"fmt"
 	"strings"
+
+	"github.com/Thynaptic/P-LMv1/pkg/rag"
 )
 
 func renderLearnDryRunPlan(args []string) (string, error) {
@@ -24,7 +26,7 @@ func renderLearnDryRunPlan(args []string) (string, error) {
 			fmt.Sprintf("recursive=%t", learnRecursive),
 			fmt.Sprintf("all_types=%t", learnAllTypes),
 		)
-	} else if len(learnURLs) > 0 || strings.TrimSpace(learnURLFile) != "" || len(learnHFDatasets) > 0 {
+	} else if len(learnURLs) > 0 || strings.TrimSpace(learnURLFile) != "" || len(learnHFDatasets) > 0 || len(learnKaggleDatasets) > 0 {
 		mode = "REMOTE"
 		target = "remote sources"
 		if len(learnURLs) > 0 {
@@ -36,12 +38,20 @@ func renderLearnDryRunPlan(args []string) (string, error) {
 		if len(learnHFDatasets) > 0 {
 			notes = append(notes, fmt.Sprintf("hf_datasets=%d", len(learnHFDatasets)))
 		}
+		if len(learnKaggleDatasets) > 0 {
+			notes = append(notes, fmt.Sprintf("kaggle_datasets=%d", len(learnKaggleDatasets)))
+		}
 		notes = append(notes,
 			fmt.Sprintf("crawl=%t", learnCrawl),
 			fmt.Sprintf("crawl_depth=%d", learnCrawlDepth),
 			fmt.Sprintf("max_pages=%d", learnMaxPages),
 			fmt.Sprintf("url_safety=%t", learnURLSafety),
 		)
+		if exts := remoteURLAllowedExtensions(); len(exts) > 0 {
+			notes = append(notes, "url_extensions="+rag.ExtensionsToCSV(exts))
+		} else {
+			notes = append(notes, "url_mode=html_text_only")
+		}
 	} else if strings.TrimSpace(learnFile) != "" {
 		mode = "FILE"
 		target = strings.TrimSpace(learnFile)
@@ -50,11 +60,15 @@ func renderLearnDryRunPlan(args []string) (string, error) {
 		target = "inline"
 		notes = append(notes, fmt.Sprintf("inline_chars=%d", len(strings.TrimSpace(strings.Join(args, " ")))))
 	} else {
-		return "", fmt.Errorf("no learn input resolved; provide text, --file, --dir, --url/--hf-dataset, or --from-research")
+		return "", fmt.Errorf("no learn input resolved; provide text, --file, --dir, --url/--hf-dataset/--kaggle-dataset, or --from-research")
 	}
 
 	var b strings.Builder
 	b.WriteString("TALOS LEARN DRY RUN\n\n")
+	b.WriteString("COMMAND\n")
+	b.WriteString("  talos learn\n\n")
+	b.WriteString("STATUS\n")
+	b.WriteString("  SKIPPED\n\n")
 	b.WriteString("MODE\n")
 	b.WriteString("  " + mode + "\n\n")
 	b.WriteString("TARGET\n")

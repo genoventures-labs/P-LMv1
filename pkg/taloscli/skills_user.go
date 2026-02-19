@@ -141,7 +141,7 @@ var skillsListCmd = &cobra.Command{
 			sort.SliceStable(recs, func(i, j int) bool {
 				return recs[i].UpdatedAt.After(recs[j].UpdatedAt)
 			})
-			fmt.Printf("TALOS SKILLS\n\nSUMMARY\n  Enabled skills: %d\n\nSKILLS\n", len(recs))
+			fmt.Printf("TALOS SKILLS\n\nCOMMAND\n  talos skills list\n\nSTATUS\n  SUCCESS\n\nSUMMARY\n  enabled_skills: %d\n\nSKILLS\n", len(recs))
 			for i, rec := range recs {
 				name := strings.TrimSpace(rec.Name)
 				if name == "" {
@@ -167,7 +167,7 @@ var skillsListCmd = &cobra.Command{
 			fmt.Println("No user skills found.")
 			return
 		}
-		fmt.Printf("TALOS SKILLS\n\nSUMMARY\n  Enabled skills: %d\n\nSKILLS\n", len(paths))
+		fmt.Printf("TALOS SKILLS\n\nCOMMAND\n  talos skills list\n\nSTATUS\n  SUCCESS\n\nSUMMARY\n  enabled_skills: %d\n\nSKILLS\n", len(paths))
 		for _, p := range paths {
 			id, name := readSkillIdentity(p)
 			if strings.TrimSpace(name) == "" {
@@ -343,7 +343,7 @@ var skillsRevisionsCmd = &cobra.Command{
 			fmt.Println("No revisions found.")
 			return
 		}
-		fmt.Printf("TALOS SKILL REVISIONS\n\nskill_id: %s\ncount: %d\n\nREVISIONS\n", rec.SkillID, len(revs))
+		fmt.Printf("TALOS SKILL REVISIONS\n\nCOMMAND\n  talos skills revisions --id %s\n\nSTATUS\n  SUCCESS\n\nSUMMARY\n  skill_id: %s\n  count: %d\n\nREVISIONS\n", rec.SkillID, rec.SkillID, len(revs))
 		for i, r := range revs {
 			fmt.Printf("  %d. revision=%s version=%s status=%s active=%t updated=%s\n", i+1, valueOrPlaceholder(r.RevisionID), valueOrPlaceholder(r.Version), valueOrPlaceholder(r.Status), r.Active, formatSkillTime(r.UpdatedAt))
 		}
@@ -428,14 +428,14 @@ var skillsMigrateCmd = &cobra.Command{
 		if userSkillMigrateApply {
 			mode = "APPLIED"
 		}
-		fmt.Fprintf(w, "TALOS SKILLS MIGRATE\n\nMODE\n  %s\n\nSUMMARY\n", mode)
+		fmt.Fprintf(w, "TALOS SKILLS MIGRATE\n\nCOMMAND\n  talos skills migrate\n\nSTATUS\n  SUCCESS\n\nMODE\n  %s\n\nSUMMARY\n", mode)
 		fmt.Fprintf(w, "  total_records: %d\n", report.TotalRecords)
 		fmt.Fprintf(w, "  legacy_records: %d\n", report.LegacyRecords)
 		fmt.Fprintf(w, "  updated_records: %d\n", report.UpdatedRecords)
 		if userSkillMigrateApply {
-			fmt.Fprintln(w, "\nRESULT\n  Registry migration completed.")
+			fmt.Fprintln(w, "\nRESULT\n  Registry migration completed.\n\nNEXT\n  Use: talos skills list")
 		} else {
-			fmt.Fprintln(w, "\nRESULT\n  No files written. Re-run with --apply to persist migration.")
+			fmt.Fprintln(w, "\nRESULT\n  No files written. Re-run with --apply to persist migration.\n\nNEXT\n  Use: talos skills migrate --apply")
 		}
 	},
 }

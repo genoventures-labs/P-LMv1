@@ -52,6 +52,12 @@ func TestRenderReleaseCheckReport(t *testing.T) {
 		Checks: []releaseCheck{{Name: "A", Status: "PASS"}},
 	}
 	out := renderReleaseCheckReport(report)
+	required := []string{"TALOS RELEASE CHECK", "COMMAND", "STATUS", "NEXT"}
+	for _, token := range required {
+		if !strings.Contains(out, token) {
+			t.Fatalf("expected token %q in report, got: %s", token, out)
+		}
+	}
 	if !strings.Contains(out, "TALOS RELEASE CHECK") {
 		t.Fatalf("expected release report header, got: %s", out)
 	}

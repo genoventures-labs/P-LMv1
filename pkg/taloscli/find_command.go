@@ -86,6 +86,14 @@ func commandMatchesQuery(c *cobra.Command, query string) bool {
 func renderFindResults(query string, matches []findMatch) string {
 	var b strings.Builder
 	b.WriteString("TALOS COMMAND FIND\n\n")
+	b.WriteString("COMMAND\n")
+	b.WriteString("  talos find " + strings.TrimSpace(query) + "\n\n")
+	b.WriteString("STATUS\n")
+	if len(matches) == 0 {
+		b.WriteString("  PARTIAL\n\n")
+	} else {
+		b.WriteString("  SUCCESS\n\n")
+	}
 	b.WriteString("QUERY\n")
 	b.WriteString("  " + strings.TrimSpace(query) + "\n\n")
 	b.WriteString("RESULTS\n")
@@ -93,6 +101,8 @@ func renderFindResults(query string, matches []findMatch) string {
 	if len(matches) == 0 {
 		b.WriteString("COMMANDS\n")
 		b.WriteString("  No matching commands found.\n")
+		b.WriteString("\nNEXT\n")
+		b.WriteString("  Try: talos --help\n")
 		return strings.TrimRight(b.String(), "\n")
 	}
 
@@ -113,6 +123,8 @@ func renderFindResults(query string, matches []findMatch) string {
 		}
 		b.WriteString(fmt.Sprintf("  %-*s | %s\n", pathWidth, m.Path, summary))
 	}
+	b.WriteString("\nNEXT\n")
+	b.WriteString("  Use: talos <command> --help\n")
 	return strings.TrimRight(b.String(), "\n")
 }
 

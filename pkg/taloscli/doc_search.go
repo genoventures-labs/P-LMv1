@@ -65,6 +65,14 @@ var docSearchCmd = &cobra.Command{
 func renderDocSearchReport(report DocSearchReport) string {
 	var b strings.Builder
 	b.WriteString("TALOS DOC SEARCH\n\n")
+	b.WriteString("COMMAND\n")
+	b.WriteString("  talos doc-search\n\n")
+	status := "SUCCESS"
+	if report.Truncated {
+		status = "PARTIAL"
+	}
+	b.WriteString("STATUS\n")
+	b.WriteString("  " + status + "\n\n")
 	b.WriteString("QUERY\n")
 	b.WriteString("  " + strings.TrimSpace(report.Query) + "\n\n")
 	b.WriteString("SCOPE\n")
@@ -82,6 +90,8 @@ func renderDocSearchReport(report DocSearchReport) string {
 	b.WriteString("RESULTS\n")
 	if len(report.Results) == 0 {
 		b.WriteString("  no matches found.\n")
+		b.WriteString("\nNEXT\n")
+		b.WriteString("  Try: talos find <keyword>\n")
 		return strings.TrimRight(b.String(), "\n")
 	}
 	for _, r := range report.Results {
@@ -90,6 +100,8 @@ func renderDocSearchReport(report DocSearchReport) string {
 			b.WriteString(fmt.Sprintf("      L%d:C%d %s\n", m.Line, m.Column, m.Snippet))
 		}
 	}
+	b.WriteString("\nNEXT\n")
+	b.WriteString("  Refine scope with --dir/--extensions for faster targeted search.\n")
 	return strings.TrimRight(b.String(), "\n")
 }
 

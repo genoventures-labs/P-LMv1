@@ -133,12 +133,16 @@ func filterLearnSessionRecords(in []LearnSessionRecord, status string, modes map
 func renderLearnedReport(records []LearnSessionRecord, requestedLast int, corruptCount int) string {
 	var b strings.Builder
 	b.WriteString("TALOS LEARNED REPORT\n\n")
+	b.WriteString("COMMAND\n")
+	b.WriteString("  talos learned\n\n")
 	b.WriteString("WINDOW\n")
 	b.WriteString(fmt.Sprintf("  requested_last: %d\n", requestedLast))
 	b.WriteString(fmt.Sprintf("  returned_sessions: %d\n", len(records)))
 	b.WriteString(fmt.Sprintf("  corrupt_records_skipped: %d\n\n", corruptCount))
 
 	if len(records) == 0 {
+		b.WriteString("STATUS\n")
+		b.WriteString("  SUCCESS\n\n")
 		b.WriteString("SESSION SNAPSHOT\n")
 		b.WriteString("  No learn sessions recorded yet.\n\n")
 		b.WriteString("NEXT ACTION\n")
@@ -231,6 +235,14 @@ func renderLearnedReport(records []LearnSessionRecord, requestedLast int, corrup
 		case "PARTIAL":
 			partial++
 		}
+	}
+	b.WriteString("\nSTATUS\n")
+	if failed > 0 {
+		b.WriteString("  FAILED\n")
+	} else if partial > 0 {
+		b.WriteString("  PARTIAL\n")
+	} else {
+		b.WriteString("  SUCCESS\n")
 	}
 	b.WriteString(fmt.Sprintf("  Processed %d session(s); failed=%d, partial=%d.\n", len(records), failed, partial))
 	if failed > 0 {

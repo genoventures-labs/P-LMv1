@@ -126,3 +126,77 @@ func TestNormalizeRemoteOptionsChunkTitleDefaults(t *testing.T) {
 		t.Fatalf("expected positive ChunkTitleMaxChars, got %d", opts.ChunkTitleMaxChars)
 	}
 }
+
+func TestParseFetchedContentDefaultsToHTMLOnly(t *testing.T) {
+	text, isHTML, err := parseFetchedContent("https://example.com/data.txt", "text/plain", []byte("hello"), false)
+	if err == nil {
+		t.Fatalf("expected non-html to be rejected, got text=%q html=%t", text, isHTML)
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "only html pages") {
+		t.Fatalf("expected html-only policy error, got: %v", err)
+	}
+}
+
+func TestParseFetchedContentAllowsTextWhenExtensionsSpecified(t *testing.T) {
+	text, isHTML, err := parseFetchedContent("https://example.com/data.txt", "text/plain", []byte("hello world"), true)
+	if err != nil {
+		t.Fatalf("expected text/plain to parse when extension mode active, got: %v", err)
+	}
+	if isHTML {
+		t.Fatalf("expected non-html content, got html=true")
+	}
+	if !strings.Contains(text, "hello world") {
+		t.Fatalf("unexpected parsed text: %q", text)
+	}
+}
+
+func TestURLAllowedByExtensionStrict(t *testing.T) {
+	allowed := map[string]bool{".pdf": true, ".md": true}
+	if !urlAllowedByExtension("https://example.com/a.pdf", allowed) {
+		t.Fatal("expected .pdf URL allowed")
+	}
+	if urlAllowedByExtension("https://example.com/", allowed) {
+		t.Fatal("expected extensionless URL to be blocked in strict mode")
+	}
+	if urlAllowedByExtension("https://example.com/a.html", allowed) {
+		t.Fatal("expected non-allowlisted extension to be blocked")
+	}
+}
+
+func TestParseKaggleRowsCSV(t *testing.T) {
+	body := []byte("name,score\nalice,10\nbob,12\n")
+	rows, err := parseKaggleRows("train.csv", body, 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows))
+	}
+	if !strings.Contains(rows[0], "name: alice") || !strings.Contains(rows[0], "score: 10") {
+		t.Fatalf("unexpected row content: %q", rows[0])
+	}
+}
+
+func TestParseKaggleRowsJSONL(t *testing.T) {
+	body := []byte("{\"text\":\"a\"}\n{\"text\":\"b\"}\n")
+	rows, err := parseKaggleRows("records.jsonl", body, 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row due maxRecords cap, got %d", len(rows))
+	}
+}
+
+func TestResolveKaggleCredentialsFromAlias(t *testing.T) {
+	t.Setenv("KAGGLE_USERNAME", "")
+	t.Setenv("KAGGLE_KEY", "")
+	t.Setenv("KAGGLE_API_KEY", "demo-user:demo-key")
+	user, key, err := resolveKaggleCredentials(DefaultRemoteIndexOptions())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if user != "demo-user" || key != "demo-key" {
+		t.Fatalf("unexpected credentials: %q %q", user, key)
+	}
+}

@@ -19,6 +19,8 @@ func TestWriteDoctorReport(t *testing.T) {
 
 	required := []string{
 		"TALOS DOCTOR",
+		"COMMAND",
+		"STATUS",
 		"SUMMARY",
 		"PASS: 1",
 		"WARN: 1",
@@ -27,6 +29,7 @@ func TestWriteDoctorReport(t *testing.T) {
 		"[PASS] A",
 		"[WARN] B",
 		"[FAIL] C",
+		"NEXT",
 	}
 	for _, token := range required {
 		if !strings.Contains(rendered, token) {

@@ -194,3 +194,23 @@ func TestMonitorStatusCommandPrintsMARHealth(t *testing.T) {
 		}
 	}
 }
+
+func TestMonitorCommandIncludesReboot(t *testing.T) {
+	cmd, _, err := monitorCmd.Find([]string{"reboot"})
+	if err != nil {
+		t.Fatalf("expected reboot subcommand to be registered: %v", err)
+	}
+	if cmd == nil || cmd.Name() != "reboot" {
+		t.Fatalf("expected reboot subcommand, got %#v", cmd)
+	}
+}
+
+func TestMonitorCommandIncludesRebootAlias(t *testing.T) {
+	cmd, _, err := monitorCmd.Find([]string{"restart"})
+	if err != nil {
+		t.Fatalf("expected restart alias to resolve: %v", err)
+	}
+	if cmd == nil || cmd.Name() != "reboot" {
+		t.Fatalf("expected restart alias to map to reboot, got %#v", cmd)
+	}
+}

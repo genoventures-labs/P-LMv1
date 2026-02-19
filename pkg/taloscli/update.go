@@ -93,19 +93,37 @@ func runUpdateCheck(verbose bool) error {
 	cmp := compareSemver(current, latest)
 	if verbose {
 		fmt.Println("TALOS UPDATE CHECK")
-		fmt.Printf("  Current: %s\n", current)
-		fmt.Printf("  Latest:  %s\n", latest)
+		fmt.Println()
+		fmt.Println("COMMAND")
+		fmt.Println("  talos update check")
+		fmt.Println()
+		fmt.Println("RESULTS")
+		fmt.Printf("  current: %s\n", current)
+		fmt.Printf("  latest:  %s\n", latest)
 	}
 	if cmp < 0 {
-		fmt.Printf("Update available: %s -> %s\n", current, latest)
-		fmt.Println("Run: talos update apply")
+		fmt.Println()
+		fmt.Println("STATUS")
+		fmt.Println("  PARTIAL")
+		fmt.Println()
+		fmt.Printf("NEXT\n  Run: talos update apply (%s -> %s)\n", current, latest)
 		return nil
 	}
 	if cmp == 0 {
-		fmt.Println("TALOS is up to date.")
+		fmt.Println()
+		fmt.Println("STATUS")
+		fmt.Println("  SUCCESS")
+		fmt.Println()
+		fmt.Println("NEXT")
+		fmt.Println("  TALOS is up to date.")
 		return nil
 	}
-	fmt.Println("Current version is newer than latest module tag.")
+	fmt.Println()
+	fmt.Println("STATUS")
+	fmt.Println("  SUCCESS")
+	fmt.Println()
+	fmt.Println("NEXT")
+	fmt.Println("  Current version is newer than latest module tag.")
 	return nil
 }
 
@@ -184,9 +202,28 @@ func runUpdateAutoConfig() error {
 		if err := saveUpdateConfig(cfg); err != nil {
 			return err
 		}
-		fmt.Println("Auto-update configuration updated.")
+		fmt.Println("TALOS UPDATE AUTO")
+		fmt.Println()
+		fmt.Println("COMMAND")
+		fmt.Println("  talos update auto")
+		fmt.Println()
+		fmt.Println("STATUS")
+		fmt.Println("  SUCCESS")
+		fmt.Println()
+		fmt.Println("RESULT")
+		fmt.Println("  Auto-update configuration updated.")
+		fmt.Println()
+	} else {
+		fmt.Println("TALOS UPDATE AUTO")
+		fmt.Println()
+		fmt.Println("COMMAND")
+		fmt.Println("  talos update auto")
+		fmt.Println()
+		fmt.Println("STATUS")
+		fmt.Println("  SUCCESS")
+		fmt.Println()
 	}
-	fmt.Println("AUTO-UPDATE CONFIG")
+	fmt.Println("CONFIG")
 	fmt.Printf("  Enabled:       %t\n", cfg.Enabled)
 	fmt.Printf("  Auto-Apply:    %t\n", cfg.AutoApply)
 	fmt.Printf("  IntervalHours: %d\n", cfg.IntervalHours)
@@ -196,6 +233,9 @@ func runUpdateAutoConfig() error {
 	if strings.TrimSpace(cfg.LastSeen) != "" {
 		fmt.Printf("  LastSeen:      %s\n", cfg.LastSeen)
 	}
+	fmt.Println()
+	fmt.Println("NEXT")
+	fmt.Println("  Re-run `talos update check` to verify current release status.")
 	return nil
 }
 

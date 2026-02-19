@@ -1,9 +1,13 @@
 package rag
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -27,13 +31,15 @@ const (
 	defaultMaxPages         = 200
 	defaultRateLimitPerSec  = 2.0
 	defaultHFDatasetAPIBase = "https://datasets-server.huggingface.co"
+	defaultKaggleAPIBase    = "https://www.kaggle.com/api/v1"
 )
 
 var (
-	htmlTagRE   = regexp.MustCompile(`(?s)<[^>]+>`)
-	htmlSpaceRE = regexp.MustCompile(`\s+`)
-	hrefRE      = regexp.MustCompile(`(?is)href\s*=\s*["']([^"'#]+)["']`)
-	hostLabelRE = regexp.MustCompile(`^[a-z0-9-]{1,63}$`)
+	htmlTagRE             = regexp.MustCompile(`(?s)<[^>]+>`)
+	htmlSpaceRE           = regexp.MustCompile(`\s+`)
+	hrefRE                = regexp.MustCompile(`(?is)href\s*=\s*["']([^"'#]+)["']`)
+	hostLabelRE           = regexp.MustCompile(`^[a-z0-9-]{1,63}$`)
+	errUnsupportedContent = errors.New("unsupported content type")
 )
 
 type RemoteIndexOptions struct {
@@ -53,6 +59,10 @@ type RemoteIndexOptions struct {
 	AuthHeader          string
 	HFToken             string
 	HFAPIBaseURL        string
+	KaggleUsername      string
+	KaggleKey           string
+	KaggleAPIBaseURL    string
+	URLAllowedExts      map[string]bool
 	URLSafetyEnabled    bool
 	URLSafetyTimeout    time.Duration
 	URLSafetyCacheTTL   time.Duration
@@ -98,6 +108,12 @@ type HFSpec struct {
 	MaxRecords int
 }
 
+type KaggleSpec struct {
+	DatasetID  string
+	Files      []string
+	MaxRecords int
+}
+
 func DefaultRemoteIndexOptions() RemoteIndexOptions {
 	return RemoteIndexOptions{
 		MaxChunkChars:       DefaultIndexOptions().MaxChunkChars,
@@ -112,6 +128,7 @@ func DefaultRemoteIndexOptions() RemoteIndexOptions {
 		RateLimitPerSec:     defaultRateLimitPerSec,
 		UserAgent:           "talos/1.0 (+https://thynaptic.com)",
 		HFAPIBaseURL:        defaultHFDatasetAPIBase,
+		KaggleAPIBaseURL:    defaultKaggleAPIBase,
 		URLSafetyEnabled:    true,
 		URLSafetyTimeout:    45 * time.Second,
 		URLSafetyCacheTTL:   24 * time.Hour,
@@ -143,6 +160,11 @@ func IndexURLs(mm *memory.MemoryManager, seedURLs []string, opts RemoteIndexOpti
 		n, host, err := normalizeHTTPURL(raw)
 		if err != nil {
 			emitRemoteEvent(opts, RemoteEvent{Source: raw, Outcome: "invalid-url", Detail: err.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			continue
+		}
+		if !urlAllowedByExtension(n, opts.URLAllowedExts) {
+			stats.SkippedUnsupported++
+			emitRemoteEvent(opts, RemoteEvent{Source: n, Outcome: "skipped-extension", Detail: "URL extension not in allowlist", ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
 			continue
 		}
 		seedHosts[host] = true
@@ -230,10 +252,15 @@ func IndexURLs(mm *memory.MemoryManager, seedURLs []string, opts RemoteIndexOpti
 			continue
 		}
 
-		text, isHTML, parseErr := parseFetchedContent(item.URL, contentType, body)
+		text, isHTML, parseErr := parseFetchedContent(item.URL, contentType, body, len(opts.URLAllowedExts) > 0)
 		if parseErr != nil {
-			stats.ParseErrors++
-			emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "parse-error", Detail: parseErr.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			if errors.Is(parseErr, errUnsupportedContent) {
+				stats.SkippedUnsupported++
+				emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "skipped-unsupported", Detail: parseErr.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			} else {
+				stats.ParseErrors++
+				emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "parse-error", Detail: parseErr.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			}
 		} else {
 			chunks := chunkText(normalizeText(text), opts.MaxChunkChars, opts.ChunkOverlap)
 			if len(chunks) == 0 {
@@ -285,6 +312,9 @@ func IndexURLs(mm *memory.MemoryManager, seedURLs []string, opts RemoteIndexOpti
 					continue
 				}
 				if !isDomainAllowed(linkHost, seedHosts, opts.AllowedDomains, opts.Crawl) {
+					continue
+				}
+				if !urlAllowedByExtension(norm, opts.URLAllowedExts) {
 					continue
 				}
 				if seen[norm] {
@@ -423,6 +453,130 @@ func IndexHFDatasets(mm *memory.MemoryManager, specs []HFSpec, opts RemoteIndexO
 	return stats, nil
 }
 
+func IndexKaggleDatasets(mm *memory.MemoryManager, specs []KaggleSpec, opts RemoteIndexOptions) (RemoteIndexStats, error) {
+	var stats RemoteIndexStats
+	if mm == nil {
+		return stats, fmt.Errorf("memory manager is required")
+	}
+	opts = normalizeRemoteOptions(opts)
+	client := opts.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: opts.Timeout}
+	}
+	username, key, credErr := resolveKaggleCredentials(opts)
+	if credErr != nil {
+		return stats, credErr
+	}
+	base := strings.TrimRight(strings.TrimSpace(opts.KaggleAPIBaseURL), "/")
+	if base == "" {
+		base = defaultKaggleAPIBase
+	}
+
+	for _, spec := range specs {
+		datasetID := strings.TrimSpace(spec.DatasetID)
+		if datasetID == "" {
+			continue
+		}
+		owner, dataset, err := splitKaggleDatasetID(datasetID)
+		if err != nil {
+			emitRemoteEvent(opts, RemoteEvent{Source: datasetID, Outcome: "kaggle-invalid-dataset", Detail: err.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			stats.ParseErrors++
+			continue
+		}
+		files, err := fetchKaggleDatasetFiles(client, base, owner, dataset, username, key, opts)
+		if err != nil {
+			stats.HTTPErrors++
+			emitRemoteEvent(opts, RemoteEvent{Source: datasetID, Outcome: "kaggle-http-error", Detail: err.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			continue
+		}
+		stats.ItemsFetched++
+		selected := selectKaggleFiles(files, spec.Files)
+		if len(selected) == 0 {
+			stats.SkippedUnsupported++
+			emitRemoteEvent(opts, RemoteEvent{Source: datasetID, Outcome: "kaggle-no-files", Detail: "no supported files selected", ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			continue
+		}
+		maxRecords := spec.MaxRecords
+		if maxRecords <= 0 {
+			maxRecords = 100
+		}
+		for _, fileName := range selected {
+			endpoint := fmt.Sprintf("%s/datasets/download/%s/%s/%s", base, url.PathEscape(owner), url.PathEscape(dataset), url.PathEscape(fileName))
+			body, _, status, fetchErr := fetchURL(client, endpoint, RemoteIndexOptions{
+				MaxBytes:   opts.MaxBytes,
+				UserAgent:  opts.UserAgent,
+				AuthHeader: kaggleBasicAuthHeader(username, key),
+			})
+			if fetchErr != nil {
+				stats.HTTPErrors++
+				emitRemoteEvent(opts, RemoteEvent{Source: datasetID, Outcome: "kaggle-http-error", Detail: fetchErr.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+				continue
+			}
+			stats.ItemsFetched++
+			stats.BytesFetched += int64(len(body))
+			if status < 200 || status >= 300 {
+				stats.HTTPErrors++
+				emitRemoteEvent(opts, RemoteEvent{Source: datasetID, Outcome: "kaggle-http-status", Detail: strconv.Itoa(status), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+				continue
+			}
+			rows, parseErr := parseKaggleRows(fileName, body, maxRecords)
+			if parseErr != nil {
+				stats.ParseErrors++
+				emitRemoteEvent(opts, RemoteEvent{Source: datasetID, Outcome: "kaggle-parse-error", Detail: parseErr.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+				continue
+			}
+			for i, row := range rows {
+				text := normalizeText(row)
+				if text == "" {
+					continue
+				}
+				chunks := chunkText(text, opts.MaxChunkChars, opts.ChunkOverlap)
+				if len(chunks) == 0 {
+					continue
+				}
+				meta := map[string]string{
+					"type":           "knowledge",
+					"source_type":    "kaggle_dataset",
+					"kaggle_dataset": datasetID,
+					"kaggle_file":    fileName,
+					"topology_node":  fmt.Sprintf("kaggle:%s", datasetID),
+					"record_index":   strconv.Itoa(i + 1),
+					"record_total":   strconv.Itoa(len(rows)),
+					"source_url":     endpoint,
+					"fetched_at":     time.Now().UTC().Format(time.RFC3339),
+				}
+				if err := addRemoteChunks(mm, chunks, meta, opts); err != nil {
+					stats.IndexErrors++
+					emitRemoteEvent(opts, RemoteEvent{Source: datasetID, Outcome: "kaggle-index-error", Detail: err.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+					continue
+				}
+				stats.ItemsIndexed++
+				stats.ChunksIndexed += len(chunks)
+				_ = mm.UpsertTopologySource(memory.SourceFingerprint{
+					SourceType: "kaggle_dataset",
+					SourceRef:  fmt.Sprintf("kaggle:%s", datasetID),
+					SourcePath: fmt.Sprintf("kaggle:%s:%s", datasetID, fileName),
+					Content:    text,
+				})
+				emitRemoteEvent(opts, RemoteEvent{Source: datasetID, Outcome: "kaggle-indexed-record", Detail: fmt.Sprintf("%s row %d", fileName, i+1), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+				emitRemoteSourceIndexed(opts, SourceIndexedEvent{
+					SourceType: "kaggle_dataset",
+					SourceRef:  fmt.Sprintf("kaggle:%s:%s:%d", datasetID, fileName, i+1),
+					Content:    text,
+					ChunkCount: len(chunks),
+					Metadata: map[string]string{
+						"source_type":    "kaggle_dataset",
+						"kaggle_dataset": datasetID,
+						"kaggle_file":    fileName,
+					},
+				})
+			}
+		}
+	}
+
+	return stats, nil
+}
+
 func normalizeRemoteOptions(opts RemoteIndexOptions) RemoteIndexOptions {
 	if opts.MaxChunkChars <= 0 {
 		opts.MaxChunkChars = DefaultIndexOptions().MaxChunkChars
@@ -477,6 +631,23 @@ func normalizeRemoteOptions(opts RemoteIndexOptions) RemoteIndexOptions {
 	if strings.TrimSpace(opts.URLSafetyBaseURL) == "" {
 		opts.URLSafetyBaseURL = defaultURLSafetyBaseURL
 	}
+	if len(opts.URLAllowedExts) > 0 {
+		normalized := make(map[string]bool, len(opts.URLAllowedExts))
+		for ext, ok := range opts.URLAllowedExts {
+			if !ok {
+				continue
+			}
+			e := strings.ToLower(strings.TrimSpace(ext))
+			if e == "" {
+				continue
+			}
+			if !strings.HasPrefix(e, ".") {
+				e = "." + e
+			}
+			normalized[e] = true
+		}
+		opts.URLAllowedExts = normalized
+	}
 	return opts
 }
 
@@ -508,13 +679,20 @@ func fetchURL(client *http.Client, rawURL string, opts RemoteIndexOptions) ([]by
 	return body, resp.Header.Get("Content-Type"), resp.StatusCode, nil
 }
 
-func parseFetchedContent(rawURL, contentType string, body []byte) (string, bool, error) {
+func parseFetchedContent(rawURL, contentType string, body []byte, allowNonHTML bool) (string, bool, error) {
 	u, _ := url.Parse(rawURL)
 	ext := strings.ToLower(filepath.Ext(u.Path))
 	ct := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
 	isHTML := strings.Contains(ct, "text/html") || ext == ".html" || ext == ".htm"
 	isPDF := strings.Contains(ct, "application/pdf") || ext == ".pdf"
 
+	if isHTML {
+		text := htmlToText(string(body))
+		return text, true, nil
+	}
+	if !allowNonHTML {
+		return "", false, fmt.Errorf("%w: only HTML pages are indexed unless --extensions is set", errUnsupportedContent)
+	}
 	if isPDF {
 		tmp, err := os.CreateTemp("", "talos_learn_*.pdf")
 		if err != nil {
@@ -529,10 +707,6 @@ func parseFetchedContent(rawURL, contentType string, body []byte) (string, bool,
 		text, err := readPDF(tmp.Name())
 		return text, false, err
 	}
-	if isHTML {
-		text := htmlToText(string(body))
-		return text, true, nil
-	}
 	if bytes.Contains(body, []byte{0}) {
 		return "", false, fmt.Errorf("binary content")
 	}
@@ -543,7 +717,22 @@ func parseFetchedContent(rawURL, contentType string, body []byte) (string, bool,
 		ext == ".txt" || ext == ".md" || ext == ".json" || ext == ".csv" || ext == ".yaml" || ext == ".yml" {
 		return string(body), false, nil
 	}
-	return "", false, fmt.Errorf("unsupported content type")
+	return "", false, fmt.Errorf("%w", errUnsupportedContent)
+}
+
+func urlAllowedByExtension(rawURL string, allowed map[string]bool) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	ext := strings.ToLower(strings.TrimSpace(filepath.Ext(u.Path)))
+	if ext == "" {
+		return false
+	}
+	return allowed[ext]
 }
 
 func htmlToText(s string) string {
@@ -627,6 +816,14 @@ func addRemoteChunks(mm *memory.MemoryManager, chunks []string, baseMeta map[str
 func remoteChunkSourceRef(meta map[string]string) string {
 	if u := strings.TrimSpace(meta["source_url"]); u != "" {
 		return u
+	}
+	kaggleDS := strings.TrimSpace(meta["kaggle_dataset"])
+	kaggleFile := strings.TrimSpace(meta["kaggle_file"])
+	if kaggleDS != "" {
+		if kaggleFile == "" {
+			return "kaggle:" + kaggleDS
+		}
+		return "kaggle:" + kaggleDS + ":" + kaggleFile
 	}
 	ds := strings.TrimSpace(meta["hf_dataset"])
 	split := strings.TrimSpace(meta["hf_split"])
@@ -888,6 +1085,209 @@ func fetchHFSplitHint(client *http.Client, base, datasetID string, opts RemoteIn
 		return "", fmt.Errorf("split/config metadata empty")
 	}
 	return fmt.Sprintf("available configs=%s splits=%s", joinSortedKeys(configs), joinSortedKeys(splits)), nil
+}
+
+func resolveKaggleCredentials(opts RemoteIndexOptions) (string, string, error) {
+	username := strings.TrimSpace(opts.KaggleUsername)
+	if username == "" {
+		username = strings.TrimSpace(os.Getenv("KAGGLE_USERNAME"))
+	}
+	key := strings.TrimSpace(opts.KaggleKey)
+	if key == "" {
+		key = strings.TrimSpace(os.Getenv("KAGGLE_KEY"))
+	}
+	if key == "" {
+		apiKey := strings.TrimSpace(os.Getenv("KAGGLE_API_KEY"))
+		if strings.Contains(apiKey, ":") {
+			parts := strings.SplitN(apiKey, ":", 2)
+			if username == "" {
+				username = strings.TrimSpace(parts[0])
+			}
+			key = strings.TrimSpace(parts[1])
+		} else {
+			key = apiKey
+		}
+	}
+	if username == "" || key == "" {
+		return "", "", fmt.Errorf("kaggle credentials missing: set KAGGLE_USERNAME and KAGGLE_KEY (or KAGGLE_API_KEY)")
+	}
+	return username, key, nil
+}
+
+func kaggleBasicAuthHeader(username, key string) string {
+	raw := strings.TrimSpace(username) + ":" + strings.TrimSpace(key)
+	if strings.TrimSpace(username) == "" || strings.TrimSpace(key) == "" {
+		return ""
+	}
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(raw))
+}
+
+func splitKaggleDatasetID(datasetID string) (string, string, error) {
+	parts := strings.Split(strings.TrimSpace(datasetID), "/")
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+		return "", "", fmt.Errorf("dataset id must be owner/dataset")
+	}
+	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), nil
+}
+
+func fetchKaggleDatasetFiles(client *http.Client, base, owner, dataset, username, key string, opts RemoteIndexOptions) ([]string, error) {
+	endpoint := fmt.Sprintf("%s/datasets/list/%s/%s/files", strings.TrimRight(base, "/"), url.PathEscape(owner), url.PathEscape(dataset))
+	body, _, status, err := fetchURL(client, endpoint, RemoteIndexOptions{
+		MaxBytes:   opts.MaxBytes,
+		UserAgent:  opts.UserAgent,
+		AuthHeader: kaggleBasicAuthHeader(username, key),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("list files status %d", status)
+	}
+	var asList []map[string]interface{}
+	if err := json.Unmarshal(body, &asList); err == nil {
+		out := make([]string, 0, len(asList))
+		for _, item := range asList {
+			name := strings.TrimSpace(fmt.Sprintf("%v", item["name"]))
+			if name != "" && name != "<nil>" {
+				out = append(out, name)
+			}
+		}
+		return out, nil
+	}
+	var wrapped struct {
+		Files []map[string]interface{} `json:"files"`
+	}
+	if err := json.Unmarshal(body, &wrapped); err != nil {
+		return nil, fmt.Errorf("parse files response: %w", err)
+	}
+	out := make([]string, 0, len(wrapped.Files))
+	for _, item := range wrapped.Files {
+		name := strings.TrimSpace(fmt.Sprintf("%v", item["name"]))
+		if name != "" && name != "<nil>" {
+			out = append(out, name)
+		}
+	}
+	return out, nil
+}
+
+func selectKaggleFiles(allFiles []string, include []string) []string {
+	allow := map[string]bool{}
+	for _, f := range include {
+		f = strings.TrimSpace(f)
+		if f != "" {
+			allow[f] = true
+		}
+	}
+	out := make([]string, 0, len(allFiles))
+	for _, name := range allFiles {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if len(allow) > 0 && !allow[name] {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(name))
+		switch ext {
+		case ".csv", ".tsv", ".jsonl", ".txt", ".md":
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func parseKaggleRows(fileName string, body []byte, maxRecords int) ([]string, error) {
+	if maxRecords <= 0 {
+		maxRecords = 100
+	}
+	ext := strings.ToLower(filepath.Ext(strings.TrimSpace(fileName)))
+	switch ext {
+	case ".csv", ".tsv":
+		reader := csv.NewReader(bytes.NewReader(body))
+		if ext == ".tsv" {
+			reader.Comma = '\t'
+		}
+		rows := make([][]string, 0, maxRecords+1)
+		for len(rows) < maxRecords+1 {
+			rec, err := reader.Read()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+			rows = append(rows, rec)
+		}
+		if len(rows) == 0 {
+			return nil, fmt.Errorf("empty tabular file")
+		}
+		header := rows[0]
+		out := make([]string, 0, len(rows)-1)
+		for i := 1; i < len(rows); i++ {
+			out = append(out, stringifyTabularRow(header, rows[i]))
+		}
+		if len(out) == 0 {
+			out = append(out, strings.Join(header, ", "))
+		}
+		return out, nil
+	case ".jsonl":
+		sc := bufio.NewScanner(bytes.NewReader(body))
+		out := make([]string, 0, maxRecords)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" {
+				continue
+			}
+			out = append(out, line)
+			if len(out) >= maxRecords {
+				break
+			}
+		}
+		if err := sc.Err(); err != nil {
+			return nil, err
+		}
+		if len(out) == 0 {
+			return nil, fmt.Errorf("empty jsonl file")
+		}
+		return out, nil
+	case ".txt", ".md":
+		sc := bufio.NewScanner(bytes.NewReader(body))
+		out := make([]string, 0, maxRecords)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" {
+				continue
+			}
+			out = append(out, line)
+			if len(out) >= maxRecords {
+				break
+			}
+		}
+		if err := sc.Err(); err != nil {
+			return nil, err
+		}
+		if len(out) == 0 {
+			return nil, fmt.Errorf("empty text file")
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("unsupported file type: %s", ext)
+	}
+}
+
+func stringifyTabularRow(header, row []string) string {
+	if len(header) == 0 {
+		return strings.Join(row, ", ")
+	}
+	parts := make([]string, 0, len(row))
+	for i := 0; i < len(row); i++ {
+		key := fmt.Sprintf("col_%d", i+1)
+		if i < len(header) && strings.TrimSpace(header[i]) != "" {
+			key = strings.TrimSpace(header[i])
+		}
+		parts = append(parts, key+": "+strings.TrimSpace(row[i]))
+	}
+	return strings.Join(parts, "\n")
 }
 
 func joinSortedKeys(m map[string]bool) string {

@@ -29,6 +29,10 @@ var (
 var monitorCmd = &cobra.Command{
 	Use:   "monitor",
 	Short: "Terminal integration utilities for TALOS.",
+	Example: `  talos monitor install
+  talos monitor reboot
+  talos monitor status
+  talos monitor uninstall`,
 }
 
 var monitorInstallCmd = &cobra.Command{
@@ -40,8 +44,9 @@ var monitorInstallCmd = &cobra.Command{
 }
 
 var monitorRebootCmd = &cobra.Command{
-	Use:   "reboot",
-	Short: "Install TALOS and run profile source verification for bash/zsh.",
+	Use:     "reboot",
+	Aliases: []string{"restart"},
+	Short:   "Install TALOS and run profile source verification for bash/zsh.",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runMonitorInstall(cmd.OutOrStdout(), true)
 	},

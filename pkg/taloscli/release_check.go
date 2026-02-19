@@ -138,6 +138,16 @@ func runReleaseChecks(timeout time.Duration, noNetwork, strict bool) releaseChec
 func renderReleaseCheckReport(report releaseCheckReport) string {
 	var b strings.Builder
 	b.WriteString("TALOS RELEASE CHECK\n\n")
+	b.WriteString("COMMAND\n")
+	b.WriteString("  talos release-check\n\n")
+	status := "SUCCESS"
+	if !report.Ready && report.Fail > 0 {
+		status = "FAILED"
+	} else if !report.Ready {
+		status = "PARTIAL"
+	}
+	b.WriteString("STATUS\n")
+	b.WriteString("  " + status + "\n\n")
 	b.WriteString("SUMMARY\n")
 	b.WriteString(fmt.Sprintf("  strict: %t\n", report.Strict))
 	b.WriteString(fmt.Sprintf("  ready: %t\n", report.Ready))
@@ -153,6 +163,14 @@ func renderReleaseCheckReport(report releaseCheckReport) string {
 		if strings.TrimSpace(c.Action) != "" {
 			b.WriteString(fmt.Sprintf("    Action: %s\n", c.Action))
 		}
+	}
+	b.WriteString("\nNEXT\n")
+	if report.Ready {
+		b.WriteString("  Release gate passed. Proceed with tagging/publish workflow.\n")
+	} else if report.Fail > 0 {
+		b.WriteString("  Resolve FAIL checks, then rerun: talos release-check\n")
+	} else {
+		b.WriteString("  Resolve WARN checks or run with --strict=false if policy allows.\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
 }

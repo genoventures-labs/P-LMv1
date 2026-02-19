@@ -82,7 +82,14 @@ func writeDoctorReport(w io.Writer, checks []doctorCheck) {
 		}
 	}
 
-	_, _ = fmt.Fprintf(w, "TALOS DOCTOR\n\nSUMMARY\n  PASS: %d\n  WARN: %d\n  FAIL: %d\n\nCHECKS\n", pass, warn, fail)
+	status := "SUCCESS"
+	if fail > 0 {
+		status = "FAILED"
+	} else if warn > 0 {
+		status = "PARTIAL"
+	}
+
+	_, _ = fmt.Fprintf(w, "TALOS DOCTOR\n\nCOMMAND\n  talos doctor\n\nSTATUS\n  %s\n\nSUMMARY\n  PASS: %d\n  WARN: %d\n  FAIL: %d\n\nCHECKS\n", status, pass, warn, fail)
 	for _, c := range checks {
 		_, _ = fmt.Fprintf(w, "  [%s] %s\n", c.Status, c.Name)
 		if strings.TrimSpace(c.Detail) != "" {
@@ -91,6 +98,14 @@ func writeDoctorReport(w io.Writer, checks []doctorCheck) {
 		if strings.TrimSpace(c.Action) != "" {
 			_, _ = fmt.Fprintf(w, "    Action: %s\n", c.Action)
 		}
+	}
+	_, _ = io.WriteString(w, "\nNEXT\n")
+	if fail > 0 {
+		_, _ = io.WriteString(w, "  Address FAIL actions first, then rerun: talos doctor\n")
+	} else if warn > 0 {
+		_, _ = io.WriteString(w, "  Address WARN actions as needed, then rerun: talos doctor\n")
+	} else {
+		_, _ = io.WriteString(w, "  Environment looks healthy. Continue with your TALOS workflow.\n")
 	}
 }
 

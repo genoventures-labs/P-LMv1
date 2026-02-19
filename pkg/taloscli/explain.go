@@ -19,6 +19,12 @@ type capabilityDoc struct {
 	Aliases   []string
 }
 
+const (
+	explainUsageLimit    = 3
+	explainFeatureLimit  = 4
+	explainExamplesLimit = 3
+)
+
 var explainCmd = &cobra.Command{
 	Use:   "explain <capability>",
 	Short: "Explain TALOS capability usage and behavior.",
@@ -157,14 +163,17 @@ var capabilityDocs = []capabilityDoc{
 			"talos learn <text>",
 			"talos learn --profile <name>",
 			"talos learn --dry-run --profile <name>",
+			"talos learn --verbose --dir <path>",
 			"talos learn --file <path>",
 			"talos learn --dir <path> --extensions .md,.txt",
 			"talos learn --dir <path> --type .go --type .md",
 			"talos learn --dir <path> --all-types",
 			"talos learn --url https://example.com/doc",
 			"talos learn --url-file urls.txt --crawl --crawl-depth 1",
+			"talos learn --url https://example.com/doc --crawl --extensions .html,.md",
 			"talos learn --from-research latest",
 			"HF_TOKEN=... talos learn --hf-dataset wikipedia --hf-split train",
+			"KAGGLE_USERNAME=... KAGGLE_KEY=... talos learn --kaggle-dataset owner/dataset",
 			"talos learn --gmail-query \"label:inbox after:2024/01/01\" --gmail-max 100",
 			"talos learn --gdrive-folder <folderID> --gdrive-max 50",
 			"talos learn --gdrive-query \"mimeType='application/vnd.google-apps.document'\"",
@@ -174,21 +183,25 @@ var capabilityDocs = []capabilityDoc{
 			"talos learn --book-id 84 --book-id 1342",
 			"talos learn --github-repo owner/repo",
 			"talos learn --github-repo owner/repo --github-path pkg/ --github-max 200",
-			"talos learn --chain \"dir,github,hf\" --dir ./docs --github-repo owner/repo --hf-dataset owner/ds",
+			"talos learn --chain \"dir,github,hf,kaggle\" --dir ./docs --github-repo owner/repo --hf-dataset owner/ds --kaggle-dataset owner/ds",
 		},
 		Abilities: []string{
 			"Ingests direct text, file content, or directory content.",
 			"Supports reusable learn profiles via --profile with explicit flag overrides.",
+			"Uses compact friendly output by default; --verbose prints the detailed technical summary format.",
 			"Ingests remote URL content with optional bounded crawling.",
+			"URL/crawl mode defaults to HTML page text extraction only.",
+			"When --extensions is provided in URL mode, crawl+ingest uses strict URL extension matching (extensionless URLs are skipped).",
 			"Runs URL safety checks (urlscan) before indexing remote URL content.",
 			"Ingests persisted research artifacts (summary/findings/sources) for chained workflows.",
 			"Ingests Hugging Face dataset rows with optional HF_TOKEN auth.",
+			"Ingests Kaggle dataset rows from owner/dataset using KAGGLE_USERNAME + KAGGLE_KEY (or KAGGLE_API_KEY alias).",
 			"Ingests Gmail messages via service-account auth (GOOGLE_SERVICE_ACCOUNT_JSON + GOOGLE_IMPERSONATE_USER).",
 			"Ingests Google Drive files — auto-exports Docs as text, Sheets as CSV, Slides as text.",
 			"Ingests Notion database pages with block-level text extraction (NOTION_API_KEY).",
 			"Ingests full-text public domain books from Project Gutenberg by search query or book ID (no auth required). Auto-paginates results when --book-max > 32.",
 			"Ingests GitHub repos via --github-repo (owner/repo). GITHUB_TOKEN optional (higher rate limits). Filters by --github-path, caps at --github-max files.",
-			"Chains multiple sources in user-specified order via --chain (e.g. \"dir,github,hf\"). Shares one MemoryManager; continues through errors.",
+			"Chains multiple sources in user-specified order via --chain (e.g. \"dir,github,hf,kaggle\"). Shares one MemoryManager; continues through errors.",
 			"Chunks and indexes all material for future retrieval.",
 			"Supports configurable chunk sizing and overlap.",
 			"Directory ingest uses incremental re-indexing by default (skip unchanged files, archive removed-source chunks).",
@@ -204,8 +217,9 @@ var capabilityDocs = []capabilityDoc{
 			"talos learn --notion-database abc123 --notion-filter '{\"property\":\"Status\",\"select\":{\"equals\":\"Done\"}}'",
 			"talos learn --book-search \"moby dick\"",
 			"talos learn --book-id 2701 --book-id 84",
+			"KAGGLE_USERNAME=... KAGGLE_KEY=... talos learn --kaggle-dataset zillow/zecon --kaggle-max-records 200",
 			"talos learn --github-repo octocat/Hello-World",
-			"talos learn --chain \"github,books,hf\" --github-repo owner/repo --book-search \"dune\" --hf-dataset owner/ds",
+			"talos learn --chain \"github,books,hf,kaggle\" --github-repo owner/repo --book-search \"dune\" --hf-dataset owner/ds --kaggle-dataset owner/ds",
 		},
 		Related: []string{"connectors", "learn profile", "learn-image", "skills", "chat"},
 	},
@@ -614,6 +628,7 @@ var capabilityDocs = []capabilityDoc{
 		},
 		Examples: []string{
 			"talos monitor install",
+			"talos monitor reboot",
 			"talos monitor status",
 		},
 		Related: []string{"doctor", "about"},
@@ -731,6 +746,33 @@ var capabilityDocs = []capabilityDoc{
 			`talos pipeline "research run 'incident review checklist' ; learn --from-research latest"`,
 		},
 		Related: []string{"research", "learn", "skills"},
+	},
+	{
+		Name:    "chaining",
+		Summary: "Explains TALOS chaining patterns across learn source chains and pipeline command chains.",
+		Usage: []string{
+			`talos learn --chain "url,books,hf,kaggle" --url https://example.com --book-search "frankenstein" --hf-dataset wikipedia --kaggle-dataset owner/dataset`,
+			`talos learn --chain "dir,github,books" --dir ./docs --github-repo owner/repo --book-search "the art of war"`,
+			`talos pipeline "research run 'query' ; learn --from-research latest"`,
+			`talos "research run 'query' --skill analyst ; learn --from-research latest --skill memory_curator"`,
+		},
+		Abilities: []string{
+			"Supports ordered multi-source learning chains with --chain (file, dir, url, hf, kaggle, gmail, drive, notion, books/gutenberg, github, research).",
+			"Executes learn chain steps in user-specified order and reuses one MemoryManager across all chain steps.",
+			"Continues through per-step errors in learn chain mode and reports aggregate success/errors at completion.",
+			"Supports command-level chaining with talos pipeline for allowlisted research->learn workflows.",
+			"Supports per-step skill binding in pipeline mode via --skill on each step.",
+			"Supports chained flows in profile-driven runs by combining --profile with chain-relevant flags.",
+		},
+		Examples: []string{
+			`talos learn --chain "url,books,hf"`,
+			`talos learn --chain "url,books,hf" --url https://example.com --book-search "frankenstein" --hf-dataset wikipedia`,
+			`talos learn --chain "dir,kaggle,github,books" --dir ./docs --kaggle-dataset owner/dataset --github-repo owner/repo --book-search "dune"`,
+			`talos pipeline "research run 'incident checklist' ; learn --from-research latest"`,
+			`talos pipeline "research run 'incident checklist' --skill researcher_v1 ; learn --from-research latest --skill memory_curator"`,
+		},
+		Related: []string{"learn", "pipeline", "connectors", "learn profile"},
+		Aliases: []string{"chain workflows", "multi-source chaining"},
 	},
 	{
 		Name:    "learned",
@@ -1022,7 +1064,7 @@ var capabilityDocs = []capabilityDoc{
 	},
 	{
 		Name:    "connectors",
-		Summary: "API connector layer for ingesting live data from Google Workspace, Notion, Project Gutenberg, and GitHub.",
+		Summary: "API connector layer for ingesting live data from Google Workspace, Notion, Project Gutenberg, GitHub, and Kaggle datasets.",
 		Usage: []string{
 			"# Gmail — set GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_IMPERSONATE_USER",
 			"talos learn --gmail-query \"label:inbox after:2024/01/01\" --gmail-max 100",
@@ -1040,8 +1082,11 @@ var capabilityDocs = []capabilityDoc{
 			"talos learn --github-repo owner/repo",
 			"talos learn --github-repo owner/repo --github-path pkg/ --github-max 200",
 			"talos learn --github-repo owner/repo1 --github-repo owner/repo2",
+			"# Kaggle datasets — set KAGGLE_USERNAME + KAGGLE_KEY (or KAGGLE_API_KEY alias)",
+			"talos learn --kaggle-dataset owner/dataset",
+			"talos learn --kaggle-dataset owner/dataset --kaggle-file train.csv --kaggle-max-records 250",
 			"# Chained sources — run in specified order, shared memory",
-			"talos learn --chain \"dir,github,hf\" --dir ./docs --github-repo owner/repo --hf-dataset owner/ds",
+			"talos learn --chain \"dir,github,hf,kaggle\" --dir ./docs --github-repo owner/repo --hf-dataset owner/ds --kaggle-dataset owner/ds",
 			"talos learn --chain \"books,url\" --book-search \"moby dick\" --url https://example.com",
 		},
 		Abilities: []string{
@@ -1052,7 +1097,8 @@ var capabilityDocs = []capabilityDoc{
 			"Gutenberg search auto-paginates across result pages — set --book-max > 32 to collect books beyond the first page.",
 			"--book-search ingests the top N matching books (--book-max, default 1). --book-id fetches specific books by numeric Gutenberg ID.",
 			"GitHub connector: walks full repo tree via git/trees API; filters by --github-path prefix; fetches and base64-decodes each text file. GITHUB_TOKEN optional.",
-			"--chain runs sources in user-specified order (comma-separated tokens: file,dir,url,hf,gmail,drive,notion,books,github,research). Continues through errors.",
+			"Kaggle ingest indexes dataset files from owner/dataset with row-capped tabular parsing (CSV/TSV/JSONL/TXT/MD).",
+			"--chain runs sources in user-specified order (comma-separated tokens: file,dir,url,hf,kaggle,gmail,drive,notion,books,github,research). Continues through errors.",
 			"All connectors implement a common Connector interface (pkg/connectors) — pluggable and extensible.",
 			"Connectors can be registered and dispatched as sub-agents via ConnectorSubAgent.",
 			"Output of every connector is chunked and indexed into TALOS memory via IndexConnector().",
@@ -1065,10 +1111,11 @@ var capabilityDocs = []capabilityDoc{
 			"talos learn --book-search \"the art of war\" --book-max 1",
 			"talos learn --book-id 2701 --book-id 84 --book-id 11",
 			"GITHUB_TOKEN=ghp_xxx talos learn --github-repo torvalds/linux --github-path Documentation/ --github-max 300",
-			"talos learn --chain \"github,books,hf\" --github-repo owner/repo --book-search \"dune\" --hf-dataset owner/ds",
+			"KAGGLE_USERNAME=... KAGGLE_KEY=... talos learn --kaggle-dataset zillow/zecon --kaggle-max-records 150",
+			"talos learn --chain \"github,books,hf,kaggle\" --github-repo owner/repo --book-search \"dune\" --hf-dataset owner/ds --kaggle-dataset owner/ds",
 		},
 		Related: []string{"learn", "learn profile", "tools", "memory"},
-		Aliases: []string{"connector", "google workspace", "gmail", "drive", "gdrive", "notion", "gutenberg", "book", "books", "github", "chain"},
+		Aliases: []string{"connector", "google workspace", "gmail", "drive", "gdrive", "notion", "gutenberg", "book", "books", "github", "kaggle", "chain"},
 	},
 }
 
@@ -1091,23 +1138,35 @@ func lookupCapabilityDoc(query string) (capabilityDoc, bool) {
 }
 
 func writeCapabilityDoc(w io.Writer, doc capabilityDoc) {
-	_, _ = fmt.Fprintf(w, "TALOS EXPLAIN\n\nCAPABILITY\n  %s\n\nSUMMARY\n  %s\n", doc.Name, doc.Summary)
+	_, _ = fmt.Fprintf(w, "TALOS EXPLAIN\n\nCOMMAND\n  talos explain %s\n\nSTATUS\n  SUCCESS\n\nCAPABILITY\n  %s\n\nSUMMARY\n  %s\n", doc.Name, doc.Name, doc.Summary)
 	if len(doc.Usage) > 0 {
 		_, _ = io.WriteString(w, "\nUSAGE\n")
-		for _, u := range doc.Usage {
+		limit := explainMin(len(doc.Usage), explainUsageLimit)
+		for _, u := range doc.Usage[:limit] {
 			_, _ = fmt.Fprintf(w, "  %s\n", u)
+		}
+		if len(doc.Usage) > limit {
+			_, _ = fmt.Fprintf(w, "  ... (%d more)\n", len(doc.Usage)-limit)
 		}
 	}
 	if len(doc.Abilities) > 0 {
 		_, _ = io.WriteString(w, "\nFUNCTIONALITY\n")
-		for i, f := range doc.Abilities {
+		limit := explainMin(len(doc.Abilities), explainFeatureLimit)
+		for i, f := range doc.Abilities[:limit] {
 			_, _ = fmt.Fprintf(w, "  %d. %s\n", i+1, f)
+		}
+		if len(doc.Abilities) > limit {
+			_, _ = fmt.Fprintf(w, "  ... (%d more)\n", len(doc.Abilities)-limit)
 		}
 	}
 	if len(doc.Examples) > 0 {
 		_, _ = io.WriteString(w, "\nEXAMPLES\n")
-		for _, ex := range doc.Examples {
+		limit := explainMin(len(doc.Examples), explainExamplesLimit)
+		for _, ex := range doc.Examples[:limit] {
 			_, _ = fmt.Fprintf(w, "  %s\n", ex)
+		}
+		if len(doc.Examples) > limit {
+			_, _ = fmt.Fprintf(w, "  ... (%d more)\n", len(doc.Examples)-limit)
 		}
 	}
 	if len(doc.Related) > 0 {
@@ -1116,6 +1175,14 @@ func writeCapabilityDoc(w io.Writer, doc capabilityDoc) {
 			_, _ = fmt.Fprintf(w, "  talos explain %s\n", rel)
 		}
 	}
+	_, _ = io.WriteString(w, "\nNEXT\n  Use: talos find <keyword>\n")
+}
+
+func explainMin(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func writeExplainNotFound(w io.Writer, query string) {
@@ -1125,12 +1192,12 @@ func writeExplainNotFound(w io.Writer, query string) {
 	}
 	sort.Strings(names)
 
-	_, _ = fmt.Fprintf(w, "TALOS EXPLAIN\n\nERROR\n  Unknown capability: %s\n", query)
+	_, _ = fmt.Fprintf(w, "TALOS EXPLAIN\n\nCOMMAND\n  talos explain %s\n\nSTATUS\n  FAILED\n\nERROR\n  Unknown capability: %s\n", query, query)
 	_, _ = io.WriteString(w, "\nAVAILABLE CAPABILITIES\n")
 	for _, n := range names {
 		_, _ = fmt.Fprintf(w, "  %s\n", n)
 	}
-	_, _ = io.WriteString(w, "\nTIP\n  Use: talos explain <capability>\n")
+	_, _ = io.WriteString(w, "\nNEXT\n  Use: talos explain <capability>\n")
 }
 
 func init() {

@@ -45,6 +45,9 @@ var learnHFDatasets []string
 var learnHFConfig string
 var learnHFSplit string
 var learnHFMaxRecords int
+var learnKaggleDatasets []string
+var learnKaggleFiles []string
+var learnKaggleMaxRecords int
 var learnURLSafety bool
 var learnURLSafetyTimeout time.Duration
 var learnURLSafetyCacheTTL time.Duration
@@ -63,6 +66,7 @@ var learnTitleModel string
 var learnIncremental bool
 var learnIncrementalManifest string
 var learnDryRun bool
+var learnVerbose bool
 
 // Google Workspace + Notion connector flags
 var learnGmailQuery string
@@ -96,8 +100,10 @@ LOCAL SOURCES
   talos learn --file ./notes.md
   talos learn --dir ./docs --extensions .md,.txt
   talos learn --url https://example.com/page --crawl --crawl-depth 1
+  talos learn --url https://example.com/page --crawl --extensions .html,.md
   talos learn --from-research latest
   HF_TOKEN=... talos learn --hf-dataset wikipedia --hf-split train
+  KAGGLE_USERNAME=... KAGGLE_KEY=... talos learn --kaggle-dataset owner/dataset
 
 GOOGLE WORKSPACE  (requires GOOGLE_SERVICE_ACCOUNT_JSON + GOOGLE_IMPERSONATE_USER)
   talos learn --gmail-query "label:inbox after:2024/01/01" --gmail-max 100
@@ -115,15 +121,25 @@ PROJECT GUTENBERG  (no credentials required)
   talos learn --book-id 84
   talos learn --book-id 84 --book-id 1342 --book-id 11
 
+KAGGLE DATASETS  (requires KAGGLE_USERNAME + KAGGLE_KEY or KAGGLE_API_KEY)
+  talos learn --kaggle-dataset owner/dataset
+  talos learn --kaggle-dataset owner/dataset --kaggle-file train.csv --kaggle-max-records 250
+
 GITHUB  (GITHUB_TOKEN optional — increases rate limit)
   talos learn --github-repo owner/repo
   talos learn --github-repo owner/repo --github-path pkg/ --github-max 200
   talos learn --github-repo owner/repo1 --github-repo owner/repo2
 
 CHAINED SOURCES  (--chain runs sources in the specified order)
-  talos learn --chain "dir,github,hf" --dir ./docs --github-repo owner/repo --hf-dataset owner/dataset
+  talos learn --chain "dir,github,hf,kaggle" --dir ./docs --github-repo owner/repo --hf-dataset owner/dataset --kaggle-dataset owner/dataset
   talos learn --chain "books,url" --book-search "moby dick" --url https://example.com
   talos learn --chain "github,notion" --github-repo owner/repo --notion-database <id>
+
+URL CRAWL RULES
+  - Default URL/crawl mode indexes text extracted from HTML pages only.
+  - If --extensions is set, URL mode switches to strict extension matching.
+  - In strict mode, only matching URL path extensions are crawled/indexed; extensionless URLs are skipped.
+  - Use --verbose to show the current detailed technical learn summary output.
 
 All sources are chunked and indexed into persistent memory for future retrieval.`,
 	Run: func(cmd *cobra.Command, args []string) {
@@ -289,11 +305,15 @@ All sources are chunked and indexed into persistent memory for future retrieval.
 			if logErr := appendLearnSessionRecord(session); logErr != nil {
 				fmt.Printf("Warning: Failed to write learn session log: %v\n", logErr)
 			}
-			fmt.Println(renderDirectoryLearnSummary(learnDir, opts, stats, summaryMetrics, mm.TopologyStats()))
+			if learnVerbose {
+				fmt.Println(renderDirectoryLearnSummary(learnDir, opts, stats, summaryMetrics, mm.TopologyStats()))
+			} else {
+				fmt.Println(renderDirectoryLearnSummaryFriendly(learnDir, stats))
+			}
 			return
 		}
 
-		if len(learnURLs) > 0 || strings.TrimSpace(learnURLFile) != "" || len(learnHFDatasets) > 0 {
+		if len(learnURLs) > 0 || strings.TrimSpace(learnURLFile) != "" || len(learnHFDatasets) > 0 || len(learnKaggleDatasets) > 0 {
 			remoteOpts := rag.DefaultRemoteIndexOptions()
 			remoteOpts.MaxChunkChars = learnChunkChars
 			remoteOpts.ChunkOverlap = learnChunkOverlap
@@ -308,12 +328,18 @@ All sources are chunked and indexed into persistent memory for future retrieval.
 			remoteOpts.Timeout = learnRemoteTimeout
 			remoteOpts.MaxBytes = learnMaxBytes
 			remoteOpts.HFToken = strings.TrimSpace(os.Getenv("HF_TOKEN"))
+			remoteOpts.KaggleUsername = strings.TrimSpace(os.Getenv("KAGGLE_USERNAME"))
+			remoteOpts.KaggleKey = strings.TrimSpace(os.Getenv("KAGGLE_KEY"))
+			if remoteOpts.KaggleKey == "" {
+				remoteOpts.KaggleKey = strings.TrimSpace(os.Getenv("KAGGLE_API_KEY"))
+			}
 			remoteOpts.URLSafetyEnabled = learnURLSafety
 			remoteOpts.URLSafetyTimeout = learnURLSafetyTimeout
 			remoteOpts.URLSafetyCacheTTL = learnURLSafetyCacheTTL
 			remoteOpts.URLSafetyVisibility = learnURLSafetyVisibility
 			remoteOpts.URLSafetyFailOpen = learnURLSafetyFailOpen
 			remoteOpts.URLSafetyAPIKey = strings.TrimSpace(os.Getenv("URLSCAN_API_KEY"))
+			remoteOpts.URLAllowedExts = remoteURLAllowedExtensions()
 			if envName := strings.TrimSpace(learnAuthHeaderEnv); envName != "" {
 				remoteOpts.AuthHeader = strings.TrimSpace(os.Getenv(envName))
 			}
@@ -328,11 +354,11 @@ All sources are chunked and indexed into persistent memory for future retrieval.
 			}
 			remoteOpts.OnEvent = func(ev rag.RemoteEvent) {
 				switch ev.Outcome {
-				case "indexed", "hf-indexed-record":
+				case "indexed", "hf-indexed-record", "kaggle-indexed-record":
 					fmt.Printf("[%d fetched | %d indexed] %s: %s\n", ev.ItemsFetched, ev.ItemsIndexed, ev.Outcome, ev.Source)
 				case "safety-allowed", "safety-cache-hit", "safety-cache-miss":
 					fmt.Printf("[%d fetched | %d indexed] %s: %s (%s)\n", ev.ItemsFetched, ev.ItemsIndexed, ev.Outcome, ev.Source, ev.Detail)
-				case "safety-blocked", "safety-error", "preflight-failed", "skipped-domain", "invalid-url", "parse-error", "http-error", "http-status", "hf-http-error", "hf-http-status", "hf-parse-error", "index-error", "hf-index-error":
+				case "safety-blocked", "safety-error", "preflight-failed", "skipped-domain", "invalid-url", "parse-error", "http-error", "http-status", "hf-http-error", "hf-http-status", "hf-parse-error", "index-error", "hf-index-error", "kaggle-http-error", "kaggle-http-status", "kaggle-parse-error", "kaggle-index-error", "kaggle-invalid-dataset", "kaggle-no-files", "skipped-extension", "skipped-unsupported":
 					fmt.Printf("[%d fetched | %d indexed] %s: %s (%s)\n", ev.ItemsFetched, ev.ItemsIndexed, ev.Outcome, ev.Source, ev.Detail)
 				}
 			}
@@ -349,6 +375,12 @@ All sources are chunked and indexed into persistent memory for future retrieval.
 					sources = append(sources, "hf:"+ds)
 				}
 			}
+			for _, ds := range learnKaggleDatasets {
+				ds = strings.TrimSpace(ds)
+				if ds != "" {
+					sources = append(sources, "kaggle:"+ds)
+				}
+			}
 			session := newLearnSession("REMOTE", "remote", sources, map[string]string{
 				"crawl":                fmt.Sprintf("%t", learnCrawl),
 				"crawl_depth":          fmt.Sprintf("%d", learnCrawlDepth),
@@ -357,6 +389,7 @@ All sources are chunked and indexed into persistent memory for future retrieval.
 				"url_safety_fail_open": fmt.Sprintf("%t", learnURLSafetyFailOpen),
 				"summarization":        fmt.Sprintf("%t", learnSummarizeSources),
 				"chunk_titles":         fmt.Sprintf("%t", learnTitleChunks),
+				"kaggle_max_records":   fmt.Sprintf("%d", learnKaggleMaxRecords),
 			})
 			annotateLearnSessionWithProfile(&session, learnProfileApplied)
 			var summaryWorker *memory.SourceSummaryWorker
@@ -433,6 +466,28 @@ All sources are chunked and indexed into persistent memory for future retrieval.
 					}
 				}
 			}
+			if len(learnKaggleDatasets) > 0 {
+				specs := make([]rag.KaggleSpec, 0, len(learnKaggleDatasets))
+				for _, ds := range learnKaggleDatasets {
+					ds = strings.TrimSpace(ds)
+					if ds == "" {
+						continue
+					}
+					specs = append(specs, rag.KaggleSpec{
+						DatasetID:  ds,
+						Files:      append([]string(nil), learnKaggleFiles...),
+						MaxRecords: learnKaggleMaxRecords,
+					})
+				}
+				if len(specs) > 0 {
+					fmt.Printf("Indexing Kaggle datasets: %d dataset(s)\n", len(specs))
+					kaggleStats, kaggleErr := rag.IndexKaggleDatasets(mm, specs, remoteOpts)
+					totalStats = mergeRemoteStats(totalStats, kaggleStats)
+					if kaggleErr != nil {
+						fmt.Printf("Kaggle indexing error: %v\n", kaggleErr)
+					}
+				}
+			}
 
 			status := "SUCCESS"
 			failureReason := ""
@@ -469,7 +524,11 @@ All sources are chunked and indexed into persistent memory for future retrieval.
 			if logErr := appendLearnSessionRecord(session); logErr != nil {
 				fmt.Printf("Warning: Failed to write learn session log: %v\n", logErr)
 			}
-			fmt.Println(renderRemoteLearnSummary(totalStats, summaryMetrics, mm.TopologyStats()))
+			if learnVerbose {
+				fmt.Println(renderRemoteLearnSummary(totalStats, summaryMetrics, mm.TopologyStats()))
+			} else {
+				fmt.Println(renderRemoteLearnSummaryFriendly(sources, totalStats))
+			}
 			return
 		}
 
@@ -518,13 +577,18 @@ All sources are chunked and indexed into persistent memory for future retrieval.
 			fmt.Printf("Warning: Failed to write learn session log: %v\n", logErr)
 		}
 
-		fmt.Println(renderInlineLearnSummary(learnFile != "", learnFile))
+		if learnVerbose {
+			fmt.Println(renderInlineLearnSummary(learnFile != "", learnFile))
+		} else {
+			fmt.Println(renderInlineLearnSummaryFriendly(learnFile != "", learnFile))
+		}
 	},
 }
 
 func init() {
 	learnCmd.Flags().StringVar(&learnProfile, "profile", "", "Learn profile name to apply (falls back to default profile when omitted)")
 	learnCmd.Flags().BoolVar(&learnDryRun, "dry-run", false, "Print resolved learn execution plan without indexing")
+	learnCmd.Flags().BoolVar(&learnVerbose, "verbose", false, "Show detailed learn summary output (default shows compact friendly output)")
 	bindLearnConfigFlags(learnCmd.Flags())
 	if f := learnCmd.Flags().Lookup("from-research"); f != nil {
 		f.NoOptDefVal = "latest"
@@ -539,7 +603,7 @@ func bindLearnConfigFlags(fs *pflag.FlagSet) {
 	fs.BoolVarP(&learnRecursive, "recursive", "r", true, "Recursively index subdirectories when using --dir")
 	fs.IntVar(&learnChunkChars, "chunk-chars", 1200, "Maximum characters per indexed chunk when using --dir")
 	fs.IntVar(&learnChunkOverlap, "chunk-overlap", 200, "Overlap between chunks when using --dir")
-	fs.StringVar(&learnExtensions, "extensions", "", "Comma-separated extensions to index with --dir (e.g. .pdf,.md,.txt)")
+	fs.StringVar(&learnExtensions, "extensions", "", "Comma-separated extensions for --dir, and strict URL/crawl filtering when using --url (e.g. .html,.md,.txt)")
 	fs.StringSliceVar(&learnTypes, "type", nil, "Repeatable file extension filter with --dir (e.g. --type .md --type .txt)")
 	fs.BoolVar(&learnAllTypes, "all-types", false, "Index all file types under --dir (binary files are skipped)")
 	fs.StringArrayVar(&learnURLs, "url", nil, "URL to index (repeatable)")
@@ -562,6 +626,9 @@ func bindLearnConfigFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&learnHFConfig, "hf-config", "", "Hugging Face dataset config")
 	fs.StringVar(&learnHFSplit, "hf-split", "train", "Hugging Face dataset split")
 	fs.IntVar(&learnHFMaxRecords, "hf-max-records", 100, "Maximum records per HF dataset to index")
+	fs.StringArrayVar(&learnKaggleDatasets, "kaggle-dataset", nil, "Kaggle dataset id to index (owner/dataset, repeatable)")
+	fs.StringArrayVar(&learnKaggleFiles, "kaggle-file", nil, "Optional Kaggle file name filter (repeatable)")
+	fs.IntVar(&learnKaggleMaxRecords, "kaggle-max-records", 100, "Maximum records per Kaggle dataset file to index")
 	fs.StringVar(&learnFromResearch, "from-research", "", "Ingest from a research artifact id or 'latest'")
 	fs.BoolVar(&learnIncludeResearchSummary, "include-research-summary", true, "Include research summary/findings text during --from-research ingest")
 	fs.BoolVar(&learnIncludeResearchSources, "include-research-sources", true, "Include source URL indexing during --from-research ingest")
@@ -597,7 +664,7 @@ func bindLearnConfigFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&learnGitHubMax, "github-max", 500, "Maximum files to ingest per GitHub repo")
 
 	// Chain — ordered multi-source ingestion
-	fs.StringVar(&learnChain, "chain", "", "Ordered comma-separated source tokens (e.g. \"dir,github,hf,books\"). Valid: file,dir,url,hf,gmail,drive,notion,books,github,research")
+	fs.StringVar(&learnChain, "chain", "", "Ordered comma-separated source tokens (e.g. \"dir,github,hf,kaggle,books\"). Valid: file,dir,url,hf,kaggle,gmail,drive,notion,books,github,research")
 }
 
 func summaryConfigFromLearnFlags() memory.SourceSummaryConfig {
@@ -759,7 +826,11 @@ func executeLearnFromResearch(selector string, includeSummary bool, includeSourc
 	if logErr := appendLearnSessionRecord(session); logErr != nil {
 		fmt.Printf("Warning: Failed to write learn session log: %v\n", logErr)
 	}
-	fmt.Println(renderResearchLearnSummary(artifactID, includeSummary, includeSources, summaryIndexed, sourceStats, summaryMetrics, mm.TopologyStats(), status))
+	if learnVerbose {
+		fmt.Println(renderResearchLearnSummary(artifactID, includeSummary, includeSources, summaryIndexed, sourceStats, summaryMetrics, mm.TopologyStats(), status))
+	} else {
+		fmt.Println(renderResearchLearnSummaryFriendly(artifactID, status, summaryIndexed, sourceStats))
+	}
 	if status == "FAILED" {
 		return fmt.Errorf("no research artifact content was indexed")
 	}
@@ -812,6 +883,25 @@ func renderResearchLearnSummary(artifactID string, includeSummary bool, includeS
 	return strings.TrimRight(b.String(), "\n")
 }
 
+func renderResearchLearnSummaryFriendly(artifactID string, status string, summaryIndexed int64, sourceStats rag.RemoteIndexStats) string {
+	var b strings.Builder
+	b.WriteString("LEARN REPORT\n\n")
+	b.WriteString("COMMAND\n")
+	b.WriteString("  talos learn --from-research\n\n")
+	b.WriteString("STATUS\n")
+	b.WriteString("  " + strings.ToUpper(strings.TrimSpace(status)) + "\n\n")
+	b.WriteString("SOURCE\n")
+	b.WriteString("  artifact: " + strings.TrimSpace(artifactID) + "\n\n")
+	b.WriteString("PROGRESS\n")
+	b.WriteString(fmt.Sprintf("  fetched: %d | indexed: %d\n\n", sourceStats.ItemsFetched, sourceStats.ItemsIndexed))
+	b.WriteString("RESULTS\n")
+	b.WriteString(fmt.Sprintf("  summary_items_indexed: %d\n", summaryIndexed))
+	b.WriteString(fmt.Sprintf("  chunks_indexed: %d\n", sourceStats.ChunksIndexed))
+	errors := sourceStats.PreflightFailures + sourceStats.SafetyBlocked + sourceStats.SafetyErrors + sourceStats.ParseErrors + sourceStats.HTTPErrors + sourceStats.IndexErrors
+	b.WriteString(fmt.Sprintf("  errors: %d", errors))
+	return b.String()
+}
+
 func learnMaxInt(a, b int) int {
 	if a > b {
 		return a
@@ -848,6 +938,19 @@ func collectURLs(seed []string, filePath string) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+func remoteURLAllowedExtensions() map[string]bool {
+	extensionInput := strings.TrimSpace(learnExtensions)
+	if len(learnTypes) > 0 {
+		typeCSV := strings.Join(learnTypes, ",")
+		if extensionInput == "" {
+			extensionInput = typeCSV
+		} else {
+			extensionInput += "," + typeCSV
+		}
+	}
+	return rag.ParseExtensionsCSV(extensionInput)
 }
 
 func mergeRemoteStats(a, b rag.RemoteIndexStats) rag.RemoteIndexStats {
@@ -909,6 +1012,24 @@ func renderDirectoryLearnSummary(dir string, opts rag.IndexOptions, stats rag.In
 	return b.String()
 }
 
+func renderDirectoryLearnSummaryFriendly(dir string, stats rag.IndexStats) string {
+	var b strings.Builder
+	b.WriteString("LEARN REPORT\n\n")
+	b.WriteString("COMMAND\n")
+	b.WriteString("  talos learn --dir\n\n")
+	b.WriteString("STATUS\n")
+	b.WriteString("  SUCCESS\n\n")
+	b.WriteString("SOURCE\n")
+	b.WriteString("  " + strings.TrimSpace(dir) + "\n\n")
+	b.WriteString("PROGRESS\n")
+	b.WriteString(fmt.Sprintf("  scanned_files: %d | indexed_files: %d\n\n", stats.FilesScanned, stats.FilesIndexed))
+	b.WriteString("RESULTS\n")
+	b.WriteString(fmt.Sprintf("  chunks_indexed: %d\n", stats.ChunksIndexed))
+	errors := stats.ParseErrors + stats.IndexErrors + stats.WalkErrors
+	b.WriteString(fmt.Sprintf("  errors: %d", errors))
+	return b.String()
+}
+
 func renderRemoteLearnSummary(stats rag.RemoteIndexStats, summaryMetrics memory.SourceSummaryMetrics, topology memory.TopologyStats) string {
 	var b strings.Builder
 	b.WriteString("LEARN SUMMARY\n\n")
@@ -932,6 +1053,37 @@ func renderRemoteLearnSummary(stats rag.RemoteIndexStats, summaryMetrics memory.
 	b.WriteString(fmt.Sprintf("  index_errors: %d\n", stats.IndexErrors))
 	appendSummaryMetricsSection(&b, summaryMetrics)
 	appendTopologyMetricsSection(&b, topology)
+	return b.String()
+}
+
+func renderRemoteLearnSummaryFriendly(sources []string, stats rag.RemoteIndexStats) string {
+	var b strings.Builder
+	b.WriteString("LEARN REPORT\n\n")
+	b.WriteString("COMMAND\n")
+	b.WriteString("  talos learn --url/--hf-dataset/--kaggle-dataset\n\n")
+	b.WriteString("STATUS\n")
+	b.WriteString("  SUCCESS\n\n")
+	b.WriteString("SOURCE\n")
+	if len(sources) > 0 {
+		maxSources := 3
+		display := sources
+		if len(sources) > maxSources {
+			display = sources[:maxSources]
+		}
+		b.WriteString("  " + strings.Join(display, ", "))
+		if len(sources) > maxSources {
+			b.WriteString(fmt.Sprintf(" (+%d more)", len(sources)-maxSources))
+		}
+		b.WriteString("\n\n")
+	} else {
+		b.WriteString("  n/a\n\n")
+	}
+	b.WriteString("PROGRESS\n")
+	b.WriteString(fmt.Sprintf("  fetched: %d | indexed: %d\n\n", stats.ItemsFetched, stats.ItemsIndexed))
+	b.WriteString("RESULTS\n")
+	b.WriteString(fmt.Sprintf("  chunks_indexed: %d\n", stats.ChunksIndexed))
+	errors := stats.PreflightFailures + stats.SafetyBlocked + stats.SafetyErrors + stats.ParseErrors + stats.HTTPErrors + stats.IndexErrors
+	b.WriteString(fmt.Sprintf("  errors: %d", errors))
 	return b.String()
 }
 
@@ -1025,6 +1177,27 @@ func renderInlineLearnSummary(fromFile bool, filePath string) string {
 	return b.String()
 }
 
+func renderInlineLearnSummaryFriendly(fromFile bool, filePath string) string {
+	var b strings.Builder
+	b.WriteString("LEARN REPORT\n\n")
+	b.WriteString("COMMAND\n")
+	b.WriteString("  talos learn\n\n")
+	b.WriteString("STATUS\n")
+	b.WriteString("  SUCCESS\n\n")
+	b.WriteString("SOURCE\n")
+	if fromFile {
+		b.WriteString("  file: " + strings.TrimSpace(filePath) + "\n\n")
+	} else {
+		b.WriteString("  inline input\n\n")
+	}
+	b.WriteString("PROGRESS\n")
+	b.WriteString("  indexed: 1/1\n\n")
+	b.WriteString("RESULTS\n")
+	b.WriteString("  chunks_indexed: 1\n")
+	b.WriteString("  errors: 0")
+	return b.String()
+}
+
 func normalizeExtensionsList(exts map[string]bool) string {
 	if len(exts) == 0 {
 		return "default"
@@ -1043,477 +1216,514 @@ func normalizeExtensionsList(exts map[string]bool) string {
 }
 
 func executeLearnFromConnectors(mm *memory.MemoryManager) {
-ctx := context.Background()
-opts := rag.DefaultIndexOptions()
-opts.MaxChunkChars = learnChunkChars
-opts.ChunkOverlap = learnChunkOverlap
+	ctx := context.Background()
+	opts := rag.DefaultIndexOptions()
+	opts.MaxChunkChars = learnChunkChars
+	opts.ChunkOverlap = learnChunkOverlap
 
-totalIndexed := 0
-totalChunks := 0
-var errors []string
+	totalIndexed := 0
+	totalChunks := 0
+	var errors []string
 
-// Gmail
-if learnGmailQuery != "" {
-auth, err := googleconn.NewGoogleAuth()
-if err != nil {
-fmt.Printf("Gmail auth error: %v\n", err)
-fmt.Println("Ensure GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_IMPERSONATE_USER are set.")
-errors = append(errors, "gmail: "+err.Error())
-} else {
-connector := googleconn.NewGmailConnector(auth)
-fetchOpts := connectors.FetchOptions{
-Query:      learnGmailQuery,
-MaxResults: learnGmailMax,
-}
-fmt.Printf("Fetching Gmail messages (query: %q, max: %d)...\n", learnGmailQuery, learnGmailMax)
-opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
-fmt.Printf("  [gmail] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
-}
-stats, err := rag.IndexConnector(ctx, connector, mm, opts, fetchOpts)
-if err != nil {
-fmt.Printf("Gmail indexing error: %v\n", err)
-errors = append(errors, "gmail: "+err.Error())
-} else {
-fmt.Printf("Gmail: %d messages indexed, %d chunks.\n", stats.FilesIndexed, stats.ChunksIndexed)
-totalIndexed += stats.FilesIndexed
-totalChunks += stats.ChunksIndexed
-}
-}
-}
+	// Gmail
+	if learnGmailQuery != "" {
+		auth, err := googleconn.NewGoogleAuth()
+		if err != nil {
+			fmt.Printf("Gmail auth error: %v\n", err)
+			fmt.Println("Ensure GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_IMPERSONATE_USER are set.")
+			errors = append(errors, "gmail: "+err.Error())
+		} else {
+			connector := googleconn.NewGmailConnector(auth)
+			fetchOpts := connectors.FetchOptions{
+				Query:      learnGmailQuery,
+				MaxResults: learnGmailMax,
+			}
+			fmt.Printf("Fetching Gmail messages (query: %q, max: %d)...\n", learnGmailQuery, learnGmailMax)
+			opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+				fmt.Printf("  [gmail] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+			}
+			stats, err := rag.IndexConnector(ctx, connector, mm, opts, fetchOpts)
+			if err != nil {
+				fmt.Printf("Gmail indexing error: %v\n", err)
+				errors = append(errors, "gmail: "+err.Error())
+			} else {
+				fmt.Printf("Gmail: %d messages indexed, %d chunks.\n", stats.FilesIndexed, stats.ChunksIndexed)
+				totalIndexed += stats.FilesIndexed
+				totalChunks += stats.ChunksIndexed
+			}
+		}
+	}
 
-// Google Drive
-if learnGdriveFolderID != "" || learnGdriveQuery != "" {
-auth, err := googleconn.NewGoogleAuth()
-if err != nil {
-fmt.Printf("Google Drive auth error: %v\n", err)
-fmt.Println("Ensure GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_IMPERSONATE_USER are set.")
-errors = append(errors, "gdrive: "+err.Error())
-} else {
-connector := googleconn.NewDriveConnector(auth)
-fetchOpts := connectors.FetchOptions{
-FolderID:   learnGdriveFolderID,
-Query:      learnGdriveQuery,
-MaxResults: learnGdriveMax,
-}
-label := learnGdriveFolderID
-if label == "" {
-label = learnGdriveQuery
-}
-fmt.Printf("Fetching Google Drive files (%s, max: %d)...\n", label, learnGdriveMax)
-opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
-fmt.Printf("  [gdrive] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
-}
-stats, err := rag.IndexConnector(ctx, connector, mm, opts, fetchOpts)
-if err != nil {
-fmt.Printf("Google Drive indexing error: %v\n", err)
-errors = append(errors, "gdrive: "+err.Error())
-} else {
-fmt.Printf("Google Drive: %d files indexed, %d chunks.\n", stats.FilesIndexed, stats.ChunksIndexed)
-totalIndexed += stats.FilesIndexed
-totalChunks += stats.ChunksIndexed
-}
-}
-}
+	// Google Drive
+	if learnGdriveFolderID != "" || learnGdriveQuery != "" {
+		auth, err := googleconn.NewGoogleAuth()
+		if err != nil {
+			fmt.Printf("Google Drive auth error: %v\n", err)
+			fmt.Println("Ensure GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_IMPERSONATE_USER are set.")
+			errors = append(errors, "gdrive: "+err.Error())
+		} else {
+			connector := googleconn.NewDriveConnector(auth)
+			fetchOpts := connectors.FetchOptions{
+				FolderID:   learnGdriveFolderID,
+				Query:      learnGdriveQuery,
+				MaxResults: learnGdriveMax,
+			}
+			label := learnGdriveFolderID
+			if label == "" {
+				label = learnGdriveQuery
+			}
+			fmt.Printf("Fetching Google Drive files (%s, max: %d)...\n", label, learnGdriveMax)
+			opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+				fmt.Printf("  [gdrive] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+			}
+			stats, err := rag.IndexConnector(ctx, connector, mm, opts, fetchOpts)
+			if err != nil {
+				fmt.Printf("Google Drive indexing error: %v\n", err)
+				errors = append(errors, "gdrive: "+err.Error())
+			} else {
+				fmt.Printf("Google Drive: %d files indexed, %d chunks.\n", stats.FilesIndexed, stats.ChunksIndexed)
+				totalIndexed += stats.FilesIndexed
+				totalChunks += stats.ChunksIndexed
+			}
+		}
+	}
 
-// Notion
-if learnNotionDatabaseID != "" {
-connector, err := notion.NewNotionConnector()
-if err != nil {
-fmt.Printf("Notion connector error: %v\n", err)
-fmt.Println("Ensure NOTION_API_KEY is set.")
-errors = append(errors, "notion: "+err.Error())
-} else {
-var filter map[string]any
-if learnNotionFilter != "" {
-if jsonErr := json.Unmarshal([]byte(learnNotionFilter), &filter); jsonErr != nil {
-fmt.Printf("Warning: invalid --notion-filter JSON: %v\n", jsonErr)
-}
-}
-fetchOpts := connectors.FetchOptions{
-Query:      learnNotionDatabaseID,
-MaxResults: 100,
-Filter:     filter,
-}
-fmt.Printf("Fetching Notion database (id: %s)...\n", learnNotionDatabaseID)
-opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
-fmt.Printf("  [notion] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
-}
-stats, err := rag.IndexConnector(ctx, connector, mm, opts, fetchOpts)
-if err != nil {
-fmt.Printf("Notion indexing error: %v\n", err)
-errors = append(errors, "notion: "+err.Error())
-} else {
-fmt.Printf("Notion: %d pages indexed, %d chunks.\n", stats.FilesIndexed, stats.ChunksIndexed)
-totalIndexed += stats.FilesIndexed
-totalChunks += stats.ChunksIndexed
-}
-}
-}
+	// Notion
+	if learnNotionDatabaseID != "" {
+		connector, err := notion.NewNotionConnector()
+		if err != nil {
+			fmt.Printf("Notion connector error: %v\n", err)
+			fmt.Println("Ensure NOTION_API_KEY is set.")
+			errors = append(errors, "notion: "+err.Error())
+		} else {
+			var filter map[string]any
+			if learnNotionFilter != "" {
+				if jsonErr := json.Unmarshal([]byte(learnNotionFilter), &filter); jsonErr != nil {
+					fmt.Printf("Warning: invalid --notion-filter JSON: %v\n", jsonErr)
+				}
+			}
+			fetchOpts := connectors.FetchOptions{
+				Query:      learnNotionDatabaseID,
+				MaxResults: 100,
+				Filter:     filter,
+			}
+			fmt.Printf("Fetching Notion database (id: %s)...\n", learnNotionDatabaseID)
+			opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+				fmt.Printf("  [notion] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+			}
+			stats, err := rag.IndexConnector(ctx, connector, mm, opts, fetchOpts)
+			if err != nil {
+				fmt.Printf("Notion indexing error: %v\n", err)
+				errors = append(errors, "notion: "+err.Error())
+			} else {
+				fmt.Printf("Notion: %d pages indexed, %d chunks.\n", stats.FilesIndexed, stats.ChunksIndexed)
+				totalIndexed += stats.FilesIndexed
+				totalChunks += stats.ChunksIndexed
+			}
+		}
+	}
 
-// Project Gutenberg
-if learnBookSearch != "" || len(learnBookIDs) > 0 {
-connector := gutenberg.NewGutenbergConnector()
-fetchOpts := connectors.FetchOptions{
-Query:      learnBookSearch,
-MaxResults: learnBookMax,
-}
-if len(learnBookIDs) > 0 {
-fetchOpts.Filter = map[string]any{
-"book_ids": strings.Join(learnBookIDs, ","),
-}
-fetchOpts.MaxResults = len(learnBookIDs)
-}
-label := learnBookSearch
-if label == "" {
-label = strings.Join(learnBookIDs, ", ")
-}
-fmt.Printf("Fetching Gutenberg book(s) (%s)...\n", label)
-opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
-fmt.Printf("  [gutenberg] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
-}
-stats, err := rag.IndexConnector(ctx, connector, mm, opts, fetchOpts)
-if err != nil {
-fmt.Printf("Gutenberg indexing error: %v\n", err)
-errors = append(errors, "gutenberg: "+err.Error())
-} else {
-fmt.Printf("Gutenberg: %d book(s) indexed, %d chunks.\n", stats.FilesIndexed, stats.ChunksIndexed)
-totalIndexed += stats.FilesIndexed
-totalChunks += stats.ChunksIndexed
-}
-}
+	// Project Gutenberg
+	if learnBookSearch != "" || len(learnBookIDs) > 0 {
+		connector := gutenberg.NewGutenbergConnector()
+		fetchOpts := connectors.FetchOptions{
+			Query:      learnBookSearch,
+			MaxResults: learnBookMax,
+		}
+		if len(learnBookIDs) > 0 {
+			fetchOpts.Filter = map[string]any{
+				"book_ids": strings.Join(learnBookIDs, ","),
+			}
+			fetchOpts.MaxResults = len(learnBookIDs)
+		}
+		label := learnBookSearch
+		if label == "" {
+			label = strings.Join(learnBookIDs, ", ")
+		}
+		fmt.Printf("Fetching Gutenberg book(s) (%s)...\n", label)
+		opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+			fmt.Printf("  [gutenberg] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+		}
+		stats, err := rag.IndexConnector(ctx, connector, mm, opts, fetchOpts)
+		if err != nil {
+			fmt.Printf("Gutenberg indexing error: %v\n", err)
+			errors = append(errors, "gutenberg: "+err.Error())
+		} else {
+			fmt.Printf("Gutenberg: %d book(s) indexed, %d chunks.\n", stats.FilesIndexed, stats.ChunksIndexed)
+			totalIndexed += stats.FilesIndexed
+			totalChunks += stats.ChunksIndexed
+		}
+	}
 
-// GitHub
-for _, repoSlug := range learnGitHubRepos {
-repoSlug = strings.TrimSpace(repoSlug)
-if repoSlug == "" {
-continue
-}
-connector := githubconn.NewGitHubConnector()
-fetchOpts := connectors.FetchOptions{
-Query:      repoSlug,
-FolderID:   learnGitHubPath,
-MaxResults: learnGitHubMax,
-}
-fmt.Printf("Fetching GitHub repo (%s)...\n", repoSlug)
-opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
-fmt.Printf("  [github] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
-}
-stats, err := rag.IndexConnector(ctx, connector, mm, opts, fetchOpts)
-if err != nil {
-fmt.Printf("GitHub indexing error (%s): %v\n", repoSlug, err)
-errors = append(errors, "github("+repoSlug+"): "+err.Error())
-} else {
-fmt.Printf("GitHub %s: %d files indexed, %d chunks.\n", repoSlug, stats.FilesIndexed, stats.ChunksIndexed)
-totalIndexed += stats.FilesIndexed
-totalChunks += stats.ChunksIndexed
-}
-}
+	// GitHub
+	for _, repoSlug := range learnGitHubRepos {
+		repoSlug = strings.TrimSpace(repoSlug)
+		if repoSlug == "" {
+			continue
+		}
+		connector := githubconn.NewGitHubConnector()
+		fetchOpts := connectors.FetchOptions{
+			Query:      repoSlug,
+			FolderID:   learnGitHubPath,
+			MaxResults: learnGitHubMax,
+		}
+		fmt.Printf("Fetching GitHub repo (%s)...\n", repoSlug)
+		opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+			fmt.Printf("  [github] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+		}
+		stats, err := rag.IndexConnector(ctx, connector, mm, opts, fetchOpts)
+		if err != nil {
+			fmt.Printf("GitHub indexing error (%s): %v\n", repoSlug, err)
+			errors = append(errors, "github("+repoSlug+"): "+err.Error())
+		} else {
+			fmt.Printf("GitHub %s: %d files indexed, %d chunks.\n", repoSlug, stats.FilesIndexed, stats.ChunksIndexed)
+			totalIndexed += stats.FilesIndexed
+			totalChunks += stats.ChunksIndexed
+		}
+	}
 
-fmt.Printf("\nConnector ingest complete. Total: %d documents, %d chunks.", totalIndexed, totalChunks)
-if len(errors) > 0 {
-fmt.Printf(" Errors: %s", strings.Join(errors, "; "))
-}
-fmt.Println()
+	fmt.Printf("\nConnector ingest complete. Total: %d documents, %d chunks.", totalIndexed, totalChunks)
+	if len(errors) > 0 {
+		fmt.Printf(" Errors: %s", strings.Join(errors, "; "))
+	}
+	fmt.Println()
 }
 
 // executeLearnChain runs sources in the user-specified order given by --chain.
 // It shares a single MemoryManager and collects errors without stopping the chain.
 func executeLearnChain(args []string, mm *memory.MemoryManager) {
-tokens := strings.Split(learnChain, ",")
-var errs []string
-grandTotal := 0
-grandChunks := 0
+	tokens := strings.Split(learnChain, ",")
+	var errs []string
+	grandTotal := 0
+	grandChunks := 0
 
-for _, raw := range tokens {
-tok := strings.ToLower(strings.TrimSpace(raw))
-if tok == "" {
-continue
-}
-fmt.Printf("\n── chain step: %s ──\n", tok)
-var err error
-var indexed, chunks int
-switch tok {
-case "file":
-indexed, chunks, err = runChainFile(args, mm)
-case "dir":
-indexed, chunks, err = runChainDir(mm)
-case "url":
-indexed, chunks, err = runChainURL(mm)
-case "hf":
-indexed, chunks, err = runChainHF(mm)
-case "gmail":
-indexed, chunks, err = runChainGmail(mm)
-case "drive":
-indexed, chunks, err = runChainDrive(mm)
-case "notion":
-indexed, chunks, err = runChainNotion(mm)
-case "books", "gutenberg":
-indexed, chunks, err = runChainBooks(mm)
-case "github":
-indexed, chunks, err = runChainGitHub(mm)
-case "research":
-err = runChainResearch()
-default:
-fmt.Printf("Warning: unknown chain token %q — skipping.\n", tok)
-continue
-}
-if err != nil {
-fmt.Printf("Error in chain step %q: %v\n", tok, err)
-errs = append(errs, tok+": "+err.Error())
-} else {
-fmt.Printf("Chain step %q complete: %d documents, %d chunks.\n", tok, indexed, chunks)
-grandTotal += indexed
-grandChunks += chunks
-}
-}
+	for _, raw := range tokens {
+		tok := strings.ToLower(strings.TrimSpace(raw))
+		if tok == "" {
+			continue
+		}
+		fmt.Printf("\n── chain step: %s ──\n", tok)
+		var err error
+		var indexed, chunks int
+		switch tok {
+		case "file":
+			indexed, chunks, err = runChainFile(args, mm)
+		case "dir":
+			indexed, chunks, err = runChainDir(mm)
+		case "url":
+			indexed, chunks, err = runChainURL(mm)
+		case "hf":
+			indexed, chunks, err = runChainHF(mm)
+		case "kaggle":
+			indexed, chunks, err = runChainKaggle(mm)
+		case "gmail":
+			indexed, chunks, err = runChainGmail(mm)
+		case "drive":
+			indexed, chunks, err = runChainDrive(mm)
+		case "notion":
+			indexed, chunks, err = runChainNotion(mm)
+		case "books", "gutenberg":
+			indexed, chunks, err = runChainBooks(mm)
+		case "github":
+			indexed, chunks, err = runChainGitHub(mm)
+		case "research":
+			err = runChainResearch()
+		default:
+			fmt.Printf("Warning: unknown chain token %q — skipping.\n", tok)
+			continue
+		}
+		if err != nil {
+			fmt.Printf("Error in chain step %q: %v\n", tok, err)
+			errs = append(errs, tok+": "+err.Error())
+		} else {
+			fmt.Printf("Chain step %q complete: %d documents, %d chunks.\n", tok, indexed, chunks)
+			grandTotal += indexed
+			grandChunks += chunks
+		}
+	}
 
-fmt.Printf("\n── chain complete. Total: %d documents, %d chunks.", grandTotal, grandChunks)
-if len(errs) > 0 {
-fmt.Printf(" Errors: %s", strings.Join(errs, "; "))
-}
-fmt.Println()
+	fmt.Printf("\n── chain complete. Total: %d documents, %d chunks.", grandTotal, grandChunks)
+	if len(errs) > 0 {
+		fmt.Printf(" Errors: %s", strings.Join(errs, "; "))
+	}
+	fmt.Println()
 }
 
 // ── per-source chain runner wrappers ────────────────────────────────────────
 
 func runChainFile(args []string, mm *memory.MemoryManager) (int, int, error) {
-if learnFile == "" && len(args) == 0 {
-return 0, 0, fmt.Errorf("--file not set and no inline text provided")
-}
-var content string
-if learnFile != "" {
-data, err := os.ReadFile(learnFile)
-if err != nil {
-return 0, 0, err
-}
-content = string(data)
-} else {
-content = strings.Join(args, " ")
-}
-if err := mm.AddKnowledge(content, nil); err != nil {
-return 0, 0, err
-}
-return 1, 1, nil
+	if learnFile == "" && len(args) == 0 {
+		return 0, 0, fmt.Errorf("--file not set and no inline text provided")
+	}
+	var content string
+	if learnFile != "" {
+		data, err := os.ReadFile(learnFile)
+		if err != nil {
+			return 0, 0, err
+		}
+		content = string(data)
+	} else {
+		content = strings.Join(args, " ")
+	}
+	if err := mm.AddKnowledge(content, nil); err != nil {
+		return 0, 0, err
+	}
+	return 1, 1, nil
 }
 
 func runChainDir(mm *memory.MemoryManager) (int, int, error) {
-if learnDir == "" {
-return 0, 0, fmt.Errorf("--dir not set")
-}
-opts := rag.DefaultIndexOptions()
-opts.MaxChunkChars = learnChunkChars
-opts.ChunkOverlap = learnChunkOverlap
-opts.Recursive = learnRecursive
-opts.Extensions = rag.ParseExtensionsCSV(strings.TrimSpace(learnExtensions))
-opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
-fmt.Printf("  [dir] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
-}
-stats, err := rag.IndexDirectory(mm, learnDir, opts)
-if err != nil {
-return 0, 0, err
-}
-return stats.FilesIndexed, stats.ChunksIndexed, nil
+	if learnDir == "" {
+		return 0, 0, fmt.Errorf("--dir not set")
+	}
+	opts := rag.DefaultIndexOptions()
+	opts.MaxChunkChars = learnChunkChars
+	opts.ChunkOverlap = learnChunkOverlap
+	opts.Recursive = learnRecursive
+	opts.Extensions = rag.ParseExtensionsCSV(strings.TrimSpace(learnExtensions))
+	opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+		fmt.Printf("  [dir] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+	}
+	stats, err := rag.IndexDirectory(mm, learnDir, opts)
+	if err != nil {
+		return 0, 0, err
+	}
+	return stats.FilesIndexed, stats.ChunksIndexed, nil
 }
 
 func runChainURL(mm *memory.MemoryManager) (int, int, error) {
-seedURLs, err := collectURLs(learnURLs, learnURLFile)
-if err != nil {
-return 0, 0, err
-}
-if len(seedURLs) == 0 {
-return 0, 0, fmt.Errorf("--url and --url-file not set")
-}
-remoteOpts := rag.DefaultRemoteIndexOptions()
-remoteOpts.MaxChunkChars = learnChunkChars
-remoteOpts.ChunkOverlap = learnChunkOverlap
-remoteOpts.Crawl = learnCrawl
-remoteOpts.CrawlDepth = learnCrawlDepth
-remoteOpts.MaxPages = learnMaxPages
-remoteOpts.URLSafetyEnabled = learnURLSafety
-remoteOpts.URLSafetyTimeout = learnURLSafetyTimeout
-remoteOpts.URLSafetyCacheTTL = learnURLSafetyCacheTTL
-remoteOpts.URLSafetyVisibility = learnURLSafetyVisibility
-remoteOpts.URLSafetyFailOpen = learnURLSafetyFailOpen
-remoteOpts.URLSafetyAPIKey = strings.TrimSpace(os.Getenv("URLSCAN_API_KEY"))
-remoteOpts.OnEvent = func(ev rag.RemoteEvent) {
-fmt.Printf("  [url] %s: %s\n", ev.Outcome, ev.Source)
-}
-stats, err := rag.IndexURLs(mm, seedURLs, remoteOpts)
-if err != nil {
-return 0, 0, err
-}
-return stats.ItemsIndexed, stats.ChunksIndexed, nil
+	seedURLs, err := collectURLs(learnURLs, learnURLFile)
+	if err != nil {
+		return 0, 0, err
+	}
+	if len(seedURLs) == 0 {
+		return 0, 0, fmt.Errorf("--url and --url-file not set")
+	}
+	remoteOpts := rag.DefaultRemoteIndexOptions()
+	remoteOpts.MaxChunkChars = learnChunkChars
+	remoteOpts.ChunkOverlap = learnChunkOverlap
+	remoteOpts.Crawl = learnCrawl
+	remoteOpts.CrawlDepth = learnCrawlDepth
+	remoteOpts.MaxPages = learnMaxPages
+	remoteOpts.URLSafetyEnabled = learnURLSafety
+	remoteOpts.URLSafetyTimeout = learnURLSafetyTimeout
+	remoteOpts.URLSafetyCacheTTL = learnURLSafetyCacheTTL
+	remoteOpts.URLSafetyVisibility = learnURLSafetyVisibility
+	remoteOpts.URLSafetyFailOpen = learnURLSafetyFailOpen
+	remoteOpts.URLSafetyAPIKey = strings.TrimSpace(os.Getenv("URLSCAN_API_KEY"))
+	remoteOpts.URLAllowedExts = remoteURLAllowedExtensions()
+	remoteOpts.OnEvent = func(ev rag.RemoteEvent) {
+		fmt.Printf("  [url] %s: %s\n", ev.Outcome, ev.Source)
+	}
+	stats, err := rag.IndexURLs(mm, seedURLs, remoteOpts)
+	if err != nil {
+		return 0, 0, err
+	}
+	return stats.ItemsIndexed, stats.ChunksIndexed, nil
 }
 
 func runChainHF(mm *memory.MemoryManager) (int, int, error) {
-if len(learnHFDatasets) == 0 {
-return 0, 0, fmt.Errorf("--hf-dataset not set")
+	if len(learnHFDatasets) == 0 {
+		return 0, 0, fmt.Errorf("--hf-dataset not set")
+	}
+	specs := make([]rag.HFSpec, 0, len(learnHFDatasets))
+	for _, ds := range learnHFDatasets {
+		ds = strings.TrimSpace(ds)
+		if ds == "" {
+			continue
+		}
+		specs = append(specs, rag.HFSpec{
+			DatasetID:  ds,
+			Config:     strings.TrimSpace(learnHFConfig),
+			Split:      strings.TrimSpace(learnHFSplit),
+			MaxRecords: learnHFMaxRecords,
+		})
+	}
+	remoteOpts := rag.DefaultRemoteIndexOptions()
+	remoteOpts.HFToken = strings.TrimSpace(os.Getenv("HF_TOKEN"))
+	remoteOpts.MaxChunkChars = learnChunkChars
+	remoteOpts.ChunkOverlap = learnChunkOverlap
+	remoteOpts.OnEvent = func(ev rag.RemoteEvent) {
+		fmt.Printf("  [hf] %s: %s\n", ev.Outcome, ev.Source)
+	}
+	stats, err := rag.IndexHFDatasets(mm, specs, remoteOpts)
+	if err != nil {
+		return 0, 0, err
+	}
+	return stats.ItemsIndexed, stats.ChunksIndexed, nil
 }
-specs := make([]rag.HFSpec, 0, len(learnHFDatasets))
-for _, ds := range learnHFDatasets {
-ds = strings.TrimSpace(ds)
-if ds == "" {
-continue
-}
-specs = append(specs, rag.HFSpec{
-DatasetID:  ds,
-Config:     strings.TrimSpace(learnHFConfig),
-Split:      strings.TrimSpace(learnHFSplit),
-MaxRecords: learnHFMaxRecords,
-})
-}
-remoteOpts := rag.DefaultRemoteIndexOptions()
-remoteOpts.HFToken = strings.TrimSpace(os.Getenv("HF_TOKEN"))
-remoteOpts.MaxChunkChars = learnChunkChars
-remoteOpts.ChunkOverlap = learnChunkOverlap
-remoteOpts.OnEvent = func(ev rag.RemoteEvent) {
-fmt.Printf("  [hf] %s: %s\n", ev.Outcome, ev.Source)
-}
-stats, err := rag.IndexHFDatasets(mm, specs, remoteOpts)
-if err != nil {
-return 0, 0, err
-}
-return stats.ItemsIndexed, stats.ChunksIndexed, nil
+
+func runChainKaggle(mm *memory.MemoryManager) (int, int, error) {
+	if len(learnKaggleDatasets) == 0 {
+		return 0, 0, fmt.Errorf("--kaggle-dataset not set")
+	}
+	specs := make([]rag.KaggleSpec, 0, len(learnKaggleDatasets))
+	for _, ds := range learnKaggleDatasets {
+		ds = strings.TrimSpace(ds)
+		if ds == "" {
+			continue
+		}
+		specs = append(specs, rag.KaggleSpec{
+			DatasetID:  ds,
+			Files:      append([]string(nil), learnKaggleFiles...),
+			MaxRecords: learnKaggleMaxRecords,
+		})
+	}
+	remoteOpts := rag.DefaultRemoteIndexOptions()
+	remoteOpts.KaggleUsername = strings.TrimSpace(os.Getenv("KAGGLE_USERNAME"))
+	remoteOpts.KaggleKey = strings.TrimSpace(os.Getenv("KAGGLE_KEY"))
+	if remoteOpts.KaggleKey == "" {
+		remoteOpts.KaggleKey = strings.TrimSpace(os.Getenv("KAGGLE_API_KEY"))
+	}
+	remoteOpts.MaxChunkChars = learnChunkChars
+	remoteOpts.ChunkOverlap = learnChunkOverlap
+	remoteOpts.OnEvent = func(ev rag.RemoteEvent) {
+		fmt.Printf("  [kaggle] %s: %s\n", ev.Outcome, ev.Source)
+	}
+	stats, err := rag.IndexKaggleDatasets(mm, specs, remoteOpts)
+	if err != nil {
+		return 0, 0, err
+	}
+	return stats.ItemsIndexed, stats.ChunksIndexed, nil
 }
 
 func runChainGmail(mm *memory.MemoryManager) (int, int, error) {
-if learnGmailQuery == "" {
-return 0, 0, fmt.Errorf("--gmail-query not set")
-}
-auth, err := googleconn.NewGoogleAuth()
-if err != nil {
-return 0, 0, err
-}
-connector := googleconn.NewGmailConnector(auth)
-opts := rag.DefaultIndexOptions()
-opts.MaxChunkChars = learnChunkChars
-opts.ChunkOverlap = learnChunkOverlap
-opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
-fmt.Printf("  [gmail] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
-}
-stats, err := rag.IndexConnector(context.Background(), connector, mm, opts, connectors.FetchOptions{
-Query:      learnGmailQuery,
-MaxResults: learnGmailMax,
-})
-if err != nil {
-return 0, 0, err
-}
-return stats.FilesIndexed, stats.ChunksIndexed, nil
+	if learnGmailQuery == "" {
+		return 0, 0, fmt.Errorf("--gmail-query not set")
+	}
+	auth, err := googleconn.NewGoogleAuth()
+	if err != nil {
+		return 0, 0, err
+	}
+	connector := googleconn.NewGmailConnector(auth)
+	opts := rag.DefaultIndexOptions()
+	opts.MaxChunkChars = learnChunkChars
+	opts.ChunkOverlap = learnChunkOverlap
+	opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+		fmt.Printf("  [gmail] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+	}
+	stats, err := rag.IndexConnector(context.Background(), connector, mm, opts, connectors.FetchOptions{
+		Query:      learnGmailQuery,
+		MaxResults: learnGmailMax,
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return stats.FilesIndexed, stats.ChunksIndexed, nil
 }
 
 func runChainDrive(mm *memory.MemoryManager) (int, int, error) {
-if learnGdriveFolderID == "" && learnGdriveQuery == "" {
-return 0, 0, fmt.Errorf("--gdrive-folder or --gdrive-query not set")
-}
-auth, err := googleconn.NewGoogleAuth()
-if err != nil {
-return 0, 0, err
-}
-connector := googleconn.NewDriveConnector(auth)
-opts := rag.DefaultIndexOptions()
-opts.MaxChunkChars = learnChunkChars
-opts.ChunkOverlap = learnChunkOverlap
-opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
-fmt.Printf("  [drive] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
-}
-stats, err := rag.IndexConnector(context.Background(), connector, mm, opts, connectors.FetchOptions{
-FolderID:   learnGdriveFolderID,
-Query:      learnGdriveQuery,
-MaxResults: learnGdriveMax,
-})
-if err != nil {
-return 0, 0, err
-}
-return stats.FilesIndexed, stats.ChunksIndexed, nil
+	if learnGdriveFolderID == "" && learnGdriveQuery == "" {
+		return 0, 0, fmt.Errorf("--gdrive-folder or --gdrive-query not set")
+	}
+	auth, err := googleconn.NewGoogleAuth()
+	if err != nil {
+		return 0, 0, err
+	}
+	connector := googleconn.NewDriveConnector(auth)
+	opts := rag.DefaultIndexOptions()
+	opts.MaxChunkChars = learnChunkChars
+	opts.ChunkOverlap = learnChunkOverlap
+	opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+		fmt.Printf("  [drive] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+	}
+	stats, err := rag.IndexConnector(context.Background(), connector, mm, opts, connectors.FetchOptions{
+		FolderID:   learnGdriveFolderID,
+		Query:      learnGdriveQuery,
+		MaxResults: learnGdriveMax,
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return stats.FilesIndexed, stats.ChunksIndexed, nil
 }
 
 func runChainNotion(mm *memory.MemoryManager) (int, int, error) {
-if learnNotionDatabaseID == "" {
-return 0, 0, fmt.Errorf("--notion-database not set")
-}
-connector, err := notion.NewNotionConnector()
-if err != nil {
-return 0, 0, err
-}
-var filter map[string]any
-if learnNotionFilter != "" {
-_ = json.Unmarshal([]byte(learnNotionFilter), &filter)
-}
-opts := rag.DefaultIndexOptions()
-opts.MaxChunkChars = learnChunkChars
-opts.ChunkOverlap = learnChunkOverlap
-opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
-fmt.Printf("  [notion] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
-}
-stats, err := rag.IndexConnector(context.Background(), connector, mm, opts, connectors.FetchOptions{
-Query:      learnNotionDatabaseID,
-MaxResults: 100,
-Filter:     filter,
-})
-if err != nil {
-return 0, 0, err
-}
-return stats.FilesIndexed, stats.ChunksIndexed, nil
+	if learnNotionDatabaseID == "" {
+		return 0, 0, fmt.Errorf("--notion-database not set")
+	}
+	connector, err := notion.NewNotionConnector()
+	if err != nil {
+		return 0, 0, err
+	}
+	var filter map[string]any
+	if learnNotionFilter != "" {
+		_ = json.Unmarshal([]byte(learnNotionFilter), &filter)
+	}
+	opts := rag.DefaultIndexOptions()
+	opts.MaxChunkChars = learnChunkChars
+	opts.ChunkOverlap = learnChunkOverlap
+	opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+		fmt.Printf("  [notion] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+	}
+	stats, err := rag.IndexConnector(context.Background(), connector, mm, opts, connectors.FetchOptions{
+		Query:      learnNotionDatabaseID,
+		MaxResults: 100,
+		Filter:     filter,
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return stats.FilesIndexed, stats.ChunksIndexed, nil
 }
 
 func runChainBooks(mm *memory.MemoryManager) (int, int, error) {
-if learnBookSearch == "" && len(learnBookIDs) == 0 {
-return 0, 0, fmt.Errorf("--book-search or --book-id not set")
-}
-connector := gutenberg.NewGutenbergConnector()
-fetchOpts := connectors.FetchOptions{Query: learnBookSearch, MaxResults: learnBookMax}
-if len(learnBookIDs) > 0 {
-fetchOpts.Filter = map[string]any{"book_ids": strings.Join(learnBookIDs, ",")}
-fetchOpts.MaxResults = len(learnBookIDs)
-}
-opts := rag.DefaultIndexOptions()
-opts.MaxChunkChars = learnChunkChars
-opts.ChunkOverlap = learnChunkOverlap
-opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
-fmt.Printf("  [books] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
-}
-stats, err := rag.IndexConnector(context.Background(), connector, mm, opts, fetchOpts)
-if err != nil {
-return 0, 0, err
-}
-return stats.FilesIndexed, stats.ChunksIndexed, nil
+	if learnBookSearch == "" && len(learnBookIDs) == 0 {
+		return 0, 0, fmt.Errorf("--book-search or --book-id not set")
+	}
+	connector := gutenberg.NewGutenbergConnector()
+	fetchOpts := connectors.FetchOptions{Query: learnBookSearch, MaxResults: learnBookMax}
+	if len(learnBookIDs) > 0 {
+		fetchOpts.Filter = map[string]any{"book_ids": strings.Join(learnBookIDs, ",")}
+		fetchOpts.MaxResults = len(learnBookIDs)
+	}
+	opts := rag.DefaultIndexOptions()
+	opts.MaxChunkChars = learnChunkChars
+	opts.ChunkOverlap = learnChunkOverlap
+	opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+		fmt.Printf("  [books] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+	}
+	stats, err := rag.IndexConnector(context.Background(), connector, mm, opts, fetchOpts)
+	if err != nil {
+		return 0, 0, err
+	}
+	return stats.FilesIndexed, stats.ChunksIndexed, nil
 }
 
 func runChainGitHub(mm *memory.MemoryManager) (int, int, error) {
-if len(learnGitHubRepos) == 0 {
-return 0, 0, fmt.Errorf("--github-repo not set")
-}
-connector := githubconn.NewGitHubConnector()
-opts := rag.DefaultIndexOptions()
-opts.MaxChunkChars = learnChunkChars
-opts.ChunkOverlap = learnChunkOverlap
-opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
-fmt.Printf("  [github] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
-}
-totalIndexed := 0
-totalChunks := 0
-for _, slug := range learnGitHubRepos {
-slug = strings.TrimSpace(slug)
-if slug == "" {
-continue
-}
-stats, err := rag.IndexConnector(context.Background(), connector, mm, opts, connectors.FetchOptions{
-Query:      slug,
-FolderID:   learnGitHubPath,
-MaxResults: learnGitHubMax,
-})
-if err != nil {
-return totalIndexed, totalChunks, fmt.Errorf("github %s: %w", slug, err)
-}
-totalIndexed += stats.FilesIndexed
-totalChunks += stats.ChunksIndexed
-}
-return totalIndexed, totalChunks, nil
+	if len(learnGitHubRepos) == 0 {
+		return 0, 0, fmt.Errorf("--github-repo not set")
+	}
+	connector := githubconn.NewGitHubConnector()
+	opts := rag.DefaultIndexOptions()
+	opts.MaxChunkChars = learnChunkChars
+	opts.ChunkOverlap = learnChunkOverlap
+	opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+		fmt.Printf("  [github] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+	}
+	totalIndexed := 0
+	totalChunks := 0
+	for _, slug := range learnGitHubRepos {
+		slug = strings.TrimSpace(slug)
+		if slug == "" {
+			continue
+		}
+		stats, err := rag.IndexConnector(context.Background(), connector, mm, opts, connectors.FetchOptions{
+			Query:      slug,
+			FolderID:   learnGitHubPath,
+			MaxResults: learnGitHubMax,
+		})
+		if err != nil {
+			return totalIndexed, totalChunks, fmt.Errorf("github %s: %w", slug, err)
+		}
+		totalIndexed += stats.FilesIndexed
+		totalChunks += stats.ChunksIndexed
+	}
+	return totalIndexed, totalChunks, nil
 }
 
 func runChainResearch() error {
-if learnFromResearch == "" {
-return fmt.Errorf("--from-research not set")
-}
-return executeLearnFromResearch(learnFromResearch, learnIncludeResearchSummary, learnIncludeResearchSources)
+	if learnFromResearch == "" {
+		return fmt.Errorf("--from-research not set")
+	}
+	return executeLearnFromResearch(learnFromResearch, learnIncludeResearchSummary, learnIncludeResearchSources)
 }

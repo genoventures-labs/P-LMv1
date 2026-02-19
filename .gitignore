@@ -35,6 +35,8 @@ api_keys.yaml
 benchmark_results.json
 recommended_models.json
 talos_benchmark_report.json
+kaggle.json
+workspace_talos.json
 
 # Editor/IDE
 # .idea/

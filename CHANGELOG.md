@@ -2,10 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.6.0] - 2026-02-19
+
+### Summary
+Enterprise UX and ingestion reliability release: cleaner, more uniform CLI output across TALOS surfaces plus safer URL crawl behavior, Kaggle/HF chain parity, and expanded explain/help coverage.
+
+### Highlights
+- Standardized user-facing reports to stable sectioned layouts (`COMMAND`, `STATUS`, `SOURCE/TARGET`, `PROGRESS`, `RESULTS`, `NEXT`) across learn/research/doctor/explain and related dry-run/session/report commands.
+- Added friendly learn output as default with `--verbose` toggle for technical detail output; friendly summaries now preserve source and progress visibility.
+- Added explain compactness controls (capped lists with overflow indicators) and new capability coverage for chaining patterns.
+- Improved monitor reboot discoverability with explicit reboot examples and alias support (`restart`).
+- Hardened URL ingest/crawl policy: default HTML text-only indexing; strict extension filtering when `--extensions` is provided, including crawl-link filtering.
+- Added Kaggle dataset ingestion support in `learn` to align with existing HF workflows, including profile/chain wiring and env-based credential resolution.
+- Expanded output governance tests for standardized rendering sections and updated CLI output contract guidance.
+
+### Validation
+- `go test ./pkg/taloscli`
+- `go test ./cmd/... ./pkg/...`
+
 ## [v0.5.0] - 2026-02-19
 
 ### Summary
-API connector ingestion layer for Google Workspace (Gmail, Drive, Docs, Sheets, Slides), Notion, Project Gutenberg, and GitHub — plus chained multi-source training via `--chain`.
+API connector ingestion layer for Google Workspace (Gmail, Drive, Docs, Sheets, Slides), Notion, Project Gutenberg, GitHub, and Kaggle datasets — plus chained multi-source training via `--chain`.
 
 ### Highlights
 - Added `pkg/connectors/` with a formal `Connector` interface and global registry — a clean extension point for all API data sources.
@@ -13,16 +31,17 @@ API connector ingestion layer for Google Workspace (Gmail, Drive, Docs, Sheets, 
 - Implemented Notion connector (`pkg/connectors/notion/`) for database page ingestion with block-level text extraction.
 - Implemented Project Gutenberg connector (`pkg/connectors/gutenberg/`) — searches ~70k public domain books via Gutendex API and downloads full plain-text. No credentials required. Auto-paginates search results when `--book-max > 32` (one Gutendex page).
 - Implemented GitHub connector (`pkg/connectors/github/`) — walks full repo file tree via `git/trees?recursive=1`, fetches and base64-decodes each text/code file. `GITHUB_TOKEN` optional (raises rate limit from 60→5000 req/hr). Supports `--github-path` subdirectory filter and `--github-max` file cap.
-- Added `--chain` flag to `talos learn` for ordered multi-source training: `--chain "dir,github,hf"` runs each source in sequence, sharing one `MemoryManager`. Continues through per-source errors. Valid tokens: `file`, `dir`, `url`, `hf`, `gmail`, `drive`, `notion`, `books`/`gutenberg`, `github`, `research`.
+- Added Kaggle dataset ingest path in remote indexing (`IndexKaggleDatasets`) with row-capped parsing for CSV/TSV/JSONL/TXT/MD files; credentials from `KAGGLE_USERNAME` + `KAGGLE_KEY` or `KAGGLE_API_KEY` alias.
+- Added `--chain` flag to `talos learn` for ordered multi-source training: `--chain "dir,github,hf,kaggle"` runs each source in sequence, sharing one `MemoryManager`. Continues through per-source errors. Valid tokens: `file`, `dir`, `url`, `hf`, `kaggle`, `gmail`, `drive`, `notion`, `books`/`gutenberg`, `github`, `research`.
 - Added `pkg/rag/connector_indexer.go` — bridges any `Connector` into the existing memory pipeline (chunking, `AddKnowledge`, `SourceIndexedEvent`).
 - Added `pkg/connectors/subagent.go` — wraps any connector as a `ProvisionedSubAgent` for autonomous invocation from daemon workflows.
-- Extended `talos learn` with `--gmail-query`, `--gmail-max`, `--gdrive-folder`, `--gdrive-query`, `--gdrive-max`, `--notion-database`, `--notion-filter`, `--book-search`, `--book-id`, `--book-max`, `--github-repo`, `--github-path`, `--github-max`, `--chain` flags.
+- Extended `talos learn` with `--gmail-query`, `--gmail-max`, `--gdrive-folder`, `--gdrive-query`, `--gdrive-max`, `--notion-database`, `--notion-filter`, `--book-search`, `--book-id`, `--book-max`, `--github-repo`, `--github-path`, `--github-max`, `--kaggle-dataset`, `--kaggle-file`, `--kaggle-max-records`, and `--chain` flags.
 - Extended `LearnProfileConfig` with all connector and chain fields — saveable and reusable in learn profiles.
 - All connector packages call `envload.Autoload()` defensively so credentials from `.env` are resolved regardless of call path (CLI, sub-agent, or test).
 
 ### Architecture
 - No new external Go dependencies — Google service account JWT auth uses stdlib `crypto/rsa` + `encoding/json`. Gutenberg and GitHub connectors use only stdlib `net/http`.
-- Credentials: `GOOGLE_SERVICE_ACCOUNT_JSON` (path), `GOOGLE_IMPERSONATE_USER` (domain-wide delegation), `NOTION_API_KEY`, `GITHUB_TOKEN` (optional). Gutenberg requires none. All read from shell exports or `.env` via `envload.Autoload()`.
+- Credentials: `GOOGLE_SERVICE_ACCOUNT_JSON` (path), `GOOGLE_IMPERSONATE_USER` (domain-wide delegation), `NOTION_API_KEY`, `GITHUB_TOKEN` (optional), and `KAGGLE_USERNAME` + `KAGGLE_KEY` (or `KAGGLE_API_KEY` alias). Gutenberg requires none. All read from shell exports or `.env` via `envload.Autoload()`.
 - Drive connector routes by MIME type: Google Docs → `text/plain` export, Sheets → `text/csv`, Slides → `text/plain`, regular files → direct download, binary files → skipped.
 - Gutenberg connector preference order for format: `text/plain; charset=utf-8` → `text/plain` → any `text/plain` variant. Paginates across Gutendex pages automatically.
 - GitHub connector resolves default branch via `/repos/{owner}/{repo}`, walks full tree via `/git/trees/{branch}?recursive=1`, fetches each text/code file via `/contents/{path}` and base64-decodes the response. Binary extensions are skipped via heuristic list.
@@ -55,4 +74,3 @@ Initial public baseline for TALOS on P-LMv1 with local skill JIT, GLM toolserver
 ### Validation
 - `go test ./cmd/... ./pkg/...`
 - `go run ./cmd/benchmark talos-audit --create-skill=false --admin-writes=false --require-preflight=false`
-

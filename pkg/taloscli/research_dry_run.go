@@ -24,6 +24,10 @@ func renderResearchDryRunPlan(mode, query string, ctx researchExecutionContext) 
 
 	var b strings.Builder
 	b.WriteString("TALOS RESEARCH DRY RUN\n\n")
+	b.WriteString("COMMAND\n")
+	b.WriteString("  talos research " + strings.ToLower(strings.TrimSpace(mode)) + "\n\n")
+	b.WriteString("STATUS\n")
+	b.WriteString("  SKIPPED\n\n")
 	b.WriteString("MODE\n")
 	b.WriteString("  " + strings.ToUpper(mode) + "\n\n")
 	b.WriteString("QUERY\n")

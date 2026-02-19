@@ -223,15 +223,34 @@ func resolveResearchArtifactID(sel string) (string, error) {
 func renderResearchSessions(records []ResearchSessionRecord, corrupt int, last int) string {
 	var b strings.Builder
 	b.WriteString("TALOS RESEARCH SESSIONS\n\n")
+	b.WriteString("COMMAND\n")
+	b.WriteString("  talos research sessions\n\n")
 	b.WriteString("WINDOW\n")
 	b.WriteString(fmt.Sprintf("  requested_last: %d\n", last))
 	b.WriteString(fmt.Sprintf("  returned_sessions: %d\n", len(records)))
 	b.WriteString(fmt.Sprintf("  corrupt_records_skipped: %d\n\n", corrupt))
 	if len(records) == 0 {
+		b.WriteString("STATUS\n")
+		b.WriteString("  SUCCESS\n\n")
 		b.WriteString("SESSIONS\n")
 		b.WriteString("  No research sessions recorded yet.\n")
+		b.WriteString("\nNEXT\n")
+		b.WriteString("  Run: talos research run <query>\n")
 		return b.String()
 	}
+	status := "SUCCESS"
+	for _, rec := range records {
+		switch strings.ToUpper(strings.TrimSpace(rec.Status)) {
+		case "FAILED":
+			status = "FAILED"
+		case "PARTIAL":
+			if status != "FAILED" {
+				status = "PARTIAL"
+			}
+		}
+	}
+	b.WriteString("STATUS\n")
+	b.WriteString("  " + status + "\n\n")
 	b.WriteString("SESSIONS\n")
 	for i, rec := range records {
 		b.WriteString(fmt.Sprintf("  %d) %s | %s | %s\n", i+1, rec.StartedAt, strings.ToUpper(rec.Status), strings.ToUpper(rec.Mode)))
@@ -251,5 +270,7 @@ func renderResearchSessions(records []ResearchSessionRecord, corrupt int, last i
 			b.WriteString(fmt.Sprintf("     error: %s\n", rec.Error))
 		}
 	}
+	b.WriteString("\nNEXT\n")
+	b.WriteString("  Use --last to narrow session history or inspect artifact paths for follow-up.\n")
 	return b.String()
 }
