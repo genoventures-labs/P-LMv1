@@ -5,7 +5,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Thynaptic/P-LMv1/pkg/cognition"
 	"github.com/Thynaptic/P-LMv1/pkg/memory"
+	"github.com/Thynaptic/P-LMv1/pkg/orchestration"
 	"github.com/Thynaptic/P-LMv1/pkg/router"
 	"github.com/Thynaptic/P-LMv1/pkg/state"
 	"github.com/Thynaptic/P-LMv1/pkg/tools"
@@ -19,6 +21,7 @@ type researchRuntime struct {
 	tc              *tools.GLMToolClient
 	modelCandidates []string
 	reindexer       *memory.Reindexer
+	sm              *state.Manager
 }
 
 type researchFinding struct {
@@ -165,8 +168,105 @@ func executeResearchMode(mode, query string, ctx researchExecutionContext) (rese
 		return researchReport{}, "", err
 	}
 	defer rt.Close()
+	env, proceed, clarification := preprocessUserIntent(query, rt.sm, rt.mm, "research")
+	if !proceed {
+		return researchReport{}, "", fmt.Errorf("clarification needed: %s", clarification)
+	}
+	if strings.TrimSpace(env.Normalized) != "" {
+		query = strings.TrimSpace(env.Normalized)
+	}
+	if len(env.CommandHints) > 0 {
+		fmt.Printf("DEBUG: Research intent hints: %s\n", strings.Join(env.CommandHints, ","))
+	}
+	modulation := cognition.BuildReasoningModulation(rt.sm, query, mode)
+	styleProfile := cognition.ResolveStyleProfile(rt.sm, rt.mm, query, mode)
+	styleContract := ""
+	if cognition.StyleV2Enabled() {
+		styleContract = cognition.BuildStylePromptContract(styleProfile)
+	}
+	fmt.Printf("DEBUG: Research modulation entropy=%s load=%.2f persistence=%.2f density=%.2f branches=%d sections=%d\n",
+		modulation.Entropy.Mode,
+		modulation.EmotionPressure,
+		modulation.GoalPersistence,
+		modulation.DensityScale,
+		modulation.BranchBudget,
+		modulation.SectionBudget,
+	)
+	if strings.TrimSpace(modulation.PredictiveIntervention) != "" {
+		fmt.Printf("DEBUG: Research predictive intervention=%s trend=%.2f volatility=%.2f\n",
+			modulation.PredictiveIntervention,
+			modulation.EmotionTrend,
+			modulation.EmotionVolatility,
+		)
+	}
 
 	if mode == "run" {
+		fmt.Println("Phase: Planning")
+		planMaxSteps := 3
+		if researchRunMaxResearchLoops > 0 && researchRunMaxResearchLoops < planMaxSteps {
+			planMaxSteps = researchRunMaxResearchLoops
+		}
+		planMaxSteps = clampIntBudget(int(float64(planMaxSteps)*modulation.DensityScale), 1, 6)
+		if modulation.BranchBudget > 0 && planMaxSteps > modulation.BranchBudget {
+			planMaxSteps = modulation.BranchBudget
+		}
+		researchLoops := clampIntBudget(int(float64(researchRunMaxResearchLoops)*modulation.DensityScale), 1, 24)
+		if modulation.SectionBudget > 0 && researchLoops > modulation.SectionBudget {
+			researchLoops = modulation.SectionBudget
+		}
+		plannerInput := "User query:\n" + query +
+			fmt.Sprintf("\n\nRun-mode budget:\n- crawl_depth=%d\n- max_pages=%d\n- max_research_loops=%d\n", researchRunCrawlDepth, researchRunMaxPages, researchLoops)
+		if len(researchRunSeedURLs) > 0 {
+			plannerInput += "\nSeed URLs:\n- " + strings.Join(researchRunSeedURLs, "\n- ")
+		}
+
+		plannerTimeout := boundedStageTimeout(researchRunTimeout/4, 20*time.Second, 45*time.Second)
+		plannerResp, _, plannerErr := runAgentLoopWithTimeout(
+			rt.client,
+			rt.tc,
+			rt.modelCandidates,
+			plannerSystemPrompt(),
+			plannerInput,
+			1,
+			false,
+			query,
+			"plan",
+			0,
+			plannerTimeout,
+		)
+		planSteps := []string{query}
+		if plannerErr == nil {
+			plannerResp, reflectionNotes := applyReflectionGate(
+				rt.client,
+				rt.modelCandidates,
+				cognition.StageResearchPlan,
+				query,
+				plannerResp,
+				nil,
+				nil,
+				rt.sm,
+			)
+			for _, note := range reflectionNotes {
+				fmt.Println(note)
+			}
+			autoDecomposed := false
+			planSteps, autoDecomposed = parsePlanStepsV2(plannerResp, query, planMaxSteps)
+			if len(planSteps) == 0 {
+				planSteps = []string{query}
+			}
+			if autoDecomposed {
+				fmt.Println("Goal Decomposition v2: recursive task tree expanded automatically.")
+			}
+			fmt.Printf("Planning complete: %d step(s).\n", len(planSteps))
+			fmt.Println("Planner outline:")
+			for i, step := range planSteps {
+				fmt.Printf("  %d. %s\n", i+1, summarizePlanStep(step, 160))
+			}
+		} else {
+			fmt.Printf("Planning warning: %v\n", plannerErr)
+			fmt.Println("Planner fallback: using a single direct research step.")
+		}
+
 		fmt.Println("Phase: Discovery")
 		if researchRunVerbose {
 			fmt.Printf("Profile: run (crawl-depth=%d, max-pages=%d, loops=%d, timeout=%s)\n", researchRunCrawlDepth, researchRunMaxPages, researchRunMaxResearchLoops, researchRunTimeout)
@@ -187,13 +287,18 @@ func executeResearchMode(mode, query string, ctx researchExecutionContext) (rese
 		system := `You are TALOS Research Operator.
 Objective: produce a high-signal factual research result.
 Workflow:
-1) Start with web discovery unless explicit seed URLs are provided.
-2) Use tools when needed: web_search, fetch_url, http_request, vector_retrieve.
-3) Keep breadth/depth bounded by the provided research budget.
-4) Return concise findings with explicit source URLs whenever available.
+1) Follow the provided plan steps in order; keep execution focused.
+2) Start with web discovery unless explicit seed URLs are provided.
+3) Use tools when needed: web_search, fetch_url, http_request, vector_retrieve.
+4) Keep breadth/depth bounded by the provided research budget.
+5) Return concise findings and cite all available sources (URLs, local paths/docs, hf refs).
 Return plain text only.`
+		if strings.TrimSpace(styleContract) != "" {
+			system += "\n\n" + styleContract
+		}
 		user := "Research query:\n" + query +
-			fmt.Sprintf("\n\nBudget:\n- crawl_depth=%d\n- max_pages=%d\n- max_research_loops=%d\n", researchRunCrawlDepth, researchRunMaxPages, researchRunMaxResearchLoops)
+			fmt.Sprintf("\n\nBudget:\n- crawl_depth=%d\n- max_pages=%d\n- max_research_loops=%d\n", researchRunCrawlDepth, researchRunMaxPages, researchLoops)
+		user += "\nPlan steps:\n- " + strings.Join(planSteps, "\n- ")
 		if len(researchRunSeedURLs) > 0 {
 			user += "\nSeed URLs:\n- " + strings.Join(researchRunSeedURLs, "\n- ")
 		}
@@ -204,7 +309,7 @@ Return plain text only.`
 			rt.modelCandidates,
 			system,
 			user,
-			researchRunMaxResearchLoops,
+			researchLoops,
 			true,
 			query,
 			"research",
@@ -219,11 +324,56 @@ Return plain text only.`
 			}
 			return report, rec.SessionID, runErr
 		}
+		discoverySources := extractSourceRefs(strings.Join(toolLogs, "\n") + "\n" + resp)
+		resp, discoveryNotes := applyReflectionGate(
+			rt.client,
+			rt.modelCandidates,
+			cognition.StageResearchDiscover,
+			query,
+			resp,
+			discoverySources,
+			nil,
+			rt.sm,
+		)
+		for _, note := range discoveryNotes {
+			fmt.Println(note)
+		}
 
 		fmt.Println("Phase: Synthesis")
-		sourceList := uniqueStrings(extractURLs(strings.Join(toolLogs, "\n") + "\n" + resp))
-		findings := buildFindings(resp, sourceList)
-		report := buildResearchReport("run", query, sanitizeModelOutput(resp), findings, sourceList, toolLogs)
+		finalAnswer := resp
+		var routeNotes []string
+		if shouldUseResearchDocumentRouting(query, rt.mm) {
+			if routed, notes := runResearchDocumentRouting(rt, query); strings.TrimSpace(routed) != "" {
+				finalAnswer = routed
+				routeNotes = notes
+			}
+		}
+		sourceList := extractSourceRefs(strings.Join(toolLogs, "\n") + "\n" + finalAnswer + "\n" + strings.Join(routeNotes, "\n"))
+		finalAnswer, reflectionNotes := applyReflectionGate(
+			rt.client,
+			rt.modelCandidates,
+			cognition.StageResearchSynthesis,
+			query,
+			finalAnswer,
+			sourceList,
+			nil,
+			rt.sm,
+		)
+		if len(reflectionNotes) > 0 {
+			routeNotes = append(routeNotes, reflectionNotes...)
+			for _, note := range reflectionNotes {
+				fmt.Println(note)
+			}
+		}
+		finalAnswer, supNotes := applyResearchSymbolicSupervision(rt.sm, query, finalAnswer, sourceList)
+		if len(supNotes) > 0 {
+			routeNotes = append(routeNotes, supNotes...)
+		}
+		findings := buildFindings(finalAnswer, sourceList)
+		report := buildResearchReport("run", query, sanitizeModelOutput(finalAnswer), findings, sourceList, toolLogs)
+		if len(routeNotes) > 0 {
+			report.EvidenceNotes = append(report.EvidenceNotes, routeNotes...)
+		}
 		rec, persistErr := persistResearchSession(query, "run", report, "SUCCESS", "", len(toolLogs), ctx)
 		if persistErr != nil {
 			fmt.Printf("Warning: Failed to write research session log: %v\n", persistErr)
@@ -241,9 +391,17 @@ Return plain text only.`
 	originalLoops := maMaxResearchLoops
 	originalChatTimeout := maChatTimeout
 	originalFirstTokenTimeout := maFirstTokenTimeout
+	deepPlanSteps := clampIntBudget(int(float64(researchDeepMaxPlanSteps)*modulation.DensityScale), 2, 16)
+	deepLoops := clampIntBudget(int(float64(researchDeepMaxResearchLoops)*modulation.DensityScale), 1, 32)
+	if modulation.BranchBudget > 0 && deepPlanSteps > modulation.BranchBudget+2 {
+		deepPlanSteps = modulation.BranchBudget + 2
+	}
+	if modulation.SectionBudget > 0 && deepLoops > modulation.SectionBudget {
+		deepLoops = modulation.SectionBudget
+	}
 	maVerbose = researchDeepVerbose
-	maMaxPlanSteps = researchDeepMaxPlanSteps
-	maMaxResearchLoops = researchDeepMaxResearchLoops
+	maMaxPlanSteps = deepPlanSteps
+	maMaxResearchLoops = deepLoops
 	maChatTimeout = researchDeepTimeout
 	maFirstTokenTimeout = maxDuration(25*time.Second, researchDeepTimeout/3)
 	defer func() {
@@ -258,7 +416,10 @@ Return plain text only.`
 	if len(researchDeepSeedURLs) > 0 {
 		seedHint = "\n\nSeed URLs:\n- " + strings.Join(researchDeepSeedURLs, "\n- ")
 	}
-	deepQuery := query + fmt.Sprintf("\n\nDeep research budget: crawl_depth=%d, max_pages=%d.%s", researchDeepCrawlDepth, researchDeepMaxPages, seedHint)
+	deepQuery := query + fmt.Sprintf("\n\nDeep research budget: crawl_depth=%d, max_pages=%d, plan_steps=%d, research_loops=%d.%s", researchDeepCrawlDepth, researchDeepMaxPages, deepPlanSteps, deepLoops, seedHint)
+	if strings.TrimSpace(styleContract) != "" {
+		deepQuery += "\n\n" + styleContract
+	}
 
 	fmt.Println("Phase: Research")
 	answer, refs, deepErr := runMultiAgentPipeline(rt.client, rt.mm, rt.tc, rt.modelCandidates, deepQuery)
@@ -273,8 +434,45 @@ Return plain text only.`
 	}
 
 	fmt.Println("Phase: Synthesis")
-	findings := buildFindings(answer, refs)
-	report := buildResearchReport("deep", query, sanitizeModelOutput(answer), findings, refs, nil)
+	finalAnswer := answer
+	var routeNotes []string
+	if shouldUseResearchDocumentRouting(query, rt.mm) {
+		if routed, notes := runResearchDocumentRouting(rt, query); strings.TrimSpace(routed) != "" {
+			finalAnswer = routed
+			routeNotes = notes
+			for _, n := range notes {
+				for _, src := range extractSourceRefs(n) {
+					refs = append(refs, src)
+				}
+			}
+			refs = uniqueStrings(refs)
+		}
+	}
+	finalAnswer, reflectionNotes := applyReflectionGate(
+		rt.client,
+		rt.modelCandidates,
+		cognition.StageResearchSynthesis,
+		query,
+		finalAnswer,
+		refs,
+		nil,
+		rt.sm,
+	)
+	if len(reflectionNotes) > 0 {
+		routeNotes = append(routeNotes, reflectionNotes...)
+		for _, note := range reflectionNotes {
+			fmt.Println(note)
+		}
+	}
+	finalAnswer, supNotes := applyResearchSymbolicSupervision(rt.sm, query, finalAnswer, refs)
+	if len(supNotes) > 0 {
+		routeNotes = append(routeNotes, supNotes...)
+	}
+	findings := buildFindings(finalAnswer, refs)
+	report := buildResearchReport("deep", query, sanitizeModelOutput(finalAnswer), findings, refs, nil)
+	if len(routeNotes) > 0 {
+		report.EvidenceNotes = append(report.EvidenceNotes, routeNotes...)
+	}
 	rec, persistErr := persistResearchSession(query, "deep", report, "SUCCESS", "", 0, ctx)
 	if persistErr != nil {
 		fmt.Printf("Warning: Failed to write research session log: %v\n", persistErr)
@@ -308,8 +506,10 @@ func initResearchRuntime(query string) (*researchRuntime, error) {
 	}
 	sm, err := state.NewManager()
 	if err == nil {
-		sm.SetPrimaryGoal(query)
-		_ = sm.Save()
+		_, note := applyPersistentGoalLock(sm, query, "research")
+		if strings.TrimSpace(note) != "" {
+			fmt.Printf("DEBUG: %s\n", strings.TrimSpace(note))
+		}
 	}
 	reindexer := memory.NewReindexer(mm, sm)
 	reindexer.Start()
@@ -324,6 +524,7 @@ func initResearchRuntime(query string) (*researchRuntime, error) {
 		tc:              tc,
 		modelCandidates: modelCandidates,
 		reindexer:       reindexer,
+		sm:              sm,
 	}, nil
 }
 
@@ -378,7 +579,7 @@ func buildResearchReport(mode, query, summary string, findings []researchFinding
 		report.Risks = append(report.Risks, "No high-confidence findings were produced by the research pipeline.")
 	}
 	if len(sources) == 0 {
-		report.Risks = append(report.Risks, "No external sources were captured; findings should be treated as unverified.")
+		report.Risks = append(report.Risks, "No sources were captured; findings should be treated as unverified.")
 	}
 	for _, f := range findings {
 		if !f.Verified || len(f.Refs) == 0 {
@@ -399,6 +600,36 @@ func buildResearchReport(mode, query, summary string, findings []researchFinding
 		report.NextActions = append([]string{"Run targeted follow-up research for unresolved contradictions or weak citations."}, report.NextActions...)
 	}
 	return report
+}
+
+func applyResearchSymbolicSupervision(sm *state.Manager, query, answer string, sources []string) (string, []string) {
+	answer = strings.TrimSpace(answer)
+	if answer == "" {
+		return answer, nil
+	}
+	snapshot := state.SessionState{}
+	if sm != nil {
+		snapshot = sm.GetSnapshot()
+	}
+	decision, _ := cognition.RunSymbolicSupervision(cognition.SupervisionInput{
+		Stage:      cognition.StageResearchFinding,
+		Query:      query,
+		Candidate:  answer,
+		Session:    snapshot,
+		SourceRefs: sources,
+	}, cognition.DefaultSupervisionPolicy("balanced"))
+	if decision.Outcome == cognition.SupervisionHardVeto {
+		note := "Symbolic supervision hard-vetoed one or more findings; output downgraded to conservative mode."
+		reason := strings.Join(decision.Violations, "; ")
+		if strings.TrimSpace(reason) != "" {
+			note += " Reason: " + reason
+		}
+		return "Symbolic supervision flagged this synthesis as high-risk. Re-run with stronger evidence or additional sources.", []string{note}
+	}
+	if decision.Outcome == cognition.SupervisionSoftWarn && len(decision.Violations) > 0 {
+		return answer, []string{"Symbolic supervision warning: " + strings.Join(decision.Violations, "; ")}
+	}
+	return answer, nil
 }
 
 func renderResearchReport(r researchReport) string {
@@ -471,6 +702,87 @@ func maxDuration(a, b time.Duration) time.Duration {
 		return a
 	}
 	return b
+}
+
+func shouldUseResearchDocumentRouting(query string, mm *memory.MemoryManager) bool {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"architecture", "project structure", "codebase", "documents", "files",
+		"technical guide", "readme", "across docs", "cross-link", "map",
+		"summarize all", "summarise all", "multi-topic", "compare sections",
+		"research", "evidence",
+	} {
+		if strings.Contains(q, marker) {
+			return true
+		}
+	}
+	if strings.Count(q, " and ") >= 2 || strings.Count(q, ",") >= 3 {
+		return true
+	}
+	if mm != nil && mm.KnowledgeCount() >= 30 && len(q) > 70 {
+		return true
+	}
+	return false
+}
+
+func runResearchDocumentRouting(rt *researchRuntime, query string) (string, []string) {
+	if rt == nil || rt.mm == nil {
+		return "", nil
+	}
+	orch := orchestration.DocumentOrchestrator{
+		Memory: rt.mm,
+		Client: rt.client,
+	}
+	synth, err := orch.Orchestrate(query, rt.modelCandidates, 32)
+	if err != nil || strings.TrimSpace(synth.StructuredAnswer) == "" {
+		return "", nil
+	}
+	notes := []string{
+		fmt.Sprintf("Document routing selected %d source group(s) from %d candidate segment(s).", len(synth.RouteReport.SelectedDocs), synth.RouteReport.CandidateSegments),
+	}
+	for _, line := range orchestration.CompactRouteReportLines(synth.RouteReport, 5) {
+		notes = append(notes, line)
+	}
+	for _, line := range orchestration.CompactHierarchySummaryLines(synth.HierarchyReport, synth.SectionMaps, 5) {
+		notes = append(notes, "Hierarchy: "+line)
+	}
+	for _, line := range orchestration.CompactSectionCrossLinkLines(synth.SectionCrossLinks, 5) {
+		notes = append(notes, "SectionLink: "+line)
+	}
+	if synth.ReasoningReport.Triggered || len(synth.ReasoningReport.Notes) > 0 {
+		notes = append(notes, fmt.Sprintf(
+			"LongForm: triggered=%t passes=%d coverage=%.2f fallback=%t unsupported_claims=%d",
+			synth.ReasoningReport.Triggered,
+			synth.ReasoningReport.PassesRun,
+			synth.ReasoningReport.CitationCoverage,
+			synth.ReasoningReport.FallbackUsed,
+			synth.ReasoningReport.UnsupportedClaims,
+		))
+		for _, note := range synth.ReasoningReport.Notes {
+			notes = append(notes, "LongForm: "+strings.TrimSpace(note))
+		}
+		rec := orchestration.DecisionRecord{
+			Query:      strings.TrimSpace(query),
+			Source:     "longform_sections",
+			ChosenPath: "hierarchical_longform",
+			Reasoning: fmt.Sprintf(
+				"triggered=%t passes=%d coverage=%.2f fallback=%t unsupported=%d",
+				synth.ReasoningReport.Triggered,
+				synth.ReasoningReport.PassesRun,
+				synth.ReasoningReport.CitationCoverage,
+				synth.ReasoningReport.FallbackUsed,
+				synth.ReasoningReport.UnsupportedClaims,
+			),
+			Confidence: synth.ReasoningReport.CitationCoverage,
+		}
+		if err := orchestration.AppendDecisionFeed("", rec); err != nil {
+			notes = append(notes, "LongForm: archive feed write failed: "+err.Error())
+		}
+	}
+	return strings.TrimSpace(synth.StructuredAnswer), notes
 }
 
 func init() {

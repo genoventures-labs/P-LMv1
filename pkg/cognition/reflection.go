@@ -1,9 +1,8 @@
 package cognition
 
 import (
-	"encoding/json"
-	"os"
-	"path/filepath"
+	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -13,10 +12,57 @@ import (
 )
 
 const (
-	defaultReflectionLogPath = ".memory/reflection_log.json"
+	defaultReflectionLogPath = defaultReflectionAuditPath
 	driftThreshold           = 0.40
 	highDriftThreshold       = 0.25
 )
+
+type ReflectionStage string
+
+const (
+	StageChatGraph         ReflectionStage = "chat_graph"
+	StageResearchPlan      ReflectionStage = "research_plan"
+	StageResearchDiscover  ReflectionStage = "research_discovery"
+	StageResearchSynthesis ReflectionStage = "research_synthesis"
+	StageMAPlan            ReflectionStage = "multi_agent_plan"
+	StageMAResearch        ReflectionStage = "multi_agent_research"
+	StageMAVerify          ReflectionStage = "multi_agent_verify"
+	StageMASynthesize      ReflectionStage = "multi_agent_synthesize"
+)
+
+type ReflectionOutcome string
+
+const (
+	ReflectionPass  ReflectionOutcome = "pass"
+	ReflectionWarn  ReflectionOutcome = "warn"
+	ReflectionSteer ReflectionOutcome = "steer"
+	ReflectionVeto  ReflectionOutcome = "veto"
+)
+
+type ReflectionInput struct {
+	Stage        ReflectionStage
+	NodeID       string
+	Step         int
+	Goal         string
+	Query        string
+	Candidate    string
+	SourceRefs   []string
+	ContextFacts []string
+	ShellFacts   []string
+	Session      state.SessionState
+	Metadata     map[string]string
+}
+
+type ReflectionDecision struct {
+	Outcome         ReflectionOutcome
+	RiskScore       float64
+	RelevanceScore  float64
+	Violations      []string
+	NeedsCorrection bool
+	CorrectionHint  string
+	AuditID         string
+	CacheHit        bool
+}
 
 // NodeOutputEvent is emitted by ThoughtGraph nodes for concurrent supervision.
 type NodeOutputEvent struct {
@@ -189,83 +235,61 @@ func (r *ReflectionLayer) evaluateEvent(ev NodeOutputEvent) {
 	if pred != nil {
 		pred.EvaluateAsync(ev.NodeID)
 	}
-	if strings.TrimSpace(ev.Output) != "" {
-		session := state.SessionState{}
-		if r.sm != nil {
-			session = r.sm.GetSnapshot()
-		}
-		shellFacts := CollectLiveShellFacts(mm, ev.Output, 10)
-		symbolic := CheckSymbolicAssertions(ev.Output, session, shellFacts)
-		if symbolic.Veto {
-			reason := "symbolic veto: " + symbolic.Violations[0]
-			sig := SteerSignal{
-				NodeID:    ev.NodeID,
-				Step:      ev.Step,
-				Goal:      r.currentGoal(),
-				Relevance: 0,
-				Reason:    reason,
-				Timestamp: time.Now().UTC(),
-			}
-			if r.sm != nil {
-				r.sm.UpdateDelta(map[string]float64{
-					"AnalyticalMode": 0.18,
-					"Frustration":    0.10,
-				})
-				_ = r.sm.Save()
-			}
-			r.appendLog(reflectionLogEntry{
-				Timestamp:     sig.Timestamp,
-				NodeID:        ev.NodeID,
-				Step:          ev.Step,
-				Goal:          sig.Goal,
-				Relevance:     0,
-				Reason:        reason,
-				OutputPreview: truncate(strings.TrimSpace(ev.Output), 320),
-			})
-			select {
-			case r.steerCh <- sig:
-			default:
-				select {
-				case <-r.steerCh:
-				default:
-				}
-				select {
-				case r.steerCh <- sig:
-				default:
-				}
-			}
-			return
-		}
-	}
-
 	goal := r.currentGoal()
-	if goal == "" {
+	if goal == "" || strings.TrimSpace(ev.Output) == "" {
 		return
 	}
-	relevance := relevanceScore(goal, ev.Output)
-	if relevance >= driftThreshold {
+	session := state.SessionState{}
+	if r.sm != nil {
+		session = r.sm.GetSnapshot()
+	}
+	shellFacts := CollectLiveShellFacts(mm, ev.Output, 10)
+	policy := DefaultReflectionPolicy("balanced")
+	decision, err := RunReflectionV2(ReflectionInput{
+		Stage:      StageChatGraph,
+		NodeID:     ev.NodeID,
+		Step:       ev.Step,
+		Goal:       goal,
+		Query:      goal,
+		Candidate:  ev.Output,
+		Session:    session,
+		ShellFacts: shellFacts,
+		Metadata: map[string]string{
+			"next_node": strings.TrimSpace(ev.NextNode),
+		},
+	}, policy)
+	if err != nil || decision.Outcome == ReflectionPass {
+		return
+	}
+	if policy.StatusEnabled {
+		fmt.Printf("REFLECTION %s step=%d outcome=%s risk=%.2f\n", StageChatGraph, ev.Step, decision.Outcome, decision.RiskScore)
+	}
+	reason := strings.Join(decision.Violations, "; ")
+	if strings.TrimSpace(reason) == "" {
+		reason = "reflection intervention"
+	}
+	relevance := decision.RelevanceScore
+
+	if decision.Outcome == ReflectionWarn {
+		r.appendLog(reflectionLogEntry{
+			Timestamp:     time.Now().UTC(),
+			NodeID:        ev.NodeID,
+			Step:          ev.Step,
+			Goal:          goal,
+			Relevance:     relevance,
+			Reason:        reason,
+			OutputPreview: truncate(strings.TrimSpace(ev.Output), 320),
+		})
 		return
 	}
 
-	reason := "goal drift detected"
-	if relevance < highDriftThreshold {
-		reason = "severe goal drift detected"
-	}
-	sig := SteerSignal{
-		NodeID:    ev.NodeID,
-		Step:      ev.Step,
-		Goal:      goal,
-		Relevance: relevance,
-		Reason:    reason,
-		Timestamp: time.Now().UTC(),
-	}
-
+	sig := SteerSignal{NodeID: ev.NodeID, Step: ev.Step, Goal: goal, Relevance: relevance, Reason: reason, Timestamp: time.Now().UTC()}
 	if r.sm != nil {
 		delta := map[string]float64{
 			"AnalyticalMode": 0.08,
 			"Frustration":    0.05,
 		}
-		if relevance < highDriftThreshold {
+		if decision.Outcome == ReflectionVeto || relevance < highDriftThreshold {
 			delta["AnalyticalMode"] = 0.14
 			delta["Frustration"] = 0.10
 		}
@@ -311,30 +335,155 @@ func (r *ReflectionLayer) currentGoal() string {
 }
 
 func (r *ReflectionLayer) appendLog(entry reflectionLogEntry) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
+	r.mu.RLock()
 	path := r.logPath
-	if path == "" {
-		path = defaultReflectionLogPath
+	r.mu.RUnlock()
+	appendReflectionAudit(path, reflectionAuditEntry{
+		Timestamp:       entry.Timestamp,
+		Stage:           StageChatGraph,
+		NodeID:          entry.NodeID,
+		Step:            entry.Step,
+		Outcome:         ReflectionSteer,
+		RiskScore:       clamp01(1 - entry.Relevance),
+		RelevanceScore:  entry.Relevance,
+		Violations:      []string{entry.Reason},
+		NeedsCorrection: false,
+	})
+}
+
+var citationRefPattern = regexp.MustCompile(`\[[0-9]+\]`)
+
+// RunReflectionV2 performs deterministic reflection checks and returns a stage-aware decision.
+func RunReflectionV2(in ReflectionInput, policy ReflectionPolicy) (ReflectionDecision, error) {
+	if !policy.Enabled {
+		return ReflectionDecision{Outcome: ReflectionPass}, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return
+	key := reflectionCacheKey(in, policy)
+	if cached, ok := globalReflectionCache.get(key); ok {
+		cached.CacheHit = true
+		return cached, nil
+	}
+	candidate := strings.TrimSpace(in.Candidate)
+	if candidate == "" {
+		return ReflectionDecision{}, fmt.Errorf("reflection candidate is empty")
+	}
+	goal := strings.TrimSpace(in.Goal)
+	if goal == "" {
+		goal = strings.TrimSpace(in.Query)
 	}
 
-	var existing []reflectionLogEntry
-	if b, err := os.ReadFile(path); err == nil && len(b) > 0 {
-		_ = json.Unmarshal(b, &existing)
+	violations := make([]string, 0, 4)
+	relevance := 1.0
+	risk := 0.0
+	if strings.TrimSpace(goal) != "" {
+		relevance = relevanceScore(goal, candidate)
+		if relevance < driftThreshold {
+			driftRisk := clamp01((driftThreshold - relevance) / maxFloat(driftThreshold, 0.01))
+			risk += driftRisk * 0.55
+			if relevance < highDriftThreshold {
+				violations = append(violations, "severe goal drift")
+			} else {
+				violations = append(violations, "goal drift")
+			}
+		}
 	}
-	existing = append(existing, entry)
-	if len(existing) > 2000 {
-		existing = existing[len(existing)-2000:]
+
+	contradictionPeak := 0.0
+	for _, fact := range in.ContextFacts {
+		score := DetectContradiction(candidate, fact)
+		if score > contradictionPeak {
+			contradictionPeak = score
+		}
 	}
-	data, err := json.MarshalIndent(existing, "", "  ")
-	if err != nil {
-		return
+	if contradictionPeak >= 0.72 {
+		risk += clamp01(contradictionPeak) * 0.35
+		violations = append(violations, fmt.Sprintf("contradiction risk %.2f", contradictionPeak))
 	}
-	_ = os.WriteFile(path, data, 0o644)
+
+	symbolic := CheckSymbolicAssertions(candidate, in.Session, in.ShellFacts)
+	if symbolic.Veto && len(symbolic.Violations) > 0 {
+		risk += 0.70
+		violations = append(violations, "symbolic veto: "+symbolic.Violations[0])
+	}
+
+	if policy.CitationGate && stageRequiresCitations(in.Stage) && len(in.SourceRefs) > 0 && !hasCitationMarker(candidate) {
+		risk += 0.45
+		violations = append(violations, "missing citation markers while sources are available")
+	}
+	risk = clamp01(risk)
+
+	outcome := ReflectionPass
+	switch {
+	case risk >= policy.VetoThreshold:
+		outcome = ReflectionVeto
+	case risk >= policy.SteerThreshold:
+		outcome = ReflectionSteer
+	case risk >= policy.WarnThreshold:
+		outcome = ReflectionWarn
+	}
+	if policy.EnforcementMode == "advisory" && (outcome == ReflectionSteer || outcome == ReflectionVeto) {
+		outcome = ReflectionWarn
+	}
+	if policy.EnforcementMode == "hard" && outcome == ReflectionWarn {
+		outcome = ReflectionSteer
+	}
+	decision := ReflectionDecision{
+		Outcome:         outcome,
+		RiskScore:       risk,
+		RelevanceScore:  relevance,
+		Violations:      uniqueReflectionStrings(violations),
+		NeedsCorrection: outcome == ReflectionWarn || outcome == ReflectionSteer || outcome == ReflectionVeto,
+		CorrectionHint:  "realign to goal, remove contradictions, preserve concise factual output",
+		AuditID:         reflectionAuditID(in.Stage, in.Step, in.NodeID),
+	}
+	appendReflectionAudit(policy.AuditLogPath, reflectionAuditEntry{
+		Timestamp:       time.Now().UTC(),
+		Stage:           in.Stage,
+		NodeID:          strings.TrimSpace(in.NodeID),
+		Step:            in.Step,
+		Outcome:         decision.Outcome,
+		RiskScore:       decision.RiskScore,
+		RelevanceScore:  decision.RelevanceScore,
+		Violations:      decision.Violations,
+		NeedsCorrection: decision.NeedsCorrection,
+		AuditID:         decision.AuditID,
+	})
+	globalReflectionCache.set(key, decision)
+	return decision, nil
+}
+
+func stageRequiresCitations(stage ReflectionStage) bool {
+	switch stage {
+	case StageResearchSynthesis, StageMAResearch, StageMAVerify, StageMASynthesize:
+		return true
+	default:
+		return false
+	}
+}
+
+func hasCitationMarker(s string) bool {
+	return citationRefPattern.MatchString(strings.TrimSpace(s))
+}
+
+func maxFloat(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func uniqueReflectionStrings(in []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		v = strings.TrimSpace(v)
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
 }
 
 func relevanceScore(goal, output string) float64 {

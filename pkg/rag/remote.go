@@ -39,6 +39,9 @@ var (
 type RemoteIndexOptions struct {
 	MaxChunkChars       int
 	ChunkOverlap        int
+	GenerateChunkTitles bool
+	ChunkTitleMaxChars  int
+	ChunkTitleModel     string
 	Timeout             time.Duration
 	MaxBytes            int64
 	Crawl               bool
@@ -58,6 +61,7 @@ type RemoteIndexOptions struct {
 	URLSafetyAPIKey     string
 	URLSafetyBaseURL    string
 	OnEvent             func(RemoteEvent)
+	OnSourceIndexed     func(SourceIndexedEvent)
 	HTTPClient          *http.Client
 }
 
@@ -98,6 +102,9 @@ func DefaultRemoteIndexOptions() RemoteIndexOptions {
 	return RemoteIndexOptions{
 		MaxChunkChars:       DefaultIndexOptions().MaxChunkChars,
 		ChunkOverlap:        DefaultIndexOptions().ChunkOverlap,
+		GenerateChunkTitles: true,
+		ChunkTitleMaxChars:  96,
+		ChunkTitleModel:     "",
 		Timeout:             defaultRemoteTimeout,
 		MaxBytes:            defaultRemoteMaxBytes,
 		CrawlDepth:          defaultCrawlDepth,
@@ -234,19 +241,38 @@ func IndexURLs(mm *memory.MemoryManager, seedURLs []string, opts RemoteIndexOpti
 				emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "empty", ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
 			} else {
 				if err := addRemoteChunks(mm, chunks, map[string]string{
-					"type":         "knowledge",
-					"source_type":  "url",
-					"source_url":   item.URL,
-					"source_host":  host,
-					"content_type": contentType,
-					"crawl_depth":  strconv.Itoa(item.Depth),
-				}); err != nil {
+					"type":          "knowledge",
+					"source_type":   "url",
+					"source_url":    item.URL,
+					"source_host":   host,
+					"topology_node": item.URL,
+					"content_type":  contentType,
+					"crawl_depth":   strconv.Itoa(item.Depth),
+				}, opts); err != nil {
 					stats.IndexErrors++
 					emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "index-error", Detail: err.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
 				} else {
 					stats.ItemsIndexed++
 					stats.ChunksIndexed += len(chunks)
+					_ = mm.UpsertTopologySource(memory.SourceFingerprint{
+						SourceType: "url",
+						SourceRef:  item.URL,
+						SourceURL:  item.URL,
+						SourceHost: host,
+						Content:    text,
+					})
 					emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "indexed", Detail: fmt.Sprintf("%d chunks", len(chunks)), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+					emitRemoteSourceIndexed(opts, SourceIndexedEvent{
+						SourceType: "url",
+						SourceRef:  item.URL,
+						Content:    text,
+						ChunkCount: len(chunks),
+						Metadata: map[string]string{
+							"source_type": "url",
+							"source_url":  item.URL,
+							"source_host": host,
+						},
+					})
 				}
 			}
 		}
@@ -355,23 +381,42 @@ func IndexHFDatasets(mm *memory.MemoryManager, specs []HFSpec, opts RemoteIndexO
 				continue
 			}
 			meta := map[string]string{
-				"type":         "knowledge",
-				"source_type":  "hf_dataset",
-				"hf_dataset":   ds,
-				"hf_split":     split,
-				"record_index": strconv.Itoa(i + 1),
-				"record_total": strconv.Itoa(len(rows)),
-				"source_url":   endpoint,
-				"fetched_at":   time.Now().UTC().Format(time.RFC3339),
+				"type":          "knowledge",
+				"source_type":   "hf_dataset",
+				"hf_dataset":    ds,
+				"hf_split":      split,
+				"topology_node": fmt.Sprintf("hf:%s:%s", ds, split),
+				"record_index":  strconv.Itoa(i + 1),
+				"record_total":  strconv.Itoa(len(rows)),
+				"source_url":    endpoint,
+				"fetched_at":    time.Now().UTC().Format(time.RFC3339),
 			}
-			if err := addRemoteChunks(mm, chunks, meta); err != nil {
+			if err := addRemoteChunks(mm, chunks, meta, opts); err != nil {
 				stats.IndexErrors++
 				emitRemoteEvent(opts, RemoteEvent{Source: ds, Outcome: "hf-index-error", Detail: err.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
 				continue
 			}
 			stats.ItemsIndexed++
 			stats.ChunksIndexed += len(chunks)
+			_ = mm.UpsertTopologySource(memory.SourceFingerprint{
+				SourceType: "hf_dataset",
+				SourceRef:  fmt.Sprintf("hf:%s:%s", ds, split),
+				SourcePath: fmt.Sprintf("hf:%s:%s", ds, split),
+				Content:    text,
+			})
 			emitRemoteEvent(opts, RemoteEvent{Source: ds, Outcome: "hf-indexed-record", Detail: fmt.Sprintf("record %d", i+1), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			emitRemoteSourceIndexed(opts, SourceIndexedEvent{
+				SourceType: "hf_dataset",
+				SourceRef:  fmt.Sprintf("hf:%s:%s:%s:%d", ds, strings.TrimSpace(spec.Config), split, i+1),
+				Content:    text,
+				ChunkCount: len(chunks),
+				Metadata: map[string]string{
+					"source_type": "hf_dataset",
+					"hf_dataset":  ds,
+					"hf_config":   strings.TrimSpace(spec.Config),
+					"hf_split":    split,
+				},
+			})
 		}
 	}
 
@@ -387,6 +432,12 @@ func normalizeRemoteOptions(opts RemoteIndexOptions) RemoteIndexOptions {
 	}
 	if opts.ChunkOverlap >= opts.MaxChunkChars {
 		opts.ChunkOverlap = opts.MaxChunkChars / 4
+	}
+	if !opts.GenerateChunkTitles && opts.ChunkTitleMaxChars <= 0 && strings.TrimSpace(opts.ChunkTitleModel) == "" {
+		opts.GenerateChunkTitles = true
+	}
+	if opts.ChunkTitleMaxChars <= 0 {
+		opts.ChunkTitleMaxChars = 96
 	}
 	if opts.Timeout <= 0 {
 		opts.Timeout = defaultRemoteTimeout
@@ -535,8 +586,15 @@ func extractLinks(baseURL string, body []byte) []string {
 	return out
 }
 
-func addRemoteChunks(mm *memory.MemoryManager, chunks []string, baseMeta map[string]string) error {
+func addRemoteChunks(mm *memory.MemoryManager, chunks []string, baseMeta map[string]string, opts RemoteIndexOptions) error {
 	total := len(chunks)
+	titleGen := memory.NewChunkTitleGenerator(mm, memory.ChunkTitleConfig{
+		MaxChars: opts.ChunkTitleMaxChars,
+		Model:    strings.TrimSpace(opts.ChunkTitleModel),
+	})
+	sourceType := strings.TrimSpace(baseMeta["source_type"])
+	sourceRef := remoteChunkSourceRef(baseMeta)
+	sectionMetas := inferChunkSections(chunks, sourceRef)
 	for i, chunk := range chunks {
 		meta := make(map[string]string, len(baseMeta)+3)
 		for k, v := range baseMeta {
@@ -545,6 +603,20 @@ func addRemoteChunks(mm *memory.MemoryManager, chunks []string, baseMeta map[str
 		meta["chunk_index"] = strconv.Itoa(i + 1)
 		meta["chunk_total"] = strconv.Itoa(total)
 		meta["indexed_at"] = time.Now().UTC().Format(time.RFC3339)
+		if i < len(sectionMetas) {
+			sectionID, sectionTitle, sectionLevel, sectionInferred := sectionMetaAsStrings(sectionMetas[i])
+			meta["section_id"] = sectionID
+			meta["section_title"] = sectionTitle
+			meta["section_level"] = sectionLevel
+			meta["section_inferred"] = sectionInferred
+		}
+		if opts.GenerateChunkTitles {
+			title, titleErr := titleGen.Generate(context.Background(), sourceType, sourceRef, chunk, i+1, total)
+			if titleErr != nil {
+				title = remoteChunkFallbackTitle(baseMeta, i+1, total)
+			}
+			meta["chunk_title"] = title
+		}
 		if err := mm.AddKnowledge(chunk, meta); err != nil {
 			return err
 		}
@@ -552,9 +624,38 @@ func addRemoteChunks(mm *memory.MemoryManager, chunks []string, baseMeta map[str
 	return nil
 }
 
+func remoteChunkSourceRef(meta map[string]string) string {
+	if u := strings.TrimSpace(meta["source_url"]); u != "" {
+		return u
+	}
+	ds := strings.TrimSpace(meta["hf_dataset"])
+	split := strings.TrimSpace(meta["hf_split"])
+	if ds != "" {
+		if split == "" {
+			return "hf:" + ds
+		}
+		return "hf:" + ds + ":" + split
+	}
+	return "remote"
+}
+
+func remoteChunkFallbackTitle(meta map[string]string, index int, total int) string {
+	ref := remoteChunkSourceRef(meta)
+	if total > 1 && index > 0 {
+		return fmt.Sprintf("%s [%d/%d]", ref, index, total)
+	}
+	return ref
+}
+
 func emitRemoteEvent(opts RemoteIndexOptions, ev RemoteEvent) {
 	if opts.OnEvent != nil {
 		opts.OnEvent(ev)
+	}
+}
+
+func emitRemoteSourceIndexed(opts RemoteIndexOptions, ev SourceIndexedEvent) {
+	if opts.OnSourceIndexed != nil {
+		opts.OnSourceIndexed(ev)
 	}
 }
 

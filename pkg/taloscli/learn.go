@@ -2,6 +2,8 @@ package taloscli
 
 import (
 	"bufio"
+	"context"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -9,6 +11,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Thynaptic/P-LMv1/pkg/connectors"
+	githubconn "github.com/Thynaptic/P-LMv1/pkg/connectors/github"
+	googleconn "github.com/Thynaptic/P-LMv1/pkg/connectors/google"
+	"github.com/Thynaptic/P-LMv1/pkg/connectors/gutenberg"
+	"github.com/Thynaptic/P-LMv1/pkg/connectors/notion"
 	"github.com/Thynaptic/P-LMv1/pkg/memory"
 	"github.com/Thynaptic/P-LMv1/pkg/rag"
 	"github.com/spf13/cobra"
@@ -46,12 +53,79 @@ var learnURLSafetyFailOpen bool
 var learnFromResearch string
 var learnIncludeResearchSources bool
 var learnIncludeResearchSummary bool
+var learnSummarizeSources bool
+var learnSummaryMaxChars int
+var learnSummaryMaxPoints int
+var learnSummaryModel string
+var learnTitleChunks bool
+var learnTitleMaxChars int
+var learnTitleModel string
+var learnIncremental bool
+var learnIncrementalManifest string
 var learnDryRun bool
+
+// Google Workspace + Notion connector flags
+var learnGmailQuery string
+var learnGmailMax int
+var learnGdriveFolderID string
+var learnGdriveQuery string
+var learnGdriveMax int
+var learnNotionDatabaseID string
+var learnNotionFilter string
+
+// Project Gutenberg connector flags
+var learnBookSearch string
+var learnBookIDs []string
+var learnBookMax int
+
+// GitHub connector flags
+var learnGitHubRepos []string
+var learnGitHubPath string
+var learnGitHubMax int
+
+// Chain flag — comma-separated ordered source tokens
+var learnChain string
 
 var learnCmd = &cobra.Command{
 	Use:   "learn [text]",
 	Short: "Add knowledge to your personal LLM's memory.",
-	Long:  `This command allows you to teach your personal LLM new information by adding text, files, directories, URLs, or Hugging Face datasets into its persistent knowledge base.`,
+	Long: `Teach TALOS new information by ingesting text, files, directories, URLs, Hugging Face datasets, or live API sources.
+
+LOCAL SOURCES
+  talos learn "some text"
+  talos learn --file ./notes.md
+  talos learn --dir ./docs --extensions .md,.txt
+  talos learn --url https://example.com/page --crawl --crawl-depth 1
+  talos learn --from-research latest
+  HF_TOKEN=... talos learn --hf-dataset wikipedia --hf-split train
+
+GOOGLE WORKSPACE  (requires GOOGLE_SERVICE_ACCOUNT_JSON + GOOGLE_IMPERSONATE_USER)
+  talos learn --gmail-query "label:inbox after:2024/01/01" --gmail-max 100
+  talos learn --gdrive-folder <folderID>
+  talos learn --gdrive-query "mimeType='application/vnd.google-apps.document'"
+  talos learn --gdrive-max 50
+
+NOTION  (requires NOTION_API_KEY)
+  talos learn --notion-database <databaseID>
+  talos learn --notion-database <databaseID> --notion-filter '{"property":"Status","select":{"equals":"Done"}}'
+
+PROJECT GUTENBERG  (no credentials required)
+  talos learn --book-search "frankenstein"
+  talos learn --book-search "the art of war" --book-max 3
+  talos learn --book-id 84
+  talos learn --book-id 84 --book-id 1342 --book-id 11
+
+GITHUB  (GITHUB_TOKEN optional — increases rate limit)
+  talos learn --github-repo owner/repo
+  talos learn --github-repo owner/repo --github-path pkg/ --github-max 200
+  talos learn --github-repo owner/repo1 --github-repo owner/repo2
+
+CHAINED SOURCES  (--chain runs sources in the specified order)
+  talos learn --chain "dir,github,hf" --dir ./docs --github-repo owner/repo --hf-dataset owner/dataset
+  talos learn --chain "books,url" --book-search "moby dick" --url https://example.com
+  talos learn --chain "github,notion" --github-repo owner/repo --notion-database <id>
+
+All sources are chunked and indexed into persistent memory for future retrieval.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if _, err := resolveLearnProfileForRun(cmd); err != nil {
 			fmt.Printf("Error resolving learn profile: %v\n", err)
@@ -78,17 +152,37 @@ var learnCmd = &cobra.Command{
 			return
 		}
 
+		// Chain dispatch — runs before all individual source checks.
+		if strings.TrimSpace(learnChain) != "" {
+			executeLearnChain(args, mm)
+			return
+		}
+
+		// Google Workspace + Notion + Gutenberg + GitHub connector dispatch
+		if learnGmailQuery != "" || learnGdriveFolderID != "" || learnGdriveQuery != "" || learnNotionDatabaseID != "" || learnBookSearch != "" || len(learnBookIDs) > 0 || len(learnGitHubRepos) > 0 {
+			executeLearnFromConnectors(mm)
+			return
+		}
+
 		if learnDir != "" {
 			session := newLearnSession("DIRECTORY", learnDir, []string{learnDir}, map[string]string{
 				"recursive":     fmt.Sprintf("%t", learnRecursive),
 				"chunk_chars":   fmt.Sprintf("%d", learnChunkChars),
 				"chunk_overlap": fmt.Sprintf("%d", learnChunkOverlap),
+				"summarization": fmt.Sprintf("%t", learnSummarizeSources),
+				"chunk_titles":  fmt.Sprintf("%t", learnTitleChunks),
+				"incremental":   fmt.Sprintf("%t", learnIncremental),
 			})
 			annotateLearnSessionWithProfile(&session, learnProfileApplied)
 			opts := rag.DefaultIndexOptions()
 			opts.Recursive = learnRecursive
 			opts.MaxChunkChars = learnChunkChars
 			opts.ChunkOverlap = learnChunkOverlap
+			opts.GenerateChunkTitles = learnTitleChunks
+			opts.ChunkTitleMaxChars = learnTitleMaxChars
+			opts.ChunkTitleModel = strings.TrimSpace(learnTitleModel)
+			opts.Incremental = learnIncremental
+			opts.IncrementalManifestPath = strings.TrimSpace(learnIncrementalManifest)
 			opts.AllTypes = learnAllTypes
 
 			extensionInput := strings.TrimSpace(learnExtensions)
@@ -121,6 +215,25 @@ var learnCmd = &cobra.Command{
 					fmt.Printf("walk error %s: %s\n", event.RelPath, event.Error)
 				}
 			}
+			var summaryWorker *memory.SourceSummaryWorker
+			if learnSummarizeSources {
+				sw, swErr := memory.NewSourceSummaryWorker(mm, session.SessionID, summaryConfigFromLearnFlags(), 2, 128)
+				if swErr != nil {
+					fmt.Printf("Warning: source summarization unavailable: %v\n", swErr)
+				} else {
+					summaryWorker = sw
+					opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+						summaryWorker.Enqueue(memory.SourceSummaryRequest{
+							SourceType: ev.SourceType,
+							SourceRef:  ev.SourceRef,
+							Content:    ev.Content,
+							SessionID:  session.SessionID,
+							ChunkCount: ev.ChunkCount,
+							Metadata:   ev.Metadata,
+						})
+					}
+				}
+			}
 
 			fmt.Printf("Indexing directory: %s\n", learnDir)
 			if opts.AllTypes {
@@ -129,33 +242,54 @@ var learnCmd = &cobra.Command{
 				fmt.Printf("Type filter: %s\n", rag.ExtensionsToCSV(opts.Extensions))
 			}
 			stats, err := rag.IndexDirectory(mm, learnDir, opts)
+			summaryMetrics := memory.SourceSummaryMetrics{}
+			if summaryWorker != nil {
+				summaryMetrics = summaryWorker.CloseAndFlush(20 * time.Second)
+				_ = summaryWorker.AddSessionAggregateSummary(buildLearnSessionSummaryText(session.Mode, session.QueryOrTarget, stats.FilesIndexed, int(summaryMetrics.SummaryDocsIndexed)), int(summaryMetrics.JobsCompleted))
+				summaryMetrics = summaryWorker.Metrics()
+			}
 			if err != nil {
 				fmt.Printf("Error indexing directory: %v\n", err)
-				session.finish("FAILED", "Directory indexing failed.", err.Error(), map[string]int64{
-					"files_scanned":  int64(stats.FilesScanned),
-					"files_indexed":  int64(stats.FilesIndexed),
-					"chunks_indexed": int64(stats.ChunksIndexed),
-					"errors":         int64(stats.ParseErrors + stats.IndexErrors + stats.WalkErrors),
-				})
+				metrics := map[string]int64{
+					"files_scanned":   int64(stats.FilesScanned),
+					"files_indexed":   int64(stats.FilesIndexed),
+					"files_unchanged": int64(stats.FilesUnchanged),
+					"files_changed":   int64(stats.FilesChanged),
+					"files_added":     int64(stats.FilesAdded),
+					"files_removed":   int64(stats.FilesRemoved),
+					"chunks_archived": int64(stats.ChunksArchived),
+					"chunks_indexed":  int64(stats.ChunksIndexed),
+					"errors":          int64(stats.ParseErrors + stats.IndexErrors + stats.WalkErrors),
+				}
+				mergeSummaryMetrics(metrics, summaryMetrics)
+				session.finish("FAILED", "Directory indexing failed.", err.Error(), metrics)
 				if logErr := appendLearnSessionRecord(session); logErr != nil {
 					fmt.Printf("Warning: Failed to write learn session log: %v\n", logErr)
 				}
 				return
 			}
-			session.finish("SUCCESS", "Directory learning completed successfully.", "", map[string]int64{
+			metrics := map[string]int64{
 				"files_scanned":       int64(stats.FilesScanned),
 				"files_indexed":       int64(stats.FilesIndexed),
+				"files_unchanged":     int64(stats.FilesUnchanged),
+				"files_changed":       int64(stats.FilesChanged),
+				"files_added":         int64(stats.FilesAdded),
+				"files_removed":       int64(stats.FilesRemoved),
+				"chunks_archived":     int64(stats.ChunksArchived),
 				"chunks_indexed":      int64(stats.ChunksIndexed),
 				"skipped_unsupported": int64(stats.SkippedUnsupported),
 				"skipped_binary":      int64(stats.SkippedBinary),
 				"parse_errors":        int64(stats.ParseErrors),
 				"index_errors":        int64(stats.IndexErrors),
 				"walk_errors":         int64(stats.WalkErrors),
-			})
+			}
+			mergeSummaryMetrics(metrics, summaryMetrics)
+			mergeTopologyMetrics(metrics, mm.TopologyStats())
+			session.finish("SUCCESS", "Directory learning completed successfully.", "", metrics)
 			if logErr := appendLearnSessionRecord(session); logErr != nil {
 				fmt.Printf("Warning: Failed to write learn session log: %v\n", logErr)
 			}
-			fmt.Println(renderDirectoryLearnSummary(learnDir, opts, stats))
+			fmt.Println(renderDirectoryLearnSummary(learnDir, opts, stats, summaryMetrics, mm.TopologyStats()))
 			return
 		}
 
@@ -163,6 +297,9 @@ var learnCmd = &cobra.Command{
 			remoteOpts := rag.DefaultRemoteIndexOptions()
 			remoteOpts.MaxChunkChars = learnChunkChars
 			remoteOpts.ChunkOverlap = learnChunkOverlap
+			remoteOpts.GenerateChunkTitles = learnTitleChunks
+			remoteOpts.ChunkTitleMaxChars = learnTitleMaxChars
+			remoteOpts.ChunkTitleModel = strings.TrimSpace(learnTitleModel)
 			remoteOpts.Crawl = learnCrawl
 			remoteOpts.CrawlDepth = learnCrawlDepth
 			remoteOpts.MaxPages = learnMaxPages
@@ -218,8 +355,29 @@ var learnCmd = &cobra.Command{
 				"max_pages":            fmt.Sprintf("%d", learnMaxPages),
 				"url_safety":           fmt.Sprintf("%t", learnURLSafety),
 				"url_safety_fail_open": fmt.Sprintf("%t", learnURLSafetyFailOpen),
+				"summarization":        fmt.Sprintf("%t", learnSummarizeSources),
+				"chunk_titles":         fmt.Sprintf("%t", learnTitleChunks),
 			})
 			annotateLearnSessionWithProfile(&session, learnProfileApplied)
+			var summaryWorker *memory.SourceSummaryWorker
+			if learnSummarizeSources {
+				sw, swErr := memory.NewSourceSummaryWorker(mm, session.SessionID, summaryConfigFromLearnFlags(), 2, 128)
+				if swErr != nil {
+					fmt.Printf("Warning: source summarization unavailable: %v\n", swErr)
+				} else {
+					summaryWorker = sw
+					remoteOpts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+						summaryWorker.Enqueue(memory.SourceSummaryRequest{
+							SourceType: ev.SourceType,
+							SourceRef:  ev.SourceRef,
+							Content:    ev.Content,
+							SessionID:  session.SessionID,
+							ChunkCount: ev.ChunkCount,
+							Metadata:   ev.Metadata,
+						})
+					}
+				}
+			}
 			totalStats := rag.RemoteIndexStats{}
 			if len(seedURLs) > 0 {
 				if remoteOpts.URLSafetyEnabled && strings.TrimSpace(remoteOpts.URLSafetyAPIKey) == "" && !remoteOpts.URLSafetyFailOpen {
@@ -285,7 +443,13 @@ var learnCmd = &cobra.Command{
 			} else if totalStats.HTTPErrors > 0 || totalStats.ParseErrors > 0 || totalStats.IndexErrors > 0 || totalStats.PreflightFailures > 0 || totalStats.SafetyErrors > 0 || totalStats.SafetyBlocked > 0 {
 				status = "PARTIAL"
 			}
-			session.finish(status, "Remote learning run completed.", failureReason, map[string]int64{
+			summaryMetrics := memory.SourceSummaryMetrics{}
+			if summaryWorker != nil {
+				summaryMetrics = summaryWorker.CloseAndFlush(20 * time.Second)
+				_ = summaryWorker.AddSessionAggregateSummary(buildLearnSessionSummaryText(session.Mode, session.QueryOrTarget, totalStats.ItemsIndexed, int(summaryMetrics.SummaryDocsIndexed)), int(summaryMetrics.JobsCompleted))
+				summaryMetrics = summaryWorker.Metrics()
+			}
+			metrics := map[string]int64{
 				"items_fetched":       int64(totalStats.ItemsFetched),
 				"items_indexed":       int64(totalStats.ItemsIndexed),
 				"chunks_indexed":      int64(totalStats.ChunksIndexed),
@@ -298,11 +462,14 @@ var learnCmd = &cobra.Command{
 				"parse_errors":        int64(totalStats.ParseErrors),
 				"http_errors":         int64(totalStats.HTTPErrors),
 				"index_errors":        int64(totalStats.IndexErrors),
-			})
+			}
+			mergeSummaryMetrics(metrics, summaryMetrics)
+			mergeTopologyMetrics(metrics, mm.TopologyStats())
+			session.finish(status, "Remote learning run completed.", failureReason, metrics)
 			if logErr := appendLearnSessionRecord(session); logErr != nil {
 				fmt.Printf("Warning: Failed to write learn session log: %v\n", logErr)
 			}
-			fmt.Println(renderRemoteLearnSummary(totalStats))
+			fmt.Println(renderRemoteLearnSummary(totalStats, summaryMetrics, mm.TopologyStats()))
 			return
 		}
 
@@ -398,6 +565,55 @@ func bindLearnConfigFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&learnFromResearch, "from-research", "", "Ingest from a research artifact id or 'latest'")
 	fs.BoolVar(&learnIncludeResearchSummary, "include-research-summary", true, "Include research summary/findings text during --from-research ingest")
 	fs.BoolVar(&learnIncludeResearchSources, "include-research-sources", true, "Include source URL indexing during --from-research ingest")
+	fs.BoolVar(&learnSummarizeSources, "summarize-sources", boolFromEnv("TALOS_LEARN_SUMMARIZE_SOURCES", true), "Generate per-source summaries during directory/remote ingest")
+	fs.IntVar(&learnSummaryMaxChars, "summary-max-chars", intFromEnv("TALOS_LEARN_SUMMARY_MAX_CHARS", 900), "Maximum chars for each source summary")
+	fs.IntVar(&learnSummaryMaxPoints, "summary-max-points", intFromEnv("TALOS_LEARN_SUMMARY_MAX_POINTS", 5), "Maximum key points per structured summary")
+	fs.StringVar(&learnSummaryModel, "summary-model", strings.TrimSpace(os.Getenv("TALOS_LEARN_SUMMARY_MODEL")), "Optional model override for source summarization")
+	fs.BoolVar(&learnTitleChunks, "title-chunks", boolFromEnv("TALOS_LEARN_TITLE_CHUNKS", true), "Generate chunk titles during directory/remote ingest")
+	fs.IntVar(&learnTitleMaxChars, "title-max-chars", intFromEnv("TALOS_LEARN_TITLE_MAX_CHARS", 96), "Maximum chars for each generated chunk title")
+	fs.StringVar(&learnTitleModel, "title-model", strings.TrimSpace(os.Getenv("TALOS_LEARN_TITLE_MODEL")), "Optional model override for chunk title generation")
+	fs.BoolVar(&learnIncremental, "incremental", boolFromEnv("TALOS_LEARN_INCREMENTAL", true), "Enable incremental re-indexing for --dir ingest")
+	fs.StringVar(&learnIncrementalManifest, "incremental-manifest", strings.TrimSpace(os.Getenv("TALOS_LEARN_INCREMENTAL_MANIFEST")), "Optional override path for directory incremental manifest")
+
+	// Google Workspace
+	fs.StringVar(&learnGmailQuery, "gmail-query", "", "Gmail search query (e.g. \"label:inbox after:2024/01/01\")")
+	fs.IntVar(&learnGmailMax, "gmail-max", 50, "Maximum Gmail messages to fetch")
+	fs.StringVar(&learnGdriveFolderID, "gdrive-folder", "", "Google Drive folder ID to ingest files from")
+	fs.StringVar(&learnGdriveQuery, "gdrive-query", "", "Google Drive search query (e.g. \"mimeType='application/vnd.google-apps.document'\")")
+	fs.IntVar(&learnGdriveMax, "gdrive-max", 100, "Maximum Google Drive files to fetch")
+
+	// Notion
+	fs.StringVar(&learnNotionDatabaseID, "notion-database", "", "Notion database ID to query and ingest")
+	fs.StringVar(&learnNotionFilter, "notion-filter", "", "Optional JSON filter for Notion database query")
+
+	// Project Gutenberg
+	fs.StringVar(&learnBookSearch, "book-search", "", "Search Project Gutenberg by title/author and ingest top result(s)")
+	fs.StringArrayVar(&learnBookIDs, "book-id", nil, "Ingest a specific Gutenberg book by numeric ID (repeatable)")
+	fs.IntVar(&learnBookMax, "book-max", 1, "Maximum Gutenberg books to ingest when using --book-search")
+
+	// GitHub
+	fs.StringArrayVar(&learnGitHubRepos, "github-repo", nil, "GitHub \"owner/repo\" to ingest (repeatable)")
+	fs.StringVar(&learnGitHubPath, "github-path", "", "Subdirectory path within repo to limit ingestion (e.g. \"pkg/\", \"docs/\")")
+	fs.IntVar(&learnGitHubMax, "github-max", 500, "Maximum files to ingest per GitHub repo")
+
+	// Chain — ordered multi-source ingestion
+	fs.StringVar(&learnChain, "chain", "", "Ordered comma-separated source tokens (e.g. \"dir,github,hf,books\"). Valid: file,dir,url,hf,gmail,drive,notion,books,github,research")
+}
+
+func summaryConfigFromLearnFlags() memory.SourceSummaryConfig {
+	maxChars := learnSummaryMaxChars
+	if maxChars <= 0 {
+		maxChars = 900
+	}
+	maxPoints := learnSummaryMaxPoints
+	if maxPoints <= 0 {
+		maxPoints = 5
+	}
+	return memory.SourceSummaryConfig{
+		MaxChars:  maxChars,
+		MaxPoints: maxPoints,
+		Model:     strings.TrimSpace(learnSummaryModel),
+	}
 }
 
 func annotateLearnSessionWithProfile(session *LearnSessionRecord, profileName string) {
@@ -434,11 +650,22 @@ func executeLearnFromResearch(selector string, includeSummary bool, includeSourc
 		"include_sources":  fmt.Sprintf("%t", includeSources),
 		"research_status":  strings.ToUpper(strings.TrimSpace(artifact.Status)),
 		"research_created": strings.TrimSpace(artifact.CreatedAt),
+		"summarization":    fmt.Sprintf("%t", learnSummarizeSources),
+		"chunk_titles":     fmt.Sprintf("%t", learnTitleChunks),
 	})
 
 	var sourceStats rag.RemoteIndexStats
 	summaryIndexed := int64(0)
 	var failureReasons []string
+	var summaryWorker *memory.SourceSummaryWorker
+	if learnSummarizeSources {
+		sw, swErr := memory.NewSourceSummaryWorker(mm, session.SessionID, summaryConfigFromLearnFlags(), 2, 128)
+		if swErr != nil {
+			failureReasons = append(failureReasons, "source summarization unavailable: "+swErr.Error())
+		} else {
+			summaryWorker = sw
+		}
+	}
 	if includeSummary {
 		payload := buildResearchLearnPayload(artifact)
 		if strings.TrimSpace(payload) != "" {
@@ -457,6 +684,9 @@ func executeLearnFromResearch(selector string, includeSummary bool, includeSourc
 		opts := rag.DefaultRemoteIndexOptions()
 		opts.MaxChunkChars = learnChunkChars
 		opts.ChunkOverlap = learnChunkOverlap
+		opts.GenerateChunkTitles = learnTitleChunks
+		opts.ChunkTitleMaxChars = learnTitleMaxChars
+		opts.ChunkTitleModel = strings.TrimSpace(learnTitleModel)
 		opts.Crawl = false
 		opts.CrawlDepth = 0
 		opts.MaxPages = learnMaxInt(1, learnMaxPages)
@@ -470,6 +700,18 @@ func executeLearnFromResearch(selector string, includeSummary bool, includeSourc
 		opts.URLSafetyVisibility = learnURLSafetyVisibility
 		opts.URLSafetyFailOpen = learnURLSafetyFailOpen
 		opts.URLSafetyAPIKey = strings.TrimSpace(os.Getenv("URLSCAN_API_KEY"))
+		if summaryWorker != nil {
+			opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+				summaryWorker.Enqueue(memory.SourceSummaryRequest{
+					SourceType: ev.SourceType,
+					SourceRef:  ev.SourceRef,
+					Content:    ev.Content,
+					SessionID:  session.SessionID,
+					ChunkCount: ev.ChunkCount,
+					Metadata:   ev.Metadata,
+				})
+			}
+		}
 
 		fmt.Printf("Indexing research sources from artifact %s: %d URL(s)\n", artifactID, len(artifact.Sources))
 		if opts.URLSafetyEnabled && strings.TrimSpace(opts.URLSafetyAPIKey) == "" && !opts.URLSafetyFailOpen {
@@ -490,7 +732,14 @@ func executeLearnFromResearch(selector string, includeSummary bool, includeSourc
 	if len(failureReasons) > 0 && status == "SUCCESS" {
 		status = "PARTIAL"
 	}
-	session.finish(status, "Research artifact learning run completed.", strings.Join(failureReasons, "; "), map[string]int64{
+	summaryMetrics := memory.SourceSummaryMetrics{}
+	if summaryWorker != nil {
+		summaryMetrics = summaryWorker.CloseAndFlush(20 * time.Second)
+		totalIndexed := sourceStats.ItemsIndexed + int(summaryIndexed)
+		_ = summaryWorker.AddSessionAggregateSummary(buildLearnSessionSummaryText(session.Mode, session.QueryOrTarget, totalIndexed, int(summaryMetrics.SummaryDocsIndexed)), int(summaryMetrics.JobsCompleted))
+		summaryMetrics = summaryWorker.Metrics()
+	}
+	metrics := map[string]int64{
 		"artifact_findings":       int64(len(artifact.Findings)),
 		"artifact_sources":        int64(len(artifact.Sources)),
 		"summary_items_indexed":   summaryIndexed,
@@ -503,11 +752,14 @@ func executeLearnFromResearch(selector string, includeSummary bool, includeSourc
 		"source_parse_errors":     int64(sourceStats.ParseErrors),
 		"source_http_errors":      int64(sourceStats.HTTPErrors),
 		"source_index_errors":     int64(sourceStats.IndexErrors),
-	})
+	}
+	mergeSummaryMetrics(metrics, summaryMetrics)
+	mergeTopologyMetrics(metrics, mm.TopologyStats())
+	session.finish(status, "Research artifact learning run completed.", strings.Join(failureReasons, "; "), metrics)
 	if logErr := appendLearnSessionRecord(session); logErr != nil {
 		fmt.Printf("Warning: Failed to write learn session log: %v\n", logErr)
 	}
-	fmt.Println(renderResearchLearnSummary(artifactID, includeSummary, includeSources, summaryIndexed, sourceStats, status))
+	fmt.Println(renderResearchLearnSummary(artifactID, includeSummary, includeSources, summaryIndexed, sourceStats, summaryMetrics, mm.TopologyStats(), status))
 	if status == "FAILED" {
 		return fmt.Errorf("no research artifact content was indexed")
 	}
@@ -540,7 +792,7 @@ func buildResearchLearnPayload(artifact ResearchArtifact) string {
 	return strings.TrimSpace(b.String())
 }
 
-func renderResearchLearnSummary(artifactID string, includeSummary bool, includeSources bool, summaryIndexed int64, sourceStats rag.RemoteIndexStats, status string) string {
+func renderResearchLearnSummary(artifactID string, includeSummary bool, includeSources bool, summaryIndexed int64, sourceStats rag.RemoteIndexStats, summaryMetrics memory.SourceSummaryMetrics, topology memory.TopologyStats, status string) string {
 	var b strings.Builder
 	b.WriteString("LEARN SUMMARY\n\n")
 	b.WriteString("MODE\n")
@@ -555,6 +807,8 @@ func renderResearchLearnSummary(artifactID string, includeSummary bool, includeS
 	b.WriteString(fmt.Sprintf("  source_items_fetched: %d\n", sourceStats.ItemsFetched))
 	b.WriteString(fmt.Sprintf("  source_items_indexed: %d\n", sourceStats.ItemsIndexed))
 	b.WriteString(fmt.Sprintf("  source_chunks_indexed: %d\n", sourceStats.ChunksIndexed))
+	appendSummaryMetricsSection(&b, summaryMetrics)
+	appendTopologyMetricsSection(&b, topology)
 	return strings.TrimRight(b.String(), "\n")
 }
 
@@ -616,7 +870,7 @@ func mergeRemoteStats(a, b rag.RemoteIndexStats) rag.RemoteIndexStats {
 	}
 }
 
-func renderDirectoryLearnSummary(dir string, opts rag.IndexOptions, stats rag.IndexStats) string {
+func renderDirectoryLearnSummary(dir string, opts rag.IndexOptions, stats rag.IndexStats, summaryMetrics memory.SourceSummaryMetrics, topology memory.TopologyStats) string {
 	var b strings.Builder
 	b.WriteString("LEARN SUMMARY\n\n")
 	b.WriteString("MODE\n")
@@ -627,6 +881,10 @@ func renderDirectoryLearnSummary(dir string, opts rag.IndexOptions, stats rag.In
 	b.WriteString(fmt.Sprintf("  recursive: %t\n", opts.Recursive))
 	b.WriteString(fmt.Sprintf("  chunk_chars: %d\n", opts.MaxChunkChars))
 	b.WriteString(fmt.Sprintf("  chunk_overlap: %d\n", opts.ChunkOverlap))
+	b.WriteString(fmt.Sprintf("  incremental: %t\n", opts.Incremental))
+	if strings.TrimSpace(opts.IncrementalManifestPath) != "" {
+		b.WriteString("  incremental_manifest: " + strings.TrimSpace(opts.IncrementalManifestPath) + "\n")
+	}
 	if opts.AllTypes {
 		b.WriteString("  type_filter: all\n")
 	} else {
@@ -635,16 +893,23 @@ func renderDirectoryLearnSummary(dir string, opts rag.IndexOptions, stats rag.In
 	b.WriteString("\nRESULTS\n")
 	b.WriteString(fmt.Sprintf("  files_scanned: %d\n", stats.FilesScanned))
 	b.WriteString(fmt.Sprintf("  files_indexed: %d\n", stats.FilesIndexed))
+	b.WriteString(fmt.Sprintf("  files_unchanged: %d\n", stats.FilesUnchanged))
+	b.WriteString(fmt.Sprintf("  files_changed: %d\n", stats.FilesChanged))
+	b.WriteString(fmt.Sprintf("  files_added: %d\n", stats.FilesAdded))
+	b.WriteString(fmt.Sprintf("  files_removed: %d\n", stats.FilesRemoved))
+	b.WriteString(fmt.Sprintf("  chunks_archived: %d\n", stats.ChunksArchived))
 	b.WriteString(fmt.Sprintf("  chunks_indexed: %d\n", stats.ChunksIndexed))
 	b.WriteString(fmt.Sprintf("  skipped_unsupported: %d\n", stats.SkippedUnsupported))
 	b.WriteString(fmt.Sprintf("  skipped_binary: %d\n", stats.SkippedBinary))
 	b.WriteString(fmt.Sprintf("  parse_errors: %d\n", stats.ParseErrors))
 	b.WriteString(fmt.Sprintf("  index_errors: %d\n", stats.IndexErrors))
-	b.WriteString(fmt.Sprintf("  walk_errors: %d", stats.WalkErrors))
+	b.WriteString(fmt.Sprintf("  walk_errors: %d\n", stats.WalkErrors))
+	appendSummaryMetricsSection(&b, summaryMetrics)
+	appendTopologyMetricsSection(&b, topology)
 	return b.String()
 }
 
-func renderRemoteLearnSummary(stats rag.RemoteIndexStats) string {
+func renderRemoteLearnSummary(stats rag.RemoteIndexStats, summaryMetrics memory.SourceSummaryMetrics, topology memory.TopologyStats) string {
 	var b strings.Builder
 	b.WriteString("LEARN SUMMARY\n\n")
 	b.WriteString("MODE\n")
@@ -664,8 +929,84 @@ func renderRemoteLearnSummary(stats rag.RemoteIndexStats) string {
 	b.WriteString(fmt.Sprintf("  skipped_unsupported: %d\n", stats.SkippedUnsupported))
 	b.WriteString(fmt.Sprintf("  parse_errors: %d\n", stats.ParseErrors))
 	b.WriteString(fmt.Sprintf("  http_errors: %d\n", stats.HTTPErrors))
-	b.WriteString(fmt.Sprintf("  index_errors: %d", stats.IndexErrors))
+	b.WriteString(fmt.Sprintf("  index_errors: %d\n", stats.IndexErrors))
+	appendSummaryMetricsSection(&b, summaryMetrics)
+	appendTopologyMetricsSection(&b, topology)
 	return b.String()
+}
+
+func appendSummaryMetricsSection(b *strings.Builder, m memory.SourceSummaryMetrics) {
+	if b == nil {
+		return
+	}
+	b.WriteString("\nSUMMARY\n")
+	b.WriteString(fmt.Sprintf("  jobs_enqueued: %d\n", m.JobsEnqueued))
+	b.WriteString(fmt.Sprintf("  jobs_completed: %d\n", m.JobsCompleted))
+	b.WriteString(fmt.Sprintf("  jobs_failed: %d\n", m.JobsFailed))
+	b.WriteString(fmt.Sprintf("  jobs_dropped: %d\n", m.JobsDropped))
+	b.WriteString(fmt.Sprintf("  summary_docs_indexed: %d\n", m.SummaryDocsIndexed))
+	b.WriteString(fmt.Sprintf("  session_summary_indexed: %d\n", m.SessionSummaryIndexed))
+}
+
+func appendTopologyMetricsSection(b *strings.Builder, t memory.TopologyStats) {
+	if b == nil {
+		return
+	}
+	b.WriteString("\nTOPOLOGY\n")
+	b.WriteString(fmt.Sprintf("  enabled: %t\n", t.Enabled))
+	b.WriteString(fmt.Sprintf("  nodes: %d\n", t.Nodes))
+	b.WriteString(fmt.Sprintf("  edges: %d\n", t.Edges))
+	b.WriteString(fmt.Sprintf("  edges_added: %d\n", t.EdgesAdded))
+	b.WriteString(fmt.Sprintf("  links_used: %d\n", t.LinksUsed))
+	if strings.TrimSpace(t.LastError) != "" {
+		b.WriteString("  last_error: " + strings.TrimSpace(t.LastError) + "\n")
+	}
+}
+
+func mergeSummaryMetrics(metrics map[string]int64, m memory.SourceSummaryMetrics) {
+	if metrics == nil {
+		return
+	}
+	metrics["summary_jobs_enqueued"] = m.JobsEnqueued
+	metrics["summary_jobs_completed"] = m.JobsCompleted
+	metrics["summary_jobs_failed"] = m.JobsFailed
+	metrics["summary_jobs_dropped"] = m.JobsDropped
+	metrics["summary_docs_indexed"] = m.SummaryDocsIndexed
+	metrics["session_summary_indexed"] = m.SessionSummaryIndexed
+}
+
+func mergeTopologyMetrics(metrics map[string]int64, t memory.TopologyStats) {
+	if metrics == nil {
+		return
+	}
+	if t.Enabled {
+		metrics["topology_enabled"] = 1
+	} else {
+		metrics["topology_enabled"] = 0
+	}
+	metrics["topology_nodes"] = int64(t.Nodes)
+	metrics["topology_edges"] = int64(t.Edges)
+	metrics["topology_edges_added"] = t.EdgesAdded
+	metrics["topology_links_used"] = t.LinksUsed
+}
+
+func buildLearnSessionSummaryText(mode string, target string, itemsIndexed int, summaryDocs int) string {
+	mode = strings.TrimSpace(strings.ToUpper(mode))
+	target = strings.TrimSpace(target)
+	if mode == "" {
+		mode = "LEARN"
+	}
+	if target == "" {
+		target = "n/a"
+	}
+	return fmt.Sprintf(
+		"Gist: %s ingest completed for %s.\nKey Points:\n- Indexed items: %d\n- Source summaries indexed: %d\n- Retrieval memory now has linked source briefs for faster recall.\nRisks/Uncertainty: none\nSource Fingerprint: ingest_session | %s",
+		mode,
+		target,
+		itemsIndexed,
+		summaryDocs,
+		target,
+	)
 }
 
 func renderInlineLearnSummary(fromFile bool, filePath string) string {
@@ -699,4 +1040,480 @@ func normalizeExtensionsList(exts map[string]bool) string {
 		return "default"
 	}
 	return strings.Join(ordered, ",")
+}
+
+func executeLearnFromConnectors(mm *memory.MemoryManager) {
+ctx := context.Background()
+opts := rag.DefaultIndexOptions()
+opts.MaxChunkChars = learnChunkChars
+opts.ChunkOverlap = learnChunkOverlap
+
+totalIndexed := 0
+totalChunks := 0
+var errors []string
+
+// Gmail
+if learnGmailQuery != "" {
+auth, err := googleconn.NewGoogleAuth()
+if err != nil {
+fmt.Printf("Gmail auth error: %v\n", err)
+fmt.Println("Ensure GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_IMPERSONATE_USER are set.")
+errors = append(errors, "gmail: "+err.Error())
+} else {
+connector := googleconn.NewGmailConnector(auth)
+fetchOpts := connectors.FetchOptions{
+Query:      learnGmailQuery,
+MaxResults: learnGmailMax,
+}
+fmt.Printf("Fetching Gmail messages (query: %q, max: %d)...\n", learnGmailQuery, learnGmailMax)
+opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+fmt.Printf("  [gmail] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+}
+stats, err := rag.IndexConnector(ctx, connector, mm, opts, fetchOpts)
+if err != nil {
+fmt.Printf("Gmail indexing error: %v\n", err)
+errors = append(errors, "gmail: "+err.Error())
+} else {
+fmt.Printf("Gmail: %d messages indexed, %d chunks.\n", stats.FilesIndexed, stats.ChunksIndexed)
+totalIndexed += stats.FilesIndexed
+totalChunks += stats.ChunksIndexed
+}
+}
+}
+
+// Google Drive
+if learnGdriveFolderID != "" || learnGdriveQuery != "" {
+auth, err := googleconn.NewGoogleAuth()
+if err != nil {
+fmt.Printf("Google Drive auth error: %v\n", err)
+fmt.Println("Ensure GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_IMPERSONATE_USER are set.")
+errors = append(errors, "gdrive: "+err.Error())
+} else {
+connector := googleconn.NewDriveConnector(auth)
+fetchOpts := connectors.FetchOptions{
+FolderID:   learnGdriveFolderID,
+Query:      learnGdriveQuery,
+MaxResults: learnGdriveMax,
+}
+label := learnGdriveFolderID
+if label == "" {
+label = learnGdriveQuery
+}
+fmt.Printf("Fetching Google Drive files (%s, max: %d)...\n", label, learnGdriveMax)
+opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+fmt.Printf("  [gdrive] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+}
+stats, err := rag.IndexConnector(ctx, connector, mm, opts, fetchOpts)
+if err != nil {
+fmt.Printf("Google Drive indexing error: %v\n", err)
+errors = append(errors, "gdrive: "+err.Error())
+} else {
+fmt.Printf("Google Drive: %d files indexed, %d chunks.\n", stats.FilesIndexed, stats.ChunksIndexed)
+totalIndexed += stats.FilesIndexed
+totalChunks += stats.ChunksIndexed
+}
+}
+}
+
+// Notion
+if learnNotionDatabaseID != "" {
+connector, err := notion.NewNotionConnector()
+if err != nil {
+fmt.Printf("Notion connector error: %v\n", err)
+fmt.Println("Ensure NOTION_API_KEY is set.")
+errors = append(errors, "notion: "+err.Error())
+} else {
+var filter map[string]any
+if learnNotionFilter != "" {
+if jsonErr := json.Unmarshal([]byte(learnNotionFilter), &filter); jsonErr != nil {
+fmt.Printf("Warning: invalid --notion-filter JSON: %v\n", jsonErr)
+}
+}
+fetchOpts := connectors.FetchOptions{
+Query:      learnNotionDatabaseID,
+MaxResults: 100,
+Filter:     filter,
+}
+fmt.Printf("Fetching Notion database (id: %s)...\n", learnNotionDatabaseID)
+opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+fmt.Printf("  [notion] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+}
+stats, err := rag.IndexConnector(ctx, connector, mm, opts, fetchOpts)
+if err != nil {
+fmt.Printf("Notion indexing error: %v\n", err)
+errors = append(errors, "notion: "+err.Error())
+} else {
+fmt.Printf("Notion: %d pages indexed, %d chunks.\n", stats.FilesIndexed, stats.ChunksIndexed)
+totalIndexed += stats.FilesIndexed
+totalChunks += stats.ChunksIndexed
+}
+}
+}
+
+// Project Gutenberg
+if learnBookSearch != "" || len(learnBookIDs) > 0 {
+connector := gutenberg.NewGutenbergConnector()
+fetchOpts := connectors.FetchOptions{
+Query:      learnBookSearch,
+MaxResults: learnBookMax,
+}
+if len(learnBookIDs) > 0 {
+fetchOpts.Filter = map[string]any{
+"book_ids": strings.Join(learnBookIDs, ","),
+}
+fetchOpts.MaxResults = len(learnBookIDs)
+}
+label := learnBookSearch
+if label == "" {
+label = strings.Join(learnBookIDs, ", ")
+}
+fmt.Printf("Fetching Gutenberg book(s) (%s)...\n", label)
+opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+fmt.Printf("  [gutenberg] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+}
+stats, err := rag.IndexConnector(ctx, connector, mm, opts, fetchOpts)
+if err != nil {
+fmt.Printf("Gutenberg indexing error: %v\n", err)
+errors = append(errors, "gutenberg: "+err.Error())
+} else {
+fmt.Printf("Gutenberg: %d book(s) indexed, %d chunks.\n", stats.FilesIndexed, stats.ChunksIndexed)
+totalIndexed += stats.FilesIndexed
+totalChunks += stats.ChunksIndexed
+}
+}
+
+// GitHub
+for _, repoSlug := range learnGitHubRepos {
+repoSlug = strings.TrimSpace(repoSlug)
+if repoSlug == "" {
+continue
+}
+connector := githubconn.NewGitHubConnector()
+fetchOpts := connectors.FetchOptions{
+Query:      repoSlug,
+FolderID:   learnGitHubPath,
+MaxResults: learnGitHubMax,
+}
+fmt.Printf("Fetching GitHub repo (%s)...\n", repoSlug)
+opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+fmt.Printf("  [github] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+}
+stats, err := rag.IndexConnector(ctx, connector, mm, opts, fetchOpts)
+if err != nil {
+fmt.Printf("GitHub indexing error (%s): %v\n", repoSlug, err)
+errors = append(errors, "github("+repoSlug+"): "+err.Error())
+} else {
+fmt.Printf("GitHub %s: %d files indexed, %d chunks.\n", repoSlug, stats.FilesIndexed, stats.ChunksIndexed)
+totalIndexed += stats.FilesIndexed
+totalChunks += stats.ChunksIndexed
+}
+}
+
+fmt.Printf("\nConnector ingest complete. Total: %d documents, %d chunks.", totalIndexed, totalChunks)
+if len(errors) > 0 {
+fmt.Printf(" Errors: %s", strings.Join(errors, "; "))
+}
+fmt.Println()
+}
+
+// executeLearnChain runs sources in the user-specified order given by --chain.
+// It shares a single MemoryManager and collects errors without stopping the chain.
+func executeLearnChain(args []string, mm *memory.MemoryManager) {
+tokens := strings.Split(learnChain, ",")
+var errs []string
+grandTotal := 0
+grandChunks := 0
+
+for _, raw := range tokens {
+tok := strings.ToLower(strings.TrimSpace(raw))
+if tok == "" {
+continue
+}
+fmt.Printf("\n── chain step: %s ──\n", tok)
+var err error
+var indexed, chunks int
+switch tok {
+case "file":
+indexed, chunks, err = runChainFile(args, mm)
+case "dir":
+indexed, chunks, err = runChainDir(mm)
+case "url":
+indexed, chunks, err = runChainURL(mm)
+case "hf":
+indexed, chunks, err = runChainHF(mm)
+case "gmail":
+indexed, chunks, err = runChainGmail(mm)
+case "drive":
+indexed, chunks, err = runChainDrive(mm)
+case "notion":
+indexed, chunks, err = runChainNotion(mm)
+case "books", "gutenberg":
+indexed, chunks, err = runChainBooks(mm)
+case "github":
+indexed, chunks, err = runChainGitHub(mm)
+case "research":
+err = runChainResearch()
+default:
+fmt.Printf("Warning: unknown chain token %q — skipping.\n", tok)
+continue
+}
+if err != nil {
+fmt.Printf("Error in chain step %q: %v\n", tok, err)
+errs = append(errs, tok+": "+err.Error())
+} else {
+fmt.Printf("Chain step %q complete: %d documents, %d chunks.\n", tok, indexed, chunks)
+grandTotal += indexed
+grandChunks += chunks
+}
+}
+
+fmt.Printf("\n── chain complete. Total: %d documents, %d chunks.", grandTotal, grandChunks)
+if len(errs) > 0 {
+fmt.Printf(" Errors: %s", strings.Join(errs, "; "))
+}
+fmt.Println()
+}
+
+// ── per-source chain runner wrappers ────────────────────────────────────────
+
+func runChainFile(args []string, mm *memory.MemoryManager) (int, int, error) {
+if learnFile == "" && len(args) == 0 {
+return 0, 0, fmt.Errorf("--file not set and no inline text provided")
+}
+var content string
+if learnFile != "" {
+data, err := os.ReadFile(learnFile)
+if err != nil {
+return 0, 0, err
+}
+content = string(data)
+} else {
+content = strings.Join(args, " ")
+}
+if err := mm.AddKnowledge(content, nil); err != nil {
+return 0, 0, err
+}
+return 1, 1, nil
+}
+
+func runChainDir(mm *memory.MemoryManager) (int, int, error) {
+if learnDir == "" {
+return 0, 0, fmt.Errorf("--dir not set")
+}
+opts := rag.DefaultIndexOptions()
+opts.MaxChunkChars = learnChunkChars
+opts.ChunkOverlap = learnChunkOverlap
+opts.Recursive = learnRecursive
+opts.Extensions = rag.ParseExtensionsCSV(strings.TrimSpace(learnExtensions))
+opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+fmt.Printf("  [dir] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+}
+stats, err := rag.IndexDirectory(mm, learnDir, opts)
+if err != nil {
+return 0, 0, err
+}
+return stats.FilesIndexed, stats.ChunksIndexed, nil
+}
+
+func runChainURL(mm *memory.MemoryManager) (int, int, error) {
+seedURLs, err := collectURLs(learnURLs, learnURLFile)
+if err != nil {
+return 0, 0, err
+}
+if len(seedURLs) == 0 {
+return 0, 0, fmt.Errorf("--url and --url-file not set")
+}
+remoteOpts := rag.DefaultRemoteIndexOptions()
+remoteOpts.MaxChunkChars = learnChunkChars
+remoteOpts.ChunkOverlap = learnChunkOverlap
+remoteOpts.Crawl = learnCrawl
+remoteOpts.CrawlDepth = learnCrawlDepth
+remoteOpts.MaxPages = learnMaxPages
+remoteOpts.URLSafetyEnabled = learnURLSafety
+remoteOpts.URLSafetyTimeout = learnURLSafetyTimeout
+remoteOpts.URLSafetyCacheTTL = learnURLSafetyCacheTTL
+remoteOpts.URLSafetyVisibility = learnURLSafetyVisibility
+remoteOpts.URLSafetyFailOpen = learnURLSafetyFailOpen
+remoteOpts.URLSafetyAPIKey = strings.TrimSpace(os.Getenv("URLSCAN_API_KEY"))
+remoteOpts.OnEvent = func(ev rag.RemoteEvent) {
+fmt.Printf("  [url] %s: %s\n", ev.Outcome, ev.Source)
+}
+stats, err := rag.IndexURLs(mm, seedURLs, remoteOpts)
+if err != nil {
+return 0, 0, err
+}
+return stats.ItemsIndexed, stats.ChunksIndexed, nil
+}
+
+func runChainHF(mm *memory.MemoryManager) (int, int, error) {
+if len(learnHFDatasets) == 0 {
+return 0, 0, fmt.Errorf("--hf-dataset not set")
+}
+specs := make([]rag.HFSpec, 0, len(learnHFDatasets))
+for _, ds := range learnHFDatasets {
+ds = strings.TrimSpace(ds)
+if ds == "" {
+continue
+}
+specs = append(specs, rag.HFSpec{
+DatasetID:  ds,
+Config:     strings.TrimSpace(learnHFConfig),
+Split:      strings.TrimSpace(learnHFSplit),
+MaxRecords: learnHFMaxRecords,
+})
+}
+remoteOpts := rag.DefaultRemoteIndexOptions()
+remoteOpts.HFToken = strings.TrimSpace(os.Getenv("HF_TOKEN"))
+remoteOpts.MaxChunkChars = learnChunkChars
+remoteOpts.ChunkOverlap = learnChunkOverlap
+remoteOpts.OnEvent = func(ev rag.RemoteEvent) {
+fmt.Printf("  [hf] %s: %s\n", ev.Outcome, ev.Source)
+}
+stats, err := rag.IndexHFDatasets(mm, specs, remoteOpts)
+if err != nil {
+return 0, 0, err
+}
+return stats.ItemsIndexed, stats.ChunksIndexed, nil
+}
+
+func runChainGmail(mm *memory.MemoryManager) (int, int, error) {
+if learnGmailQuery == "" {
+return 0, 0, fmt.Errorf("--gmail-query not set")
+}
+auth, err := googleconn.NewGoogleAuth()
+if err != nil {
+return 0, 0, err
+}
+connector := googleconn.NewGmailConnector(auth)
+opts := rag.DefaultIndexOptions()
+opts.MaxChunkChars = learnChunkChars
+opts.ChunkOverlap = learnChunkOverlap
+opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+fmt.Printf("  [gmail] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+}
+stats, err := rag.IndexConnector(context.Background(), connector, mm, opts, connectors.FetchOptions{
+Query:      learnGmailQuery,
+MaxResults: learnGmailMax,
+})
+if err != nil {
+return 0, 0, err
+}
+return stats.FilesIndexed, stats.ChunksIndexed, nil
+}
+
+func runChainDrive(mm *memory.MemoryManager) (int, int, error) {
+if learnGdriveFolderID == "" && learnGdriveQuery == "" {
+return 0, 0, fmt.Errorf("--gdrive-folder or --gdrive-query not set")
+}
+auth, err := googleconn.NewGoogleAuth()
+if err != nil {
+return 0, 0, err
+}
+connector := googleconn.NewDriveConnector(auth)
+opts := rag.DefaultIndexOptions()
+opts.MaxChunkChars = learnChunkChars
+opts.ChunkOverlap = learnChunkOverlap
+opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+fmt.Printf("  [drive] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+}
+stats, err := rag.IndexConnector(context.Background(), connector, mm, opts, connectors.FetchOptions{
+FolderID:   learnGdriveFolderID,
+Query:      learnGdriveQuery,
+MaxResults: learnGdriveMax,
+})
+if err != nil {
+return 0, 0, err
+}
+return stats.FilesIndexed, stats.ChunksIndexed, nil
+}
+
+func runChainNotion(mm *memory.MemoryManager) (int, int, error) {
+if learnNotionDatabaseID == "" {
+return 0, 0, fmt.Errorf("--notion-database not set")
+}
+connector, err := notion.NewNotionConnector()
+if err != nil {
+return 0, 0, err
+}
+var filter map[string]any
+if learnNotionFilter != "" {
+_ = json.Unmarshal([]byte(learnNotionFilter), &filter)
+}
+opts := rag.DefaultIndexOptions()
+opts.MaxChunkChars = learnChunkChars
+opts.ChunkOverlap = learnChunkOverlap
+opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+fmt.Printf("  [notion] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+}
+stats, err := rag.IndexConnector(context.Background(), connector, mm, opts, connectors.FetchOptions{
+Query:      learnNotionDatabaseID,
+MaxResults: 100,
+Filter:     filter,
+})
+if err != nil {
+return 0, 0, err
+}
+return stats.FilesIndexed, stats.ChunksIndexed, nil
+}
+
+func runChainBooks(mm *memory.MemoryManager) (int, int, error) {
+if learnBookSearch == "" && len(learnBookIDs) == 0 {
+return 0, 0, fmt.Errorf("--book-search or --book-id not set")
+}
+connector := gutenberg.NewGutenbergConnector()
+fetchOpts := connectors.FetchOptions{Query: learnBookSearch, MaxResults: learnBookMax}
+if len(learnBookIDs) > 0 {
+fetchOpts.Filter = map[string]any{"book_ids": strings.Join(learnBookIDs, ",")}
+fetchOpts.MaxResults = len(learnBookIDs)
+}
+opts := rag.DefaultIndexOptions()
+opts.MaxChunkChars = learnChunkChars
+opts.ChunkOverlap = learnChunkOverlap
+opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+fmt.Printf("  [books] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+}
+stats, err := rag.IndexConnector(context.Background(), connector, mm, opts, fetchOpts)
+if err != nil {
+return 0, 0, err
+}
+return stats.FilesIndexed, stats.ChunksIndexed, nil
+}
+
+func runChainGitHub(mm *memory.MemoryManager) (int, int, error) {
+if len(learnGitHubRepos) == 0 {
+return 0, 0, fmt.Errorf("--github-repo not set")
+}
+connector := githubconn.NewGitHubConnector()
+opts := rag.DefaultIndexOptions()
+opts.MaxChunkChars = learnChunkChars
+opts.ChunkOverlap = learnChunkOverlap
+opts.OnSourceIndexed = func(ev rag.SourceIndexedEvent) {
+fmt.Printf("  [github] indexed: %s (%d chunks)\n", ev.SourceRef, ev.ChunkCount)
+}
+totalIndexed := 0
+totalChunks := 0
+for _, slug := range learnGitHubRepos {
+slug = strings.TrimSpace(slug)
+if slug == "" {
+continue
+}
+stats, err := rag.IndexConnector(context.Background(), connector, mm, opts, connectors.FetchOptions{
+Query:      slug,
+FolderID:   learnGitHubPath,
+MaxResults: learnGitHubMax,
+})
+if err != nil {
+return totalIndexed, totalChunks, fmt.Errorf("github %s: %w", slug, err)
+}
+totalIndexed += stats.FilesIndexed
+totalChunks += stats.ChunksIndexed
+}
+return totalIndexed, totalChunks, nil
+}
+
+func runChainResearch() error {
+if learnFromResearch == "" {
+return fmt.Errorf("--from-research not set")
+}
+return executeLearnFromResearch(learnFromResearch, learnIncludeResearchSummary, learnIncludeResearchSources)
 }

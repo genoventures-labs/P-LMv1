@@ -74,9 +74,45 @@ func DetermineTopologyWithState(query string, s state.SessionState) Topology {
 	if s.Confidence < 0.45 || s.AnalyticalMode >= 0.72 {
 		return TopologyOuroboros
 	}
+	// High goal persistence resists branch inflation on otherwise moderate prompts.
+	if s.GoalPersistence >= 0.78 && base == TopologyBloom && len(strings.TrimSpace(query)) < 180 {
+		return TopologySpike
+	}
+	// Low goal persistence allows broader branching when ambiguity exists.
+	if s.GoalPersistence <= 0.30 && base == TopologySpike && (strings.Count(query, " and ") >= 2 || strings.Contains(strings.ToLower(query), "compare")) {
+		return TopologyBloom
+	}
 	// High confidence + low ambiguity can collapse to efficient linear path.
 	if s.Confidence >= 0.8 && s.AnalyticalMode < 0.55 && base == TopologyBloom && len(strings.TrimSpace(query)) < 90 {
 		return TopologySpike
+	}
+	return base
+}
+
+// DetermineTopologyWithTruthShift adjusts cognitive shape based on worldview truth-shift severity.
+// High-severity truth shifts force recursive verification geometry.
+func DetermineTopologyWithTruthShift(query string, s state.SessionState, shiftDetected bool, shiftSeverity float64, conflictIndex float64) Topology {
+	base := DetermineTopologyWithState(query, s)
+	sev := clamp01Geometry(maxFloatGeometry(shiftSeverity, conflictIndex))
+
+	if !shiftDetected && sev < 0.35 {
+		return base
+	}
+	if sev >= 0.78 {
+		return TopologyOuroboros
+	}
+	if sev >= 0.52 {
+		switch base {
+		case TopologySpike:
+			return TopologyBloom
+		case TopologyBloom:
+			return TopologyOuroboros
+		default:
+			return base
+		}
+	}
+	if shiftDetected && sev >= 0.35 && base == TopologySpike {
+		return TopologyBloom
 	}
 	return base
 }
@@ -92,4 +128,21 @@ func markerScore(q string, markers []string) float64 {
 		}
 	}
 	return float64(hits) / float64(len(markers))
+}
+
+func clamp01Geometry(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+func maxFloatGeometry(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
 }

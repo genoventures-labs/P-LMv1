@@ -1,7 +1,6 @@
 package skills
 
 import (
-	"encoding/json"
 	"fmt"
 	"go/format"
 	"go/parser"
@@ -29,6 +28,9 @@ type JITSkillRequest struct {
 // JITSkillArtifact contains generated source + manifest metadata.
 type JITSkillArtifact struct {
 	SkillID      string
+	RevisionID   string
+	Version      string
+	Status       string
 	RootDir      string
 	SourcePath   string
 	ManifestPath string
@@ -79,25 +81,41 @@ func (g *JITGenerator) Generate(req JITSkillRequest) (JITSkillArtifact, error) {
 
 	compileOK := validateGoSource(srcPath)
 	manifestPath := filepath.Join(dir, "skill_manifest.json")
-	manifest := map[string]interface{}{
-		"skill_id":       skillID,
-		"name":           name,
-		"description":    strings.TrimSpace(req.Description),
-		"requirement":    strings.TrimSpace(req.Requirement),
-		"reasoning_tier": strings.TrimSpace(req.ReasoningTier),
-		"task_type":      strings.TrimSpace(req.TaskType),
-		"package":        pkgName,
-		"source_path":    srcPath,
-		"compile_ok":     compileOK,
-		"created_at":     time.Now().UTC().Format(time.RFC3339),
+	manifest := SkillManifestV3{
+		SchemaVersion: "v3",
+		SkillID:       skillID,
+		RevisionID:    revisionIDFrom(skillID, "0.1.0", srcPath),
+		Version:       "0.1.0",
+		Name:          name,
+		Intent:        strings.TrimSpace(req.Requirement),
+		Description:   strings.TrimSpace(req.Description),
+		ReasoningTier: strings.TrimSpace(req.ReasoningTier),
+		TaskType:      strings.TrimSpace(req.TaskType),
+		Status:        SkillStatusDraft,
+		IOContract: SkillIOContract{
+			InputSchema:  "map[string]any",
+			OutputSchema: "map[string]any",
+		},
+		CapabilityPolicy: SkillCapabilityPolicy{
+			SandboxProfile: "skill_default",
+		},
+		Provenance: SkillProvenance{
+			CreatedBy: "jit_generator",
+			CreatedAt: time.Now().UTC(),
+		},
+		SourcePath:  srcPath,
+		PackageName: pkgName,
+		CompileOK:   compileOK,
 	}
-	b, _ := json.MarshalIndent(manifest, "", "  ")
-	if err := os.WriteFile(manifestPath, b, 0o644); err != nil {
+	if err := SaveManifestV3(manifestPath, manifest); err != nil {
 		return JITSkillArtifact{}, err
 	}
 
 	return JITSkillArtifact{
 		SkillID:      skillID,
+		RevisionID:   manifest.RevisionID,
+		Version:      manifest.Version,
+		Status:       manifest.Status,
 		RootDir:      dir,
 		SourcePath:   srcPath,
 		ManifestPath: manifestPath,

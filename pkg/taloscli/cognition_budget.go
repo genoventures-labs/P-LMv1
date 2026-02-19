@@ -3,6 +3,7 @@ package taloscli
 import (
 	"strings"
 
+	"github.com/Thynaptic/P-LMv1/pkg/cognition"
 	"github.com/Thynaptic/P-LMv1/pkg/state"
 )
 
@@ -126,4 +127,31 @@ func estimateTaskComplexity(taskQuery string, sm *state.Manager) int {
 		}
 	}
 	return score
+}
+
+func applyReasoningModulationBudget(base cognitionBudget, mod cognition.ReasoningModulationProfile) cognitionBudget {
+	out := base
+	scale := mod.DensityScale
+	if scale <= 0 {
+		scale = 1.0
+	}
+	out.HistoryTopK = clampIntBudget(int(float64(out.HistoryTopK)*scale), 1, 6)
+	out.KnowledgeTopK = clampIntBudget(int(float64(out.KnowledgeTopK)*scale), 1, 8)
+	if mod.EmotionPressure >= 0.65 {
+		out.UseTreeOfThought = true
+	}
+	if mod.GoalPersistence >= 0.78 && out.Mode != "deep" {
+		out.UseThoughtGraph = false
+	}
+	return out
+}
+
+func clampIntBudget(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }

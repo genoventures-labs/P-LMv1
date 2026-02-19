@@ -24,6 +24,11 @@ const (
 var digitPattern = regexp.MustCompile(`[0-9]`)
 var firstLineNumberRE = regexp.MustCompile(`(?i)(?:line\s+|:)(\d{1,6})(?::\d+)?`)
 
+type StyleCadenceProfile struct {
+	Density float64
+	Tone    string
+}
+
 // PrintBreathAware streams text with a "breathing rhythm" unless raw mode is enabled.
 func PrintBreathAware(text string, sm *state.Manager, raw bool) {
 	PrintBreathAwareStyled(os.Stdout, text, AnalyzeSubtext(text), sm, raw)
@@ -90,6 +95,11 @@ func BuildDebtAwarenessNarrative(tradeoff, impact string) string {
 
 // PrintBreathAwareStyled streams text using provided tonal segments.
 func PrintBreathAwareStyled(w io.Writer, text string, segments []TonalSegment, sm *state.Manager, raw bool) {
+	PrintBreathAwareStyledWithProfile(w, text, segments, sm, raw, nil)
+}
+
+// PrintBreathAwareStyledWithProfile streams text using provided tonal segments.
+func PrintBreathAwareStyledWithProfile(w io.Writer, text string, segments []TonalSegment, sm *state.Manager, raw bool, profile *StyleCadenceProfile) {
 	if text == "" {
 		return
 	}
@@ -99,6 +109,9 @@ func PrintBreathAwareStyled(w io.Writer, text string, segments []TonalSegment, s
 	}
 
 	load := semanticLoadFactor(text)
+	if profile != nil && profile.Density > 0 {
+		load *= clampRangeCadence(profile.Density, 0.60, 1.40)
+	}
 	emotion := emotionalFactor(sm)
 
 	var totalSlept time.Duration
@@ -118,7 +131,11 @@ func PrintBreathAwareStyled(w io.Writer, text string, segments []TonalSegment, s
 
 		_, _ = io.WriteString(w, string(r))
 
-		delay := time.Duration(float64(baseCharDelay) * load * emotion * toneCadenceMultiplier(segments, segIndex))
+		toneMult := toneCadenceMultiplier(segments, segIndex)
+		if profile != nil && strings.TrimSpace(profile.Tone) != "" {
+			toneMult *= toneMultiplierFromProfile(profile.Tone)
+		}
+		delay := time.Duration(float64(baseCharDelay) * load * emotion * toneMult)
 		if len(segments) > 0 && !enteredSegment {
 			enteredSegment = true
 			if segments[segIndex].Tone == ToneSarcastic {
@@ -157,6 +174,31 @@ func PrintBreathAwareStyled(w io.Writer, text string, segments []TonalSegment, s
 		time.Sleep(delay)
 		totalSlept += delay
 	}
+}
+
+func toneMultiplierFromProfile(tone string) float64 {
+	switch strings.ToLower(strings.TrimSpace(tone)) {
+	case "direct_technical":
+		return 0.94
+	case "calm_clarifying":
+		return 1.06
+	case "supportive":
+		return 1.10
+	case "energetic_solution":
+		return 0.96
+	default:
+		return 1.0
+	}
+}
+
+func clampRangeCadence(v, lo, hi float64) float64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 func toneCadenceMultiplier(segments []TonalSegment, idx int) float64 {

@@ -70,6 +70,41 @@ type LearnProfileConfig struct {
 	FromResearch           string   `json:"from_research,omitempty"`
 	IncludeResearchSources bool     `json:"include_research_sources"`
 	IncludeResearchSummary bool     `json:"include_research_summary"`
+	SummarizeSources       bool     `json:"summarize_sources"`
+	SummaryMaxChars        int      `json:"summary_max_chars"`
+	SummaryMaxPoints       int      `json:"summary_max_points"`
+	SummaryModel           string   `json:"summary_model,omitempty"`
+	TitleChunks            bool     `json:"title_chunks"`
+	TitleMaxChars          int      `json:"title_max_chars"`
+	TitleModel             string   `json:"title_model,omitempty"`
+	Incremental            bool     `json:"incremental"`
+	IncrementalManifest    string   `json:"incremental_manifest,omitempty"`
+
+	// Google Workspace — Gmail
+	GmailQuery string `json:"gmail_query,omitempty"`
+	GmailMax   int    `json:"gmail_max,omitempty"`
+
+	// Google Workspace — Drive (includes Docs, Sheets, Slides)
+	GdriveFolderID string `json:"gdrive_folder_id,omitempty"`
+	GdriveQuery    string `json:"gdrive_query,omitempty"`
+	GdriveMax      int    `json:"gdrive_max,omitempty"`
+
+	// Notion
+	NotionDatabaseID string `json:"notion_database_id,omitempty"`
+	NotionFilter     string `json:"notion_filter,omitempty"`
+
+	// Project Gutenberg
+	BookSearch string   `json:"book_search,omitempty"`
+	BookIDs    []string `json:"book_ids,omitempty"`
+	BookMax    int      `json:"book_max,omitempty"`
+
+	// GitHub
+	GitHubRepos []string `json:"github_repos,omitempty"`
+	GitHubPath  string   `json:"github_path,omitempty"`
+	GitHubMax   int      `json:"github_max,omitempty"`
+
+	// Chain
+	Chain string `json:"chain,omitempty"`
 }
 
 type LearnProfile struct {
@@ -118,6 +153,31 @@ type learnRuntimeSnapshot struct {
 	learnFromResearch           string
 	learnIncludeResearchSources bool
 	learnIncludeResearchSummary bool
+	learnSummarizeSources       bool
+	learnSummaryMaxChars        int
+	learnSummaryMaxPoints       int
+	learnSummaryModel           string
+	learnTitleChunks            bool
+	learnTitleMaxChars          int
+	learnTitleModel             string
+	learnIncremental            bool
+	learnIncrementalManifest    string
+
+	// Google Workspace + Notion connector fields
+	learnGmailQuery       string
+	learnGmailMax         int
+	learnGdriveFolderID   string
+	learnGdriveQuery      string
+	learnGdriveMax        int
+	learnNotionDatabaseID string
+	learnNotionFilter     string
+	learnBookSearch       string
+	learnBookIDs          []string
+	learnBookMax          int
+	learnGitHubRepos      []string
+	learnGitHubPath       string
+	learnGitHubMax        int
+	learnChain            string
 }
 
 func installLearnProfileCommands() {
@@ -510,6 +570,30 @@ func currentLearnProfileConfigFromGlobals() LearnProfileConfig {
 		FromResearch:           strings.TrimSpace(learnFromResearch),
 		IncludeResearchSources: learnIncludeResearchSources,
 		IncludeResearchSummary: learnIncludeResearchSummary,
+		SummarizeSources:       learnSummarizeSources,
+		SummaryMaxChars:        learnSummaryMaxChars,
+		SummaryMaxPoints:       learnSummaryMaxPoints,
+		SummaryModel:           strings.TrimSpace(learnSummaryModel),
+		TitleChunks:            learnTitleChunks,
+		TitleMaxChars:          learnTitleMaxChars,
+		TitleModel:             strings.TrimSpace(learnTitleModel),
+		Incremental:            learnIncremental,
+		IncrementalManifest:    strings.TrimSpace(learnIncrementalManifest),
+
+		GmailQuery:       strings.TrimSpace(learnGmailQuery),
+		GmailMax:         learnGmailMax,
+		GdriveFolderID:   strings.TrimSpace(learnGdriveFolderID),
+		GdriveQuery:      strings.TrimSpace(learnGdriveQuery),
+		GdriveMax:        learnGdriveMax,
+		NotionDatabaseID: strings.TrimSpace(learnNotionDatabaseID),
+		NotionFilter:     strings.TrimSpace(learnNotionFilter),
+		BookSearch:       strings.TrimSpace(learnBookSearch),
+		BookIDs:          learnBookIDs,
+		BookMax:          learnBookMax,
+		GitHubRepos:      learnGitHubRepos,
+		GitHubPath:       strings.TrimSpace(learnGitHubPath),
+		GitHubMax:        learnGitHubMax,
+		Chain:            strings.TrimSpace(learnChain),
 	}
 }
 
@@ -551,6 +635,40 @@ func applyLearnProfileConfig(cfg LearnProfileConfig) {
 	learnFromResearch = strings.TrimSpace(cfg.FromResearch)
 	learnIncludeResearchSources = cfg.IncludeResearchSources
 	learnIncludeResearchSummary = cfg.IncludeResearchSummary
+	learnSummarizeSources = cfg.SummarizeSources
+	if cfg.SummaryMaxChars > 0 {
+		learnSummaryMaxChars = cfg.SummaryMaxChars
+	}
+	if cfg.SummaryMaxPoints > 0 {
+		learnSummaryMaxPoints = cfg.SummaryMaxPoints
+	}
+	learnSummaryModel = strings.TrimSpace(cfg.SummaryModel)
+	titleChunks := cfg.TitleChunks
+	if !titleChunks && cfg.TitleMaxChars <= 0 && strings.TrimSpace(cfg.TitleModel) == "" {
+		titleChunks = true
+	}
+	learnTitleChunks = titleChunks
+	if cfg.TitleMaxChars > 0 {
+		learnTitleMaxChars = cfg.TitleMaxChars
+	}
+	learnTitleModel = strings.TrimSpace(cfg.TitleModel)
+	learnIncremental = cfg.Incremental
+	learnIncrementalManifest = strings.TrimSpace(cfg.IncrementalManifest)
+
+	learnGmailQuery = strings.TrimSpace(cfg.GmailQuery)
+	learnGmailMax = cfg.GmailMax
+	learnGdriveFolderID = strings.TrimSpace(cfg.GdriveFolderID)
+	learnGdriveQuery = strings.TrimSpace(cfg.GdriveQuery)
+	learnGdriveMax = cfg.GdriveMax
+	learnNotionDatabaseID = strings.TrimSpace(cfg.NotionDatabaseID)
+	learnNotionFilter = strings.TrimSpace(cfg.NotionFilter)
+	learnBookSearch = strings.TrimSpace(cfg.BookSearch)
+	learnBookIDs = cfg.BookIDs
+	learnBookMax = cfg.BookMax
+	learnGitHubRepos = cfg.GitHubRepos
+	learnGitHubPath = strings.TrimSpace(cfg.GitHubPath)
+	learnGitHubMax = cfg.GitHubMax
+	learnChain = strings.TrimSpace(cfg.Chain)
 }
 
 func validateLearnProfileConfig(cfg LearnProfileConfig) error {
@@ -604,6 +722,15 @@ func validateLearnProfileConfig(cfg LearnProfileConfig) error {
 		if split == "" {
 			return fmt.Errorf("hf_split is required when hf_datasets is set")
 		}
+	}
+	if cfg.SummaryMaxChars < 0 {
+		return fmt.Errorf("summary_max_chars must be >= 0")
+	}
+	if cfg.SummaryMaxPoints < 0 {
+		return fmt.Errorf("summary_max_points must be >= 0")
+	}
+	if cfg.TitleMaxChars < 0 {
+		return fmt.Errorf("title_max_chars must be >= 0")
 	}
 	return nil
 }
@@ -698,6 +825,30 @@ func captureLearnRuntimeSnapshot() learnRuntimeSnapshot {
 		learnFromResearch:           learnFromResearch,
 		learnIncludeResearchSources: learnIncludeResearchSources,
 		learnIncludeResearchSummary: learnIncludeResearchSummary,
+		learnSummarizeSources:       learnSummarizeSources,
+		learnSummaryMaxChars:        learnSummaryMaxChars,
+		learnSummaryMaxPoints:       learnSummaryMaxPoints,
+		learnSummaryModel:           learnSummaryModel,
+		learnTitleChunks:            learnTitleChunks,
+		learnTitleMaxChars:          learnTitleMaxChars,
+		learnTitleModel:             learnTitleModel,
+		learnIncremental:            learnIncremental,
+		learnIncrementalManifest:    learnIncrementalManifest,
+
+		learnGmailQuery:       learnGmailQuery,
+		learnGmailMax:         learnGmailMax,
+		learnGdriveFolderID:   learnGdriveFolderID,
+		learnGdriveQuery:      learnGdriveQuery,
+		learnGdriveMax:        learnGdriveMax,
+		learnNotionDatabaseID: learnNotionDatabaseID,
+		learnNotionFilter:     learnNotionFilter,
+		learnBookSearch:       learnBookSearch,
+		learnBookIDs:          learnBookIDs,
+		learnBookMax:          learnBookMax,
+		learnGitHubRepos:      learnGitHubRepos,
+		learnGitHubPath:       learnGitHubPath,
+		learnGitHubMax:        learnGitHubMax,
+		learnChain:            learnChain,
 	}
 }
 
@@ -802,6 +953,75 @@ func restoreVisitedLearnFlags(cmd *cobra.Command, snap learnRuntimeSnapshot) {
 	if visited["include-research-sources"] {
 		learnIncludeResearchSources = snap.learnIncludeResearchSources
 	}
+	if visited["summarize-sources"] {
+		learnSummarizeSources = snap.learnSummarizeSources
+	}
+	if visited["summary-max-chars"] {
+		learnSummaryMaxChars = snap.learnSummaryMaxChars
+	}
+	if visited["summary-max-points"] {
+		learnSummaryMaxPoints = snap.learnSummaryMaxPoints
+	}
+	if visited["summary-model"] {
+		learnSummaryModel = snap.learnSummaryModel
+	}
+	if visited["title-chunks"] {
+		learnTitleChunks = snap.learnTitleChunks
+	}
+	if visited["title-max-chars"] {
+		learnTitleMaxChars = snap.learnTitleMaxChars
+	}
+	if visited["title-model"] {
+		learnTitleModel = snap.learnTitleModel
+	}
+	if visited["incremental"] {
+		learnIncremental = snap.learnIncremental
+	}
+	if visited["incremental-manifest"] {
+		learnIncrementalManifest = snap.learnIncrementalManifest
+	}
+	if visited["gmail-query"] {
+		learnGmailQuery = snap.learnGmailQuery
+	}
+	if visited["gmail-max"] {
+		learnGmailMax = snap.learnGmailMax
+	}
+	if visited["gdrive-folder"] {
+		learnGdriveFolderID = snap.learnGdriveFolderID
+	}
+	if visited["gdrive-query"] {
+		learnGdriveQuery = snap.learnGdriveQuery
+	}
+	if visited["gdrive-max"] {
+		learnGdriveMax = snap.learnGdriveMax
+	}
+	if visited["notion-database"] {
+		learnNotionDatabaseID = snap.learnNotionDatabaseID
+	}
+	if visited["notion-filter"] {
+		learnNotionFilter = snap.learnNotionFilter
+	}
+	if visited["book-search"] {
+		learnBookSearch = snap.learnBookSearch
+	}
+	if visited["book-id"] {
+		learnBookIDs = snap.learnBookIDs
+	}
+	if visited["book-max"] {
+		learnBookMax = snap.learnBookMax
+	}
+	if visited["github-repo"] {
+		learnGitHubRepos = snap.learnGitHubRepos
+	}
+	if visited["github-path"] {
+		learnGitHubPath = snap.learnGitHubPath
+	}
+	if visited["github-max"] {
+		learnGitHubMax = snap.learnGitHubMax
+	}
+	if visited["chain"] {
+		learnChain = snap.learnChain
+	}
 }
 
 func patchLearnProfileFromVisited(cmd *cobra.Command, p *LearnProfile) {
@@ -905,6 +1125,75 @@ func patchLearnProfileFromVisited(cmd *cobra.Command, p *LearnProfile) {
 	}
 	if visited["include-research-sources"] {
 		cfg.IncludeResearchSources = learnIncludeResearchSources
+	}
+	if visited["summarize-sources"] {
+		cfg.SummarizeSources = learnSummarizeSources
+	}
+	if visited["summary-max-chars"] {
+		cfg.SummaryMaxChars = learnSummaryMaxChars
+	}
+	if visited["summary-max-points"] {
+		cfg.SummaryMaxPoints = learnSummaryMaxPoints
+	}
+	if visited["summary-model"] {
+		cfg.SummaryModel = strings.TrimSpace(learnSummaryModel)
+	}
+	if visited["title-chunks"] {
+		cfg.TitleChunks = learnTitleChunks
+	}
+	if visited["title-max-chars"] {
+		cfg.TitleMaxChars = learnTitleMaxChars
+	}
+	if visited["title-model"] {
+		cfg.TitleModel = strings.TrimSpace(learnTitleModel)
+	}
+	if visited["incremental"] {
+		cfg.Incremental = learnIncremental
+	}
+	if visited["incremental-manifest"] {
+		cfg.IncrementalManifest = strings.TrimSpace(learnIncrementalManifest)
+	}
+	if visited["gmail-query"] {
+		cfg.GmailQuery = strings.TrimSpace(learnGmailQuery)
+	}
+	if visited["gmail-max"] {
+		cfg.GmailMax = learnGmailMax
+	}
+	if visited["gdrive-folder"] {
+		cfg.GdriveFolderID = strings.TrimSpace(learnGdriveFolderID)
+	}
+	if visited["gdrive-query"] {
+		cfg.GdriveQuery = strings.TrimSpace(learnGdriveQuery)
+	}
+	if visited["gdrive-max"] {
+		cfg.GdriveMax = learnGdriveMax
+	}
+	if visited["notion-database"] {
+		cfg.NotionDatabaseID = strings.TrimSpace(learnNotionDatabaseID)
+	}
+	if visited["notion-filter"] {
+		cfg.NotionFilter = strings.TrimSpace(learnNotionFilter)
+	}
+	if visited["book-search"] {
+		cfg.BookSearch = strings.TrimSpace(learnBookSearch)
+	}
+	if visited["book-id"] {
+		cfg.BookIDs = learnBookIDs
+	}
+	if visited["book-max"] {
+		cfg.BookMax = learnBookMax
+	}
+	if visited["github-repo"] {
+		cfg.GitHubRepos = learnGitHubRepos
+	}
+	if visited["github-path"] {
+		cfg.GitHubPath = strings.TrimSpace(learnGitHubPath)
+	}
+	if visited["github-max"] {
+		cfg.GitHubMax = learnGitHubMax
+	}
+	if visited["chain"] {
+		cfg.Chain = strings.TrimSpace(learnChain)
 	}
 }
 

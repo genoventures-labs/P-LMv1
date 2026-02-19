@@ -116,3 +116,13 @@ func TestFetchHFSplitHint(t *testing.T) {
 		t.Fatalf("unexpected hint: %q", hint)
 	}
 }
+
+func TestNormalizeRemoteOptionsChunkTitleDefaults(t *testing.T) {
+	opts := normalizeRemoteOptions(RemoteIndexOptions{})
+	if !opts.GenerateChunkTitles {
+		t.Fatal("expected GenerateChunkTitles enabled by default")
+	}
+	if opts.ChunkTitleMaxChars <= 0 {
+		t.Fatalf("expected positive ChunkTitleMaxChars, got %d", opts.ChunkTitleMaxChars)
+	}
+}

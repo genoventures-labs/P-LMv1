@@ -1,9 +1,15 @@
 package orchestration
 
 import (
+	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,7 +22,10 @@ import (
 )
 
 const (
-	fusionTimeout = 25 * time.Second
+	fusionTimeout                  = 25 * time.Second
+	defaultWorldviewTruthStatePath = ".memory/worldview_truth.json"
+	defaultWorldviewTruthShiftPath = ".memory/worldview_truth_shifts.jsonl"
+	defaultWorldviewHistoryPath    = ".memory/worldview_history.jsonl"
 )
 
 // TechnicalPerspective describes one coherent worldview extracted from evidence.
@@ -44,12 +53,42 @@ type ConflictResolution struct {
 	Rationale string
 }
 
+// WorldviewTruthAnchor captures one canonical resolved conflict.
+type WorldviewTruthAnchor struct {
+	Issue  string `json:"issue"`
+	Winner string `json:"winner"`
+}
+
+// WorldviewTruthState is the persisted unified technical truth snapshot.
+type WorldviewTruthState struct {
+	Version           int                    `json:"version"`
+	UpdatedAt         time.Time              `json:"updated_at"`
+	Query             string                 `json:"query"`
+	TruthHash         string                 `json:"truth_hash"`
+	ConflictIndex     float64                `json:"conflict_index"`
+	FusedWorldview    string                 `json:"fused_worldview"`
+	ResolutionAnchors []WorldviewTruthAnchor `json:"resolution_anchors"`
+}
+
+// WorldviewTruthShift summarizes whether project truth changed materially.
+type WorldviewTruthShift struct {
+	Detected       bool     `json:"detected"`
+	Severity       float64  `json:"severity"`
+	Reason         string   `json:"reason"`
+	PriorTruthHash string   `json:"prior_truth_hash,omitempty"`
+	NewTruthHash   string   `json:"new_truth_hash,omitempty"`
+	ChangedIssues  []string `json:"changed_issues,omitempty"`
+}
+
 // FusionResult captures staged worldview fusion output.
 type FusionResult struct {
 	Perspectives   []TechnicalPerspective
 	Conflicts      []PerspectiveConflict
 	Resolutions    []ConflictResolution
 	Epistemic      []cognition.DebateOutcome
+	TruthState     WorldviewTruthState
+	TruthShift     WorldviewTruthShift
+	Warnings       []string
 	FusedWorldview string
 	ConflictIndex  float64
 }
@@ -84,36 +123,439 @@ func (f *FusionEngine) FuseWorldviews(query string, research string, modelCandid
 	resolutions := resolveConflictsWeighted(conflicts, perspectives)
 	fused := synthesizeUnifiedWorldview(query, perspectives, conflicts, resolutions)
 	epOutcomes, _ := cognition.RunEpistemicSelfAlignment(query, research, segs, f.Memory)
-	if len(epOutcomes) > 0 {
-		fused = strings.TrimSpace(fused) + "\n\nEpistemic Belief Shifts\n"
-		for _, o := range epOutcomes {
-			fused += fmt.Sprintf("- Winner %s over %s: %s\n", o.WinnerID, o.LoserID, o.Rationale)
-			if strings.TrimSpace(o.VerificationNote) != "" {
-				fused += fmt.Sprintf("  Verification: %s\n", o.VerificationNote)
-			}
-		}
-	}
 	if llm := f.llmFuse(query, perspectives, conflicts, resolutions, modelCandidates); strings.TrimSpace(llm) != "" {
 		fused = llm
-		if len(epOutcomes) > 0 {
-			fused = strings.TrimSpace(fused) + "\n\nEpistemic Belief Shifts\n"
-			for _, o := range epOutcomes {
-				fused += fmt.Sprintf("- Winner %s over %s: %s\n", o.WinnerID, o.LoserID, o.Rationale)
-				if strings.TrimSpace(o.VerificationNote) != "" {
-					fused += fmt.Sprintf("  Verification: %s\n", o.VerificationNote)
-				}
-			}
-		}
 	}
+	if len(epOutcomes) > 0 {
+		fused = appendEpistemicBeliefShifts(fused, epOutcomes)
+	}
+	truthState, truthShift, warnings := runWorldviewTruthFusion(query, fused, resolutions, conflictIndex(conflicts))
+	fused = appendWorldviewTruthSection(fused, truthState, truthShift, warnings)
 
 	return FusionResult{
 		Perspectives:   perspectives,
 		Conflicts:      conflicts,
 		Resolutions:    resolutions,
 		Epistemic:      epOutcomes,
+		TruthState:     truthState,
+		TruthShift:     truthShift,
+		Warnings:       warnings,
 		FusedWorldview: fused,
 		ConflictIndex:  conflictIndex(conflicts),
 	}, nil
+}
+
+func appendEpistemicBeliefShifts(fused string, outcomes []cognition.DebateOutcome) string {
+	if len(outcomes) == 0 {
+		return strings.TrimSpace(fused)
+	}
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(fused))
+	b.WriteString("\n\nEpistemic Belief Shifts\n")
+	for _, o := range outcomes {
+		b.WriteString(fmt.Sprintf("- Winner %s over %s: %s\n", o.WinnerID, o.LoserID, o.Rationale))
+		if strings.TrimSpace(o.VerificationNote) != "" {
+			b.WriteString(fmt.Sprintf("  Verification: %s\n", o.VerificationNote))
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func runWorldviewTruthFusion(query, fused string, resolutions []ConflictResolution, idx float64) (WorldviewTruthState, WorldviewTruthShift, []string) {
+	anchors := make([]WorldviewTruthAnchor, 0, len(resolutions))
+	for _, r := range resolutions {
+		issue := strings.TrimSpace(r.Issue)
+		winner := strings.TrimSpace(r.Winner)
+		if issue == "" || winner == "" {
+			continue
+		}
+		anchors = append(anchors, WorldviewTruthAnchor{Issue: issue, Winner: winner})
+	}
+	sort.SliceStable(anchors, func(i, j int) bool { return anchors[i].Issue < anchors[j].Issue })
+	state := WorldviewTruthState{
+		Version:           1,
+		UpdatedAt:         time.Now().UTC(),
+		Query:             strings.TrimSpace(query),
+		TruthHash:         buildWorldviewTruthHash(strings.TrimSpace(query), strings.TrimSpace(fused), anchors),
+		ConflictIndex:     idx,
+		FusedWorldview:    truncateLine(strings.TrimSpace(fused), 2400),
+		ResolutionAnchors: anchors,
+	}
+	prev, found, err := loadWorldviewTruthState(defaultWorldviewTruthStatePath)
+	warnings := make([]string, 0, 2)
+	if err != nil {
+		warnings = append(warnings, "truth load: "+err.Error())
+	}
+	shift := detectWorldviewTruthShift(found, prev, state)
+	if err := saveWorldviewTruthState(defaultWorldviewTruthStatePath, state); err != nil {
+		warnings = append(warnings, "truth save: "+err.Error())
+	}
+	if shift.Detected {
+		if err := appendWorldviewTruthShiftLog(defaultWorldviewTruthShiftPath, shift, state); err != nil {
+			warnings = append(warnings, "truth shift log: "+err.Error())
+		}
+	}
+	if err := appendWorldviewHistoryLog(defaultWorldviewHistoryPath, state); err != nil {
+		warnings = append(warnings, "worldview history log: "+err.Error())
+	}
+	return state, shift, warnings
+}
+
+func appendWorldviewTruthSection(fused string, state WorldviewTruthState, shift WorldviewTruthShift, warnings []string) string {
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(fused))
+	b.WriteString("\n\nStage 4 - Epistemic Worldview Fusion\n")
+	b.WriteString(fmt.Sprintf("- Truth Hash: %s\n", strings.TrimSpace(state.TruthHash)))
+	b.WriteString(fmt.Sprintf("- Conflict Index: %.2f\n", state.ConflictIndex))
+	if shift.Detected {
+		b.WriteString(fmt.Sprintf("- Truth Shift: DETECTED (severity %.2f)\n", shift.Severity))
+		b.WriteString(fmt.Sprintf("  Reason: %s\n", shift.Reason))
+		if len(shift.ChangedIssues) > 0 {
+			for _, issue := range shift.ChangedIssues {
+				b.WriteString("  Changed: " + issue + "\n")
+			}
+		}
+	} else {
+		b.WriteString("- Truth Shift: stable\n")
+	}
+	if len(warnings) > 0 {
+		for _, w := range warnings {
+			b.WriteString("- Warning: " + strings.TrimSpace(w) + "\n")
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func buildWorldviewTruthHash(query, fused string, anchors []WorldviewTruthAnchor) string {
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(strings.ToLower(query)))
+	b.WriteString("\n")
+	for _, a := range anchors {
+		b.WriteString(strings.ToLower(strings.TrimSpace(a.Issue)))
+		b.WriteString("=>")
+		b.WriteString(strings.ToLower(strings.TrimSpace(a.Winner)))
+		b.WriteString("\n")
+	}
+	if strings.TrimSpace(fused) != "" {
+		b.WriteString(strings.ToLower(strings.TrimSpace(truncateLine(fused, 800))))
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:8])
+}
+
+func detectWorldviewTruthShift(found bool, prev WorldviewTruthState, curr WorldviewTruthState) WorldviewTruthShift {
+	shift := WorldviewTruthShift{
+		Detected:       false,
+		Severity:       0,
+		Reason:         "no prior worldview baseline",
+		PriorTruthHash: strings.TrimSpace(prev.TruthHash),
+		NewTruthHash:   strings.TrimSpace(curr.TruthHash),
+	}
+	if !found || strings.TrimSpace(prev.TruthHash) == "" {
+		return shift
+	}
+	if prev.TruthHash == curr.TruthHash {
+		shift.Reason = "truth hash unchanged"
+		return shift
+	}
+
+	prevAnchors := map[string]string{}
+	for _, a := range prev.ResolutionAnchors {
+		issue := strings.TrimSpace(strings.ToLower(a.Issue))
+		winner := strings.TrimSpace(a.Winner)
+		if issue == "" || winner == "" {
+			continue
+		}
+		prevAnchors[issue] = winner
+	}
+	overlap := 0
+	changed := make([]string, 0, len(curr.ResolutionAnchors))
+	for _, a := range curr.ResolutionAnchors {
+		issue := strings.TrimSpace(strings.ToLower(a.Issue))
+		if issue == "" {
+			continue
+		}
+		if prior, ok := prevAnchors[issue]; ok {
+			overlap++
+			if !strings.EqualFold(strings.TrimSpace(prior), strings.TrimSpace(a.Winner)) {
+				changed = append(changed, a.Issue)
+			}
+		}
+	}
+	changedRatio := 0.0
+	if overlap > 0 {
+		changedRatio = float64(len(changed)) / float64(overlap)
+	}
+	severity := clamp01((changedRatio * 0.7) + (curr.ConflictIndex * 0.3))
+	shift.Severity = severity
+	shift.ChangedIssues = uniqueLines(changed, 6)
+
+	if overlap == 0 {
+		if len(curr.ResolutionAnchors) >= 2 && curr.ConflictIndex >= 0.75 {
+			shift.Detected = true
+			shift.Reason = "dominant evidence set changed and replaced previous worldview anchors"
+			return shift
+		}
+		shift.Reason = "anchor set changed with no direct overlap"
+		return shift
+	}
+	if len(changed) == 0 {
+		shift.Reason = "truth hash changed but anchor winners remained stable"
+		return shift
+	}
+	if changedRatio >= 0.34 || curr.ConflictIndex >= 0.60 {
+		shift.Detected = true
+		shift.Reason = fmt.Sprintf("resolved winner changed for %.0f%% of overlapping conflicts", changedRatio*100)
+		return shift
+	}
+	shift.Reason = "minor winner drift below shift threshold"
+	return shift
+}
+
+func loadWorldviewTruthState(path string) (WorldviewTruthState, bool, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		path = defaultWorldviewTruthStatePath
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return WorldviewTruthState{}, false, nil
+		}
+		return WorldviewTruthState{}, false, fmt.Errorf("read worldview state: %w", err)
+	}
+	var s WorldviewTruthState
+	if err := json.Unmarshal(b, &s); err != nil {
+		return WorldviewTruthState{}, false, fmt.Errorf("decode worldview state: %w", err)
+	}
+	return s, true, nil
+}
+
+func saveWorldviewTruthState(path string, state WorldviewTruthState) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		path = defaultWorldviewTruthStatePath
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create worldview dir: %w", err)
+	}
+	payload, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode worldview state: %w", err)
+	}
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		return fmt.Errorf("write worldview state: %w", err)
+	}
+	return nil
+}
+
+func appendWorldviewTruthShiftLog(path string, shift WorldviewTruthShift, state WorldviewTruthState) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		path = defaultWorldviewTruthShiftPath
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create worldview shift dir: %w", err)
+	}
+	entry := map[string]interface{}{
+		"timestamp":      time.Now().UTC(),
+		"detected":       shift.Detected,
+		"severity":       shift.Severity,
+		"reason":         shift.Reason,
+		"prior_truth":    shift.PriorTruthHash,
+		"new_truth":      shift.NewTruthHash,
+		"changed_issues": shift.ChangedIssues,
+		"conflict_index": state.ConflictIndex,
+		"truth_hash":     state.TruthHash,
+	}
+	line, err := json.Marshal(entry)
+	if err != nil {
+		return fmt.Errorf("encode worldview shift: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open worldview shift log: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		return fmt.Errorf("write worldview shift log: %w", err)
+	}
+	return nil
+}
+
+func appendWorldviewHistoryLog(path string, state WorldviewTruthState) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		path = defaultWorldviewHistoryPath
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create worldview history dir: %w", err)
+	}
+	line, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("encode worldview history: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open worldview history: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		return fmt.Errorf("write worldview history: %w", err)
+	}
+	return nil
+}
+
+// LoadCurrentWorldviewTruth reads the latest persisted worldview truth state.
+func LoadCurrentWorldviewTruth() (WorldviewTruthState, bool, error) {
+	return loadWorldviewTruthState(defaultWorldviewTruthStatePath)
+}
+
+// LoadLatestWorldviewTruthShift reads the most recent shift event from JSONL log.
+func LoadLatestWorldviewTruthShift() (WorldviewTruthShift, time.Time, bool, error) {
+	f, err := os.Open(defaultWorldviewTruthShiftPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return WorldviewTruthShift{}, time.Time{}, false, nil
+		}
+		return WorldviewTruthShift{}, time.Time{}, false, fmt.Errorf("open worldview shift log: %w", err)
+	}
+	defer f.Close()
+
+	var last string
+	sc := bufio.NewScanner(f)
+	buf := make([]byte, 0, 64*1024)
+	sc.Buffer(buf, 1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		last = line
+	}
+	if err := sc.Err(); err != nil {
+		return WorldviewTruthShift{}, time.Time{}, false, fmt.Errorf("scan worldview shift log: %w", err)
+	}
+	if strings.TrimSpace(last) == "" {
+		return WorldviewTruthShift{}, time.Time{}, false, nil
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(last), &raw); err != nil {
+		return WorldviewTruthShift{}, time.Time{}, false, fmt.Errorf("decode worldview shift log: %w", err)
+	}
+	out := WorldviewTruthShift{
+		Detected:       parseBoolAny(raw["detected"]),
+		Severity:       parseFloatAny(raw["severity"]),
+		Reason:         strings.TrimSpace(parseStringAny(raw["reason"])),
+		PriorTruthHash: strings.TrimSpace(parseStringAny(raw["prior_truth"])),
+		NewTruthHash:   strings.TrimSpace(parseStringAny(raw["new_truth"])),
+	}
+	if arr, ok := raw["changed_issues"].([]interface{}); ok {
+		for _, v := range arr {
+			s := strings.TrimSpace(parseStringAny(v))
+			if s != "" {
+				out.ChangedIssues = append(out.ChangedIssues, s)
+			}
+		}
+	}
+	ts := parseTimeAny(raw["timestamp"])
+	return out, ts, true, nil
+}
+
+// LoadWorldviewHistory returns all persisted worldview truth snapshots ordered by write-time.
+func LoadWorldviewHistory() ([]WorldviewTruthState, error) {
+	f, err := os.Open(defaultWorldviewHistoryPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("open worldview history: %w", err)
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	buf := make([]byte, 0, 64*1024)
+	sc.Buffer(buf, 1024*1024)
+	out := make([]WorldviewTruthState, 0, 128)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var entry WorldviewTruthState
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		out = append(out, entry)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("scan worldview history: %w", err)
+	}
+	return out, nil
+}
+
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+func parseStringAny(v interface{}) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func parseFloatAny(v interface{}) float64 {
+	switch x := v.(type) {
+	case float64:
+		return x
+	case float32:
+		return float64(x)
+	case int:
+		return float64(x)
+	case int32:
+		return float64(x)
+	case int64:
+		return float64(x)
+	case string:
+		f, _ := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		return f
+	default:
+		return 0
+	}
+}
+
+func parseBoolAny(v interface{}) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case string:
+		b, _ := strconv.ParseBool(strings.TrimSpace(x))
+		return b
+	default:
+		return false
+	}
+}
+
+func parseTimeAny(v interface{}) time.Time {
+	switch x := v.(type) {
+	case string:
+		t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(x))
+		if err == nil {
+			return t
+		}
+		t, _ = time.Parse(time.RFC3339, strings.TrimSpace(x))
+		return t
+	default:
+		return time.Time{}
+	}
 }
 
 // ExtractWorldviews identifies at least two technical perspectives from research + evidence.

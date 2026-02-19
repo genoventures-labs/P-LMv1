@@ -78,6 +78,28 @@ Learn an entire directory (all supported default document types):
 talos learn --dir ./docs
 ```
 
+Ingest from Google Workspace (Gmail):
+
+```bash
+# Requires: GOOGLE_SERVICE_ACCOUNT_JSON=/path/to/sa.json GOOGLE_IMPERSONATE_USER=user@yourdomain.com
+talos learn --gmail-query "label:inbox after:2024/01/01" --gmail-max 100
+```
+
+Ingest from Google Drive (includes Docs, Sheets, Slides):
+
+```bash
+talos learn --gdrive-folder <folder-id> --gdrive-max 200
+talos learn --gdrive-query "mimeType='application/vnd.google-apps.document'"
+```
+
+Ingest from Notion:
+
+```bash
+# Requires: NOTION_API_KEY=secret_...
+talos learn --notion-database <database-id>
+talos learn --notion-database <database-id> --notion-filter '{"property":"Status","select":{"equals":"Done"}}'
+```
+
 Learn only specific file types in a directory:
 
 ```bash

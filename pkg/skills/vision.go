@@ -126,6 +126,7 @@ type WatchTerminalResult struct {
 // DrawBoxRequest describes a temporary desktop highlight.
 type DrawBoxRequest struct {
 	Consent    bool
+	SessionID  string
 	X          int
 	Y          int
 	W          int
@@ -162,6 +163,7 @@ type WarRoomBox struct {
 // DrawWarRoomRequest draws multiple color-coded boxes simultaneously.
 type DrawWarRoomRequest struct {
 	Consent    bool         `json:"consent"`
+	SessionID  string       `json:"session_id,omitempty"`
 	Boxes      []WarRoomBox `json:"boxes"`
 	DurationMS int          `json:"duration_ms,omitempty"`
 }
@@ -183,6 +185,7 @@ type DrawWarRoomResult struct {
 // ContextualHUDFilterRequest focuses the HUD web on the currently opened/hovered document.
 type ContextualHUDFilterRequest struct {
 	Consent           bool
+	SessionID         string
 	RelationalMap     cognition.RelationalMap
 	DocumentAnchors   []cognition.HUDAnchor
 	FocusedDocument   string
@@ -248,6 +251,7 @@ type ForensicProofResult struct {
 // CodeDiffHUDRequest renders a red/green code-diff overlay plus a compact confidence panel.
 type CodeDiffHUDRequest struct {
 	Consent         bool   `json:"consent"`
+	SessionID       string `json:"session_id,omitempty"`
 	BuggyX          int    `json:"buggy_x,omitempty"`
 	BuggyY          int    `json:"buggy_y,omitempty"`
 	BuggyW          int    `json:"buggy_w,omitempty"`
@@ -460,15 +464,23 @@ func WatchTerminal(req WatchTerminalRequest) WatchTerminalResult {
 
 // DrawBox renders a temporary on-screen highlight box at coordinates.
 func DrawBox(req DrawBoxRequest) DrawBoxResult {
+	policy := DefaultOverlayPolicy()
 	out := DrawBoxResult{
 		ExitCode:   1,
 		StatePath:  defaultHUDStatePath,
 		EventsPath: defaultHUDEventsPath,
 	}
-	if !req.Consent {
+	consent := req.Consent
+	if !consent && HasActiveOverlayConsent(strings.TrimSpace(req.SessionID), "draw_box") {
+		consent = true
+	}
+	if !consent {
 		out.RequiresApproval = true
 		out.VisualRequest = "I'm about to highlight part of your screen to point out an issue. Is this okay?"
 		return out
+	}
+	if req.Consent && strings.TrimSpace(req.SessionID) != "" {
+		_ = GrantOverlayConsent(strings.TrimSpace(req.SessionID), "all", policy.SessionConsentTTL)
 	}
 
 	x, y := maxIntVision(req.X, 0), maxIntVision(req.Y, 0)
@@ -565,15 +577,23 @@ root.mainloop()
 
 // DrawWarRoom renders multiple color-coded highlights in one overlay.
 func DrawWarRoom(req DrawWarRoomRequest) DrawWarRoomResult {
+	policy := DefaultOverlayPolicy()
 	out := DrawWarRoomResult{
 		ExitCode:   1,
 		StatePath:  defaultWarRoomStatePath,
 		EventsPath: defaultHUDEventsPath,
 	}
-	if !req.Consent {
+	consent := req.Consent
+	if !consent && HasActiveOverlayConsent(strings.TrimSpace(req.SessionID), "draw_war_room") {
+		consent = true
+	}
+	if !consent {
 		out.RequiresApproval = true
 		out.VisualRequest = "I'm about to highlight multiple areas of your screen. Is this okay?"
 		return out
+	}
+	if req.Consent && strings.TrimSpace(req.SessionID) != "" {
+		_ = GrantOverlayConsent(strings.TrimSpace(req.SessionID), "all", policy.SessionConsentTTL)
 	}
 	if len(req.Boxes) == 0 {
 		out.Stderr = "draw_war_room requires at least one box"
@@ -585,24 +605,42 @@ func DrawWarRoom(req DrawWarRoomRequest) DrawWarRoomResult {
 		duration = 10_000
 	}
 	boxes := make([]WarRoomBox, 0, len(req.Boxes))
-	for _, b := range req.Boxes {
-		w := b.W
-		h := b.H
-		if w <= 0 {
-			w = 180
+	if policy.TaxonomyStrict {
+		cands := make([]OverlayCandidate, 0, len(req.Boxes))
+		for _, b := range req.Boxes {
+			cands = append(cands, OverlayCandidate{
+				Kind:       normalizeOverlayKind(b.Kind),
+				Text:       strings.TrimSpace(b.Text),
+				X:          b.X,
+				Y:          b.Y,
+				W:          b.W,
+				H:          b.H,
+				Confidence: 1.0,
+				Priority:   OverlayPriorityHigh,
+				Source:     "direct_draw_war_room",
+			})
 		}
-		if h <= 0 {
-			h = 100
+		boxes = ToWarRoomBoxes(cands)
+	} else {
+		for _, b := range req.Boxes {
+			w := b.W
+			h := b.H
+			if w <= 0 {
+				w = 180
+			}
+			if h <= 0 {
+				h = 100
+			}
+			boxes = append(boxes, WarRoomBox{
+				X:     maxIntVision(b.X, 0),
+				Y:     maxIntVision(b.Y, 0),
+				W:     w,
+				H:     h,
+				Text:  strings.TrimSpace(b.Text),
+				Kind:  strings.TrimSpace(b.Kind),
+				Color: normalizeWarRoomColor(strings.TrimSpace(b.Kind), strings.TrimSpace(b.Color)),
+			})
 		}
-		boxes = append(boxes, WarRoomBox{
-			X:     maxIntVision(b.X, 0),
-			Y:     maxIntVision(b.Y, 0),
-			W:     w,
-			H:     h,
-			Text:  strings.TrimSpace(b.Text),
-			Kind:  strings.TrimSpace(b.Kind),
-			Color: normalizeWarRoomColor(strings.TrimSpace(b.Kind), strings.TrimSpace(b.Color)),
-		})
 	}
 
 	utility := ""
@@ -727,6 +765,7 @@ func DrawCodeDiffHUD(req CodeDiffHUDRequest) DrawWarRoomResult {
 
 	return DrawWarRoom(DrawWarRoomRequest{
 		Consent:    true,
+		SessionID:  strings.TrimSpace(req.SessionID),
 		DurationMS: req.DurationMS,
 		Boxes: []WarRoomBox{
 			{X: bx, Y: by, W: bw, H: bh, Text: buggyLabel, Kind: "contradiction", Color: "red"},
@@ -773,7 +812,7 @@ func ApplyContextualHUDFiltering(req ContextualHUDFilterRequest) ContextualHUDFi
 		focusAnchor = cognition.HUDAnchor{Document: focused, X: 420, Y: 180, W: 320, H: 180}
 	}
 
-	var boxes []WarRoomBox
+	var candidates []OverlayCandidate
 	addedLinks := 0
 	for _, link := range req.RelationalMap.Links {
 		if addedLinks >= maxLinks {
@@ -789,18 +828,54 @@ func ApplyContextualHUDFiltering(req ContextualHUDFilterRequest) ContextualHUDFi
 		}
 		plan := cognition.BuildEvidenceHUDWeb(link, focusAnchor, ra)
 		for _, b := range plan.Boxes {
-			boxes = append(boxes, WarRoomBox{
-				X: b.X, Y: b.Y, W: b.W, H: b.H,
-				Text: b.Text, Kind: b.Kind, Color: b.Color,
+			kind := normalizeOverlayKind(b.Kind)
+			priority := OverlayPriorityMedium
+			if kind == OverlayKindContradiction || kind == OverlayKindEvidence {
+				priority = OverlayPriorityHigh
+			}
+			candidates = append(candidates, OverlayCandidate{
+				Kind:       kind,
+				Text:       b.Text,
+				X:          b.X,
+				Y:          b.Y,
+				W:          b.W,
+				H:          b.H,
+				Confidence: 0.78,
+				Priority:   priority,
+				Source:     "contextual_hud",
 			})
 		}
 		addedLinks++
 	}
-	if len(boxes) == 0 {
-		boxes = []WarRoomBox{
-			{X: focusAnchor.X, Y: focusAnchor.Y, W: focusAnchor.W, H: focusAnchor.H, Text: "Focused document", Kind: "document", Color: "blue"},
+	if len(candidates) == 0 {
+		candidates = []OverlayCandidate{
+			{
+				Kind:       OverlayKindDocument,
+				Text:       "Focused document",
+				X:          focusAnchor.X,
+				Y:          focusAnchor.Y,
+				W:          focusAnchor.W,
+				H:          focusAnchor.H,
+				Confidence: 0.90,
+				Priority:   OverlayPriorityMedium,
+				Source:     "contextual_hud",
+			},
 		}
 	}
+	policy := DefaultOverlayPolicy()
+	decision := EvaluateOverlayCandidates(candidates, OverlayContext{
+		Stage:     "contextual_hud",
+		Explicit:  true,
+		SessionID: strings.TrimSpace(req.SessionID),
+	}, policy)
+	if !decision.Render {
+		res.Rendered.ExitCode = 0
+		res.Rendered.Allowed = true
+		res.Rendered.BoxesRendered = 0
+		res.Rendered.Utility = "overlay_policy_suppressed"
+		return res
+	}
+	boxes := ToWarRoomBoxes(decision.Selected)
 	res.LinkCount = addedLinks
 	duration := req.DurationMS
 	if duration <= 0 {
@@ -808,6 +883,7 @@ func ApplyContextualHUDFiltering(req ContextualHUDFilterRequest) ContextualHUDFi
 	}
 	res.Rendered = DrawWarRoom(DrawWarRoomRequest{
 		Consent:    true,
+		SessionID:  strings.TrimSpace(req.SessionID),
 		DurationMS: duration,
 		Boxes:      boxes,
 	})
@@ -818,6 +894,7 @@ func ApplyContextualHUDFiltering(req ContextualHUDFilterRequest) ContextualHUDFi
 	}
 	res.FactSheetHUD = DrawBox(DrawBoxRequest{
 		Consent:    true,
+		SessionID:  strings.TrimSpace(req.SessionID),
 		X:          fx,
 		Y:          maxIntVision(20, fy),
 		W:          360,
@@ -987,6 +1064,9 @@ func ClearAllHUDOverlays(reason string) (int, []string) {
 }
 
 func normalizeWarRoomColor(kind, color string) string {
+	if DefaultOverlayPolicy().TaxonomyStrict {
+		return overlayColorForKind(normalizeOverlayKind(kind))
+	}
 	color = strings.ToLower(strings.TrimSpace(color))
 	if strings.HasPrefix(color, "#") && len(color) == 7 {
 		return color

@@ -163,18 +163,24 @@ func (o *Orchestrator) handleSkill(ctx context.Context, signal IntentSignal) (sk
 		return skills.JITSkillArtifact{}, err
 	}
 	if err := reg.Upsert(skills.SkillRecord{
-		SkillID:       strings.TrimSpace(artifact.SkillID),
-		Name:          name,
-		Intent:        intent,
-		Description:   "Self capability generated from TALOS intent routing.",
-		ReasoningTier: strings.TrimSpace(signal.ReasoningTier),
-		TaskType:      strings.TrimSpace(signal.TaskType),
-		RootDir:       strings.TrimSpace(artifact.RootDir),
-		SourcePath:    strings.TrimSpace(artifact.SourcePath),
-		ManifestPath:  strings.TrimSpace(artifact.ManifestPath),
-		PackageName:   strings.TrimSpace(artifact.PackageName),
-		CompileOK:     artifact.CompileOK,
-		Enabled:       true,
+		SkillID:        strings.TrimSpace(artifact.SkillID),
+		RevisionID:     strings.TrimSpace(artifact.RevisionID),
+		Version:        firstNonEmpty(strings.TrimSpace(artifact.Version), "0.1.0"),
+		Status:         skills.SkillStatusDraft,
+		Name:           name,
+		Intent:         intent,
+		Description:    "Self capability generated from TALOS intent routing.",
+		ReasoningTier:  strings.TrimSpace(signal.ReasoningTier),
+		TaskType:       strings.TrimSpace(signal.TaskType),
+		RootDir:        strings.TrimSpace(artifact.RootDir),
+		SourcePath:     strings.TrimSpace(artifact.SourcePath),
+		ManifestPath:   strings.TrimSpace(artifact.ManifestPath),
+		PackageName:    strings.TrimSpace(artifact.PackageName),
+		CompileOK:      artifact.CompileOK,
+		Enabled:        true,
+		Active:         false,
+		Provenance:     "capability_orchestrator",
+		SandboxProfile: "skill_default",
 	}); err != nil {
 		return skills.JITSkillArtifact{}, err
 	}

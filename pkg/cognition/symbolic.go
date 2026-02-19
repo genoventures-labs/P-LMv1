@@ -68,11 +68,25 @@ type SymbolicCheckResult struct {
 
 // SelfPlayResult captures adversarial review/refinement outcomes.
 type SelfPlayResult struct {
+	FinalCandidate   string
+	MaxFlawScore     float64
+	Cycles           int
+	Contradictions   int
+	OpponentFinding  string
+	WinningVector    string
+	WinningRationale string
+	AttackVectors    []SelfPlayAttackResult
+}
+
+// SelfPlayAttackResult captures one adversarial attack vector run.
+type SelfPlayAttackResult struct {
+	VectorName      string
 	FinalCandidate  string
 	MaxFlawScore    float64
-	Cycles          int
 	Contradictions  int
+	Cycles          int
 	OpponentFinding string
+	BranchScore     float64
 }
 
 // CodeAuditOptions carries symbolic code-audit inputs.
@@ -915,39 +929,151 @@ func ConductSelfPlay(candidate string, refs []string) SelfPlayResult {
 		if score >= 0.7 {
 			result.Contradictions = 1
 		}
+		result.WinningVector = "symbolic_fallback"
+		result.WinningRationale = "LLM unavailable; selected symbolic consistency path."
+		result.AttackVectors = []SelfPlayAttackResult{
+			{
+				VectorName:     result.WinningVector,
+				FinalCandidate: current,
+				MaxFlawScore:   score,
+				Contradictions: result.Contradictions,
+				BranchScore:    scoreSelfPlayBranch(score, result.Contradictions, 0),
+			},
+		}
 		return result
 	}
 
 	maxCycles := 2
-	for cycle := 0; cycle < maxCycles; cycle++ {
-		flawScore, critique := runOpponentCritique(client, current, refs)
-		if flawScore > result.MaxFlawScore {
-			result.MaxFlawScore = flawScore
-		}
-		result.OpponentFinding = critique
+	vectors := buildSelfPlayVectors()
+	branches := make([]selfPlayBranch, 0, len(vectors))
+	for _, vector := range vectors {
+		branchCandidate := current
+		branchCycles := 0
+		branchContradictions := 0
+		branchMaxFlaw := 0.0
+		branchCritique := ""
 
-		contradiction := EvaluateLogic(current, refs)
-		if contradiction >= 0.7 {
-			result.Contradictions++
-		}
-		if flawScore <= 0.7 {
-			break
+		for cycle := 0; cycle < maxCycles; cycle++ {
+			flawScore, critique := runOpponentCritiqueWithVector(client, branchCandidate, refs, vector)
+			if flawScore > branchMaxFlaw {
+				branchMaxFlaw = flawScore
+			}
+			branchCritique = critique
+
+			contradiction := EvaluateLogic(branchCandidate, refs)
+			if contradiction >= 0.7 {
+				branchContradictions++
+			}
+			if flawScore <= 0.7 {
+				break
+			}
+
+			refined, ok := runAuthorRebuttalWithVector(client, branchCandidate, critique, refs, vector)
+			if !ok || strings.TrimSpace(refined) == "" {
+				break
+			}
+
+			branchCycles = cycle + 1
+			branchCandidate = strings.TrimSpace(refined)
 		}
 
-		refined, ok := runAuthorRebuttal(client, current, critique, refs)
-		if !ok || strings.TrimSpace(refined) == "" {
-			break
-		}
+		branches = append(branches, selfPlayBranch{
+			vectorName:      vector.Name,
+			finalCandidate:  strings.TrimSpace(branchCandidate),
+			maxFlawScore:    branchMaxFlaw,
+			contradictions:  branchContradictions,
+			cycles:          branchCycles,
+			opponentFinding: strings.TrimSpace(branchCritique),
+			branchScore:     scoreSelfPlayBranch(branchMaxFlaw, branchContradictions, branchCycles),
+		})
+	}
 
-		result.Cycles = cycle + 1
-		current = strings.TrimSpace(refined)
-		result.FinalCandidate = current
+	best, ok := selectStrongestSelfPlayBranch(branches)
+	if !ok {
+		return result
+	}
+	result.FinalCandidate = best.finalCandidate
+	result.MaxFlawScore = best.maxFlawScore
+	result.Cycles = best.cycles
+	result.Contradictions = best.contradictions
+	result.OpponentFinding = best.opponentFinding
+	result.WinningVector = best.vectorName
+	result.WinningRationale = "Selected branch with minimum adversarial flaw score after vectorized internal attack."
+	result.AttackVectors = make([]SelfPlayAttackResult, 0, len(branches))
+	for _, b := range branches {
+		result.AttackVectors = append(result.AttackVectors, SelfPlayAttackResult{
+			VectorName:      b.vectorName,
+			FinalCandidate:  b.finalCandidate,
+			MaxFlawScore:    b.maxFlawScore,
+			Contradictions:  b.contradictions,
+			Cycles:          b.cycles,
+			OpponentFinding: b.opponentFinding,
+			BranchScore:     b.branchScore,
+		})
 	}
 
 	return result
 }
 
 func runOpponentCritique(client *api.Client, candidate string, refs []string) (float64, string) {
+	return runOpponentCritiqueWithVector(client, candidate, refs, selfPlayVector{})
+}
+
+type selfPlayVector struct {
+	Name   string
+	Prompt string
+}
+
+type selfPlayBranch struct {
+	vectorName      string
+	finalCandidate  string
+	maxFlawScore    float64
+	contradictions  int
+	cycles          int
+	opponentFinding string
+	branchScore     float64
+}
+
+func buildSelfPlayVectors() []selfPlayVector {
+	return []selfPlayVector{
+		{Name: "logic_contradiction", Prompt: "Attack logical consistency and contradiction handling."},
+		{Name: "evidence_coverage", Prompt: "Attack missing evidence, citation weakness, and unsupported claims."},
+		{Name: "security_exploitability", Prompt: "Attack security assumptions, exploit paths, and risk under adversarial conditions."},
+		{Name: "implementation_feasibility", Prompt: "Attack operational feasibility, hidden dependencies, and rollout risk."},
+	}
+}
+
+func scoreSelfPlayBranch(maxFlaw float64, contradictions int, cycles int) float64 {
+	return clampScore(maxFlaw) + (0.12 * float64(maxSelfPlayInt(contradictions, 0))) + (0.03 * float64(maxSelfPlayInt(cycles, 0)))
+}
+
+func selectStrongestSelfPlayBranch(branches []selfPlayBranch) (selfPlayBranch, bool) {
+	if len(branches) == 0 {
+		return selfPlayBranch{}, false
+	}
+	best := branches[0]
+	for i := 1; i < len(branches); i++ {
+		b := branches[i]
+		switch {
+		case b.branchScore < best.branchScore:
+			best = b
+		case b.branchScore == best.branchScore && b.maxFlawScore < best.maxFlawScore:
+			best = b
+		case b.branchScore == best.branchScore && b.maxFlawScore == best.maxFlawScore && b.contradictions < best.contradictions:
+			best = b
+		}
+	}
+	return best, true
+}
+
+func maxSelfPlayInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func runOpponentCritiqueWithVector(client *api.Client, candidate string, refs []string, vector selfPlayVector) (float64, string) {
 	system := `You are an adversarial evaluator.
 Find logical gaps, missing edge cases, or factual inconsistencies.
 Return JSON only:
@@ -955,6 +1081,10 @@ Return JSON only:
 Where flaw_score in [0,1] and >0.7 means significant flaw.`
 
 	user := "Candidate answer:\n" + candidate + "\n\nReference context:\n- " + strings.Join(refs, "\n- ")
+	if strings.TrimSpace(vector.Name) != "" {
+		system += "\nUse the declared attack vector to maximize pressure."
+		user += "\n\nAttack vector: " + vector.Name + "\nAttack objective: " + strings.TrimSpace(vector.Prompt)
+	}
 	messages := []api.Message{
 		{Role: "system", Content: system},
 		{Role: "user", Content: user},
@@ -986,16 +1116,26 @@ Where flaw_score in [0,1] and >0.7 means significant flaw.`
 	// Heuristic fallback
 	score := EvaluateLogic(candidate, refs)
 	critique := "Potential inconsistency found by symbolic heuristic."
+	if strings.TrimSpace(vector.Name) != "" {
+		critique = vector.Name + ": " + critique
+	}
 	return score, critique
 }
 
 func runAuthorRebuttal(client *api.Client, candidate string, critique string, refs []string) (string, bool) {
+	return runAuthorRebuttalWithVector(client, candidate, critique, refs, selfPlayVector{})
+}
+
+func runAuthorRebuttalWithVector(client *api.Client, candidate string, critique string, refs []string, vector selfPlayVector) (string, bool) {
 	system := `You are the original author improving an answer under critique.
 Address the criticism directly, correct factual issues, and keep the answer concise.
 Return only the revised answer text.`
 	user := "Original candidate:\n" + candidate +
 		"\n\nOpponent critique:\n" + critique +
 		"\n\nReference context:\n- " + strings.Join(refs, "\n- ")
+	if strings.TrimSpace(vector.Name) != "" {
+		user += "\n\nTarget attack vector to satisfy: " + vector.Name
+	}
 	messages := []api.Message{
 		{Role: "system", Content: system},
 		{Role: "user", Content: user},

@@ -68,6 +68,15 @@ func renderLearnDryRunPlan(args []string) (string, error) {
 	b.WriteString(fmt.Sprintf("  max_pages: %d\n", learnMaxPages))
 	b.WriteString(fmt.Sprintf("  remote_timeout: %s\n", learnRemoteTimeout))
 	b.WriteString(fmt.Sprintf("  max_bytes: %d\n", learnMaxBytes))
+	b.WriteString(fmt.Sprintf("  summarize_sources: %t\n", learnSummarizeSources))
+	b.WriteString(fmt.Sprintf("  summary_max_chars: %d\n", learnSummaryMaxChars))
+	b.WriteString(fmt.Sprintf("  summary_max_points: %d\n", learnSummaryMaxPoints))
+	b.WriteString("  summary_model: " + emptyAsNA(learnSummaryModel) + "\n")
+	b.WriteString(fmt.Sprintf("  title_chunks: %t\n", learnTitleChunks))
+	b.WriteString(fmt.Sprintf("  title_max_chars: %d\n", learnTitleMaxChars))
+	b.WriteString("  title_model: " + emptyAsNA(learnTitleModel) + "\n")
+	b.WriteString(fmt.Sprintf("  incremental: %t\n", learnIncremental))
+	b.WriteString("  incremental_manifest: " + emptyAsNA(learnIncrementalManifest) + "\n")
 	if len(notes) > 0 {
 		b.WriteString("\nNOTES\n")
 		for _, n := range notes {

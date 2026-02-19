@@ -25,12 +25,23 @@ const (
 	collectionNameBase       = "conversation_history"
 	knowledgeCollectionBase  = "knowledge_base"
 	ollamaAPIHostEnv         = "OLLAMA_HOST"
+	retrievalModeEnv         = "TALOS_MEMORY_RETRIEVAL_MODE"
+	candidateWeightsEnv      = "TALOS_RETRIEVAL_CANDIDATE_WEIGHTS"
+	dynamicWeightsEnv        = "TALOS_RETRIEVAL_DYNAMIC_WEIGHTS"
+	knowledgeWeightsEnv      = "TALOS_RETRIEVAL_KNOWLEDGE_WEIGHTS"
+	segmentWeightsEnv        = "TALOS_RETRIEVAL_SEGMENT_WEIGHTS"
 	defaultBaseImportance    = 0.5
 	defaultFreshnessHalfLife = 24 * time.Hour
 	importanceEvalTimeout    = 8 * time.Second
 )
 
 var importanceEvalModels = []string{"llama3.2:1b", "qwen2.5:3b-instruct"}
+
+const (
+	retrievalModeSemantic = "semantic"
+	retrievalModeHybrid   = "hybrid"
+	retrievalModeLexical  = "lexical"
+)
 
 const (
 	metaTimestamp       = "timestamp"
@@ -47,6 +58,7 @@ const (
 	metaImagePath       = "image_path"
 	metaVisualModel     = "visual_model"
 	metaCrossModalLink  = "cross_modal_link_id"
+	metaTopologyNode    = "topology_node"
 )
 
 // MemoryManager handles interaction with chromem-go for conversation memory.
@@ -54,8 +66,20 @@ type MemoryManager struct {
 	db                  *chromem.DB
 	historyCollection   *chromem.Collection
 	knowledgeCollection *chromem.Collection
+	historyBM25         *BM25Index
+	knowledgeBM25       *BM25Index
+	retrievalMode       string
+	retrievalWeights    RetrievalWeights
+	marPolicy           MARPolicy
+	marCache            *marContextCache
 	client              *api.Client
 	activeNamespace     string
+	topology            *TopologyGraph
+	topologyCfg         TopologyConfig
+	topologyPath        string
+	topologyLastErr     string
+	topologyEdgesAdded  int64
+	topologyLinksUsed   int64
 	mu                  sync.Mutex
 }
 
@@ -65,6 +89,30 @@ type KnowledgeSegment struct {
 	Content    string
 	Similarity float64
 	Metadata   map[string]string
+}
+
+type retrievalCandidate struct {
+	ID       string
+	Content  string
+	Metadata map[string]string
+	Semantic float64
+	Lexical  float64
+}
+
+type RetrievalWeights struct {
+	CandidateSemantic float64
+	CandidateLexical  float64
+
+	DynamicSemantic   float64
+	DynamicLexical    float64
+	DynamicImportance float64
+	DynamicFreshness  float64
+
+	KnowledgeSemantic float64
+	KnowledgeLexical  float64
+
+	SegmentSemantic float64
+	SegmentLexical  float64
 }
 
 // NewMemoryManager initializes a new MemoryManager with persistent storage.
@@ -138,13 +186,36 @@ func NewMemoryManager() (*MemoryManager, error) {
 		return nil, fmt.Errorf("failed to get or create knowledge collection: %w", err)
 	}
 
-	return &MemoryManager{
+	retrievalMode := resolveRetrievalMode()
+	retrievalWeights := resolveRetrievalWeights()
+	mm := &MemoryManager{
 		db:                  db,
 		historyCollection:   hCol,
 		knowledgeCollection: kCol,
+		historyBM25:         NewBM25Index(),
+		knowledgeBM25:       NewBM25Index(),
+		retrievalMode:       retrievalMode,
+		retrievalWeights:    retrievalWeights,
+		marPolicy:           defaultMARPolicy(),
+		marCache:            newMARContextCache(),
 		client:              client,
 		activeNamespace:     "",
-	}, nil
+		topologyCfg:         defaultTopologyConfig(),
+		topologyPath:        defaultTopologyPath,
+	}
+	if mm.topologyCfg.Enabled {
+		if graph, loadErr := LoadTopologyGraph(mm.topologyPath); loadErr != nil {
+			mm.topology = newTopologyGraph()
+			mm.topologyLastErr = loadErr.Error()
+		} else {
+			mm.topology = graph
+		}
+	}
+
+	_ = mm.rebuildBM25IndexForCollection(mm.historyCollection, mm.historyBM25)
+	_ = mm.rebuildBM25IndexForCollection(mm.knowledgeCollection, mm.knowledgeBM25)
+
+	return mm, nil
 }
 
 func resolveEmbeddingModel(client *api.Client) (string, error) {
@@ -295,6 +366,132 @@ func collectionNameForModel(base, model string) string {
 	return base + "__" + model
 }
 
+func resolveRetrievalMode() string {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv(retrievalModeEnv)))
+	switch mode {
+	case retrievalModeSemantic, retrievalModeHybrid, retrievalModeLexical:
+		return mode
+	default:
+		return retrievalModeHybrid
+	}
+}
+
+func resolveRetrievalWeights() RetrievalWeights {
+	candidate := parseWeightListEnv(candidateWeightsEnv, []float64{0.60, 0.40})
+	dynamic := parseWeightListEnv(dynamicWeightsEnv, []float64{0.40, 0.20, 0.25, 0.15})
+	knowledge := parseWeightListEnv(knowledgeWeightsEnv, []float64{0.70, 0.30})
+	segment := parseWeightListEnv(segmentWeightsEnv, []float64{0.70, 0.30})
+	return RetrievalWeights{
+		CandidateSemantic: candidate[0],
+		CandidateLexical:  candidate[1],
+
+		DynamicSemantic:   dynamic[0],
+		DynamicLexical:    dynamic[1],
+		DynamicImportance: dynamic[2],
+		DynamicFreshness:  dynamic[3],
+
+		KnowledgeSemantic: knowledge[0],
+		KnowledgeLexical:  knowledge[1],
+
+		SegmentSemantic: segment[0],
+		SegmentLexical:  segment[1],
+	}
+}
+
+func parseWeightListEnv(key string, fallback []float64) []float64 {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return append([]float64(nil), fallback...)
+	}
+	parts := strings.Split(raw, ",")
+	if len(parts) != len(fallback) {
+		return append([]float64(nil), fallback...)
+	}
+	values := make([]float64, 0, len(parts))
+	for _, p := range parts {
+		v, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
+		if err != nil || v < 0 {
+			return append([]float64(nil), fallback...)
+		}
+		values = append(values, v)
+	}
+	return normalizeWeights(values, fallback)
+}
+
+func normalizeWeights(values []float64, fallback []float64) []float64 {
+	if len(values) == 0 {
+		return append([]float64(nil), fallback...)
+	}
+	sum := 0.0
+	for _, v := range values {
+		sum += v
+	}
+	if sum <= 0 {
+		return append([]float64(nil), fallback...)
+	}
+	out := make([]float64, len(values))
+	for i, v := range values {
+		out[i] = v / sum
+	}
+	return out
+}
+
+func (mm *MemoryManager) rebuildBM25IndexForCollection(col *chromem.Collection, idx *BM25Index) error {
+	if mm == nil || col == nil || idx == nil {
+		return nil
+	}
+	count := col.Count()
+	if count <= 0 {
+		idx.Rebuild(nil)
+		return nil
+	}
+	results, err := col.Query(context.Background(), " ", count, nil, nil)
+	if err != nil {
+		return err
+	}
+	docs := make([]bm25Document, 0, len(results))
+	for _, r := range results {
+		meta := make(map[string]string, len(r.Metadata))
+		for k, v := range r.Metadata {
+			meta[k] = v
+		}
+		docs = append(docs, bm25Document{
+			ID:       r.ID,
+			Content:  r.Content,
+			Metadata: meta,
+		})
+	}
+	idx.Rebuild(docs)
+	return nil
+}
+
+func (mm *MemoryManager) bm25IndexForCollection(col *chromem.Collection) *BM25Index {
+	switch col {
+	case mm.historyCollection:
+		return mm.historyBM25
+	case mm.knowledgeCollection:
+		return mm.knowledgeBM25
+	default:
+		return nil
+	}
+}
+
+func (mm *MemoryManager) upsertBM25Doc(col *chromem.Collection, doc chromem.Document) {
+	idx := mm.bm25IndexForCollection(col)
+	if idx == nil {
+		return
+	}
+	meta := make(map[string]string, len(doc.Metadata))
+	for k, v := range doc.Metadata {
+		meta[k] = v
+	}
+	idx.Upsert(bm25Document{
+		ID:       doc.ID,
+		Content:  doc.Content,
+		Metadata: meta,
+	})
+}
+
 // SetActiveNamespace scopes all Add/Retrieve operations to a namespace.
 // Empty means global/unscoped behavior (no metadata filter).
 func (mm *MemoryManager) SetActiveNamespace(namespace string) {
@@ -308,6 +505,128 @@ func (mm *MemoryManager) ActiveNamespace() string {
 	mm.mu.Lock()
 	defer mm.mu.Unlock()
 	return mm.activeNamespace
+}
+
+func (mm *MemoryManager) retrieveCandidates(col *chromem.Collection, idx *BM25Index, query string, candidateLimit int) ([]retrievalCandidate, error) {
+	if col == nil || candidateLimit <= 0 {
+		return nil, nil
+	}
+	mode := mm.retrievalMode
+	if mode == "" {
+		mode = retrievalModeHybrid
+	}
+
+	semanticCandidates := make(map[string]retrievalCandidate)
+	var semanticErr error
+	if mode != retrievalModeLexical {
+		results, err := col.Query(context.Background(), query, candidateLimit, mm.namespaceWhereFilter(), nil)
+		if err != nil {
+			semanticErr = err
+			if mode == retrievalModeSemantic {
+				return nil, err
+			}
+		} else {
+			for _, r := range results {
+				meta := make(map[string]string, len(r.Metadata))
+				for k, v := range r.Metadata {
+					meta[k] = v
+				}
+				semanticCandidates[r.ID] = retrievalCandidate{
+					ID:       r.ID,
+					Content:  r.Content,
+					Metadata: meta,
+					Semantic: similarityToUnit(r.Similarity),
+				}
+			}
+		}
+	}
+
+	lexicalCandidates := make(map[string]retrievalCandidate)
+	if mode != retrievalModeSemantic && idx != nil {
+		ns := strings.TrimSpace(mm.ActiveNamespace())
+		results := idx.Search(query, candidateLimit, ns)
+		for _, r := range results {
+			meta := make(map[string]string, len(r.Metadata))
+			for k, v := range r.Metadata {
+				meta[k] = v
+			}
+			lexicalCandidates[r.ID] = retrievalCandidate{
+				ID:       r.ID,
+				Content:  r.Content,
+				Metadata: meta,
+				Lexical:  clamp01(r.Score),
+			}
+		}
+	}
+
+	if mode == retrievalModeSemantic {
+		return mapCandidates(semanticCandidates, candidateLimit, func(c retrievalCandidate) float64 {
+			return c.Semantic
+		}), nil
+	}
+	if mode == retrievalModeLexical {
+		return mapCandidates(lexicalCandidates, candidateLimit, func(c retrievalCandidate) float64 {
+			return c.Lexical
+		}), nil
+	}
+
+	merged := make(map[string]retrievalCandidate, len(semanticCandidates)+len(lexicalCandidates))
+	for id, c := range semanticCandidates {
+		merged[id] = c
+	}
+	for id, c := range lexicalCandidates {
+		existing := merged[id]
+		if existing.ID == "" {
+			merged[id] = c
+			continue
+		}
+		existing.Lexical = c.Lexical
+		if strings.TrimSpace(existing.Content) == "" {
+			existing.Content = c.Content
+		}
+		if len(existing.Metadata) == 0 {
+			existing.Metadata = c.Metadata
+		}
+		merged[id] = existing
+	}
+	if len(merged) == 0 {
+		if semanticErr != nil {
+			return nil, semanticErr
+		}
+		return nil, nil
+	}
+	return mapCandidates(merged, candidateLimit, func(c retrievalCandidate) float64 {
+		return (c.Semantic * mm.retrievalWeights.CandidateSemantic) + (c.Lexical * mm.retrievalWeights.CandidateLexical)
+	}), nil
+}
+
+func mapCandidates(in map[string]retrievalCandidate, limit int, scoreFn func(retrievalCandidate) float64) []retrievalCandidate {
+	if len(in) == 0 || limit <= 0 {
+		return nil
+	}
+	out := make([]retrievalCandidate, 0, len(in))
+	for _, c := range in {
+		out = append(out, c)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return scoreFn(out[i]) > scoreFn(out[j])
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+func (mm *MemoryManager) sortCandidatesByKnowledgeWeights(candidates []retrievalCandidate) {
+	sort.SliceStable(candidates, func(i, j int) bool {
+		si := (candidates[i].Semantic * mm.retrievalWeights.KnowledgeSemantic) + (candidates[i].Lexical * mm.retrievalWeights.KnowledgeLexical)
+		sj := (candidates[j].Semantic * mm.retrievalWeights.KnowledgeSemantic) + (candidates[j].Lexical * mm.retrievalWeights.KnowledgeLexical)
+		return si > sj
+	})
+}
+
+func (mm *MemoryManager) segmentHybridScore(c retrievalCandidate) float64 {
+	return clamp01((c.Semantic * mm.retrievalWeights.SegmentSemantic) + (c.Lexical * mm.retrievalWeights.SegmentLexical))
 }
 
 // AddMessage adds a message (user or assistant) to the conversation memory.
@@ -335,6 +654,7 @@ func (mm *MemoryManager) AddMessage(role, content string) error {
 	if err != nil {
 		return fmt.Errorf("failed to add message to history: %w", err)
 	}
+	mm.upsertBM25Doc(mm.historyCollection, doc)
 
 	return nil
 }
@@ -356,7 +676,7 @@ func (mm *MemoryManager) RetrieveDynamicContext(query string, k int) ([]string, 
 
 	// Query a broader candidate set before weighted reranking.
 	candidatesN := minInt(maxInt(k*8, 16), count)
-	results, err := mm.historyCollection.Query(context.Background(), query, candidatesN, mm.namespaceWhereFilter(), nil)
+	candidates, err := mm.retrieveCandidates(mm.historyCollection, mm.historyBM25, query, candidatesN)
 	if err != nil {
 		return nil, err
 	}
@@ -367,18 +687,20 @@ func (mm *MemoryManager) RetrieveDynamicContext(query string, k int) ([]string, 
 		content string
 		score   float64
 	}
-	scoredResults := make([]scored, 0, len(results))
-	for _, result := range results {
-		if isArchived(result.Metadata) {
+	scoredResults := make([]scored, 0, len(candidates))
+	for _, c := range candidates {
+		if isArchived(c.Metadata) {
 			continue
 		}
-		importance := parseMetaFloat(result.Metadata, metaBaseImportance, defaultBaseImportance)
-		freshness := freshnessScore(parseMetaTime(result.Metadata, metaTimestamp), now)
-		semantic := similarityToUnit(result.Similarity)
-		finalScore := (semantic * 0.5) + (importance * 0.3) + (freshness * 0.2)
+		importance := parseMetaFloat(c.Metadata, metaBaseImportance, defaultBaseImportance)
+		freshness := freshnessScore(parseMetaTime(c.Metadata, metaTimestamp), now)
+		finalScore := (c.Semantic * mm.retrievalWeights.DynamicSemantic) +
+			(c.Lexical * mm.retrievalWeights.DynamicLexical) +
+			(importance * mm.retrievalWeights.DynamicImportance) +
+			(freshness * mm.retrievalWeights.DynamicFreshness)
 		scoredResults = append(scoredResults, scored{
-			id:      result.ID,
-			content: result.Content,
+			id:      c.ID,
+			content: c.Content,
 			score:   finalScore,
 		})
 	}
@@ -424,14 +746,14 @@ func (mm *MemoryManager) RetrieveContext(query string, k int) ([]string, error) 
 		k = count
 	}
 
-	results, err := mm.historyCollection.Query(context.Background(), query, k, mm.namespaceWhereFilter(), nil)
+	candidates, err := mm.retrieveCandidates(mm.historyCollection, mm.historyBM25, query, k)
 	if err != nil {
 		return nil, err
 	}
 
 	var contextMessages []string
-	for _, result := range results {
-		contextMessages = append(contextMessages, result.Content)
+	for _, c := range candidates {
+		contextMessages = append(contextMessages, c.Content)
 	}
 
 	return contextMessages, nil
@@ -474,8 +796,140 @@ func (mm *MemoryManager) AddKnowledge(content string, metadata map[string]string
 	if err != nil {
 		return fmt.Errorf("failed to add knowledge: %w", err)
 	}
+	mm.upsertBM25Doc(mm.knowledgeCollection, doc)
 
 	return nil
+}
+
+func (mm *MemoryManager) UpsertTopologySource(fp SourceFingerprint) error {
+	if mm == nil {
+		return fmt.Errorf("memory manager is nil")
+	}
+	if !mm.topologyCfg.Enabled {
+		return nil
+	}
+	if mm.topology == nil {
+		mm.topology = newTopologyGraph()
+	}
+	edgesAdded, err := mm.topology.UpsertSource(fp, mm.topologyCfg)
+	if err != nil {
+		mm.mu.Lock()
+		mm.topologyLastErr = err.Error()
+		mm.mu.Unlock()
+		return err
+	}
+	if err := SaveTopologyGraph(mm.topologyPath, mm.topology); err != nil {
+		mm.mu.Lock()
+		mm.topologyLastErr = err.Error()
+		mm.mu.Unlock()
+		return err
+	}
+	mm.mu.Lock()
+	mm.topologyEdgesAdded += int64(edgesAdded)
+	mm.topologyLastErr = ""
+	mm.mu.Unlock()
+	return nil
+}
+
+type TopologyStats struct {
+	Enabled    bool
+	Nodes      int
+	Edges      int
+	EdgesAdded int64
+	LinksUsed  int64
+	LastError  string
+}
+
+func (mm *MemoryManager) TopologyStats() TopologyStats {
+	if mm == nil {
+		return TopologyStats{}
+	}
+	mm.mu.Lock()
+	defer mm.mu.Unlock()
+	out := TopologyStats{
+		Enabled:    mm.topologyCfg.Enabled,
+		EdgesAdded: mm.topologyEdgesAdded,
+		LinksUsed:  mm.topologyLinksUsed,
+		LastError:  mm.topologyLastErr,
+	}
+	if mm.topology != nil {
+		mm.topology.mu.RLock()
+		out.Nodes = len(mm.topology.Nodes)
+		for _, edges := range mm.topology.Adjacency {
+			out.Edges += len(edges)
+		}
+		mm.topology.mu.RUnlock()
+	}
+	return out
+}
+
+// SnapshotKnowledgeSegments returns a broad deterministic sample of knowledge segments for offline consolidation.
+func (mm *MemoryManager) SnapshotKnowledgeSegments(limit int) ([]KnowledgeSegment, error) {
+	if mm == nil || mm.knowledgeCollection == nil {
+		return nil, nil
+	}
+	count := mm.knowledgeCollection.Count()
+	if count <= 0 {
+		return nil, nil
+	}
+	if limit <= 0 || limit > count {
+		limit = count
+	}
+
+	results, err := mm.knowledgeCollection.Query(context.Background(), " ", count, mm.namespaceWhereFilter(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]KnowledgeSegment, 0, minInt(limit, len(results)))
+	for _, r := range results {
+		if isArchived(r.Metadata) {
+			continue
+		}
+		meta := make(map[string]string, len(r.Metadata))
+		for k, v := range r.Metadata {
+			meta[k] = v
+		}
+		score := parseMetaFloat(meta, metaBaseImportance, similarityToUnit(r.Similarity))
+		out = append(out, KnowledgeSegment{
+			ID:         r.ID,
+			Content:    r.Content,
+			Similarity: score,
+			Metadata:   meta,
+		})
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// ReinforceTopologyFromCrossSectionLinks applies cross-sectional evidence to the topology graph and persists updates.
+func (mm *MemoryManager) ReinforceTopologyFromCrossSectionLinks(links []CrossSectionalLink, baseBoost float64) (int, error) {
+	if mm == nil {
+		return 0, fmt.Errorf("memory manager is nil")
+	}
+	if !mm.topologyCfg.Enabled {
+		return 0, nil
+	}
+	if mm.topology == nil {
+		mm.topology = newTopologyGraph()
+	}
+	updated := mm.topology.ReinforceCrossSectionLinks(links, mm.topologyCfg.MaxNeighbors, baseBoost)
+	if updated == 0 {
+		return 0, nil
+	}
+	if err := SaveTopologyGraph(mm.topologyPath, mm.topology); err != nil {
+		mm.mu.Lock()
+		mm.topologyLastErr = err.Error()
+		mm.mu.Unlock()
+		return 0, err
+	}
+	mm.mu.Lock()
+	mm.topologyEdgesAdded += int64(updated)
+	mm.topologyLastErr = ""
+	mm.mu.Unlock()
+	return updated, nil
 }
 
 // RefineImportance re-evaluates importance from retrieval frequency and updates metadata.
@@ -501,23 +955,25 @@ func (mm *MemoryManager) RetrieveKnowledge(query string, k int) ([]string, error
 		k = count
 	}
 
-	results, err := mm.knowledgeCollection.Query(context.Background(), query, k, mm.namespaceWhereFilter(), nil)
+	candidatesN := minInt(maxInt(k*6, 12), count)
+	candidates, err := mm.retrieveCandidates(mm.knowledgeCollection, mm.knowledgeBM25, query, candidatesN)
 	if err != nil {
 		return nil, err
 	}
+	mm.sortCandidatesByKnowledgeWeights(candidates)
 
 	var knowledge []string
 	selectedIDs := make(map[string]bool)
 	clusterIDs := make(map[string]bool)
 	now := time.Now().UTC()
-	for _, result := range results {
-		if isArchived(result.Metadata) {
+	for _, c := range candidates {
+		if isArchived(c.Metadata) {
 			continue
 		}
-		knowledge = append(knowledge, result.Content)
-		selectedIDs[result.ID] = true
-		mm.bumpRetrievalCount(mm.knowledgeCollection, result.ID, now)
-		if cid := strings.TrimSpace(result.Metadata[metaClusterID]); cid != "" {
+		knowledge = append(knowledge, c.Content)
+		selectedIDs[c.ID] = true
+		mm.bumpRetrievalCount(mm.knowledgeCollection, c.ID, now)
+		if cid := strings.TrimSpace(c.Metadata[metaClusterID]); cid != "" {
 			clusterIDs[cid] = true
 		}
 		if len(knowledge) >= k {
@@ -552,26 +1008,34 @@ func (mm *MemoryManager) RetrieveKnowledgeSegments(query string, k int) ([]Knowl
 		return nil, nil
 	}
 
-	results, err := mm.knowledgeCollection.Query(context.Background(), query, k, mm.namespaceWhereFilter(), nil)
+	candidatesN := minInt(maxInt(k*6, 12), count)
+	candidates, err := mm.retrieveCandidates(mm.knowledgeCollection, mm.knowledgeBM25, query, candidatesN)
 	if err != nil {
 		return nil, err
 	}
+	mm.sortCandidatesByKnowledgeWeights(candidates)
 
-	segments := make([]KnowledgeSegment, 0, len(results))
-	for _, result := range results {
-		if isArchived(result.Metadata) {
+	segments := make([]KnowledgeSegment, 0, len(candidates))
+	now := time.Now().UTC()
+	for _, c := range candidates {
+		if isArchived(c.Metadata) {
 			continue
 		}
-		meta := make(map[string]string, len(result.Metadata))
-		for mk, mv := range result.Metadata {
+		meta := make(map[string]string, len(c.Metadata))
+		for mk, mv := range c.Metadata {
 			meta[mk] = mv
 		}
+		hybridScore := mm.segmentHybridScore(c)
 		segments = append(segments, KnowledgeSegment{
-			ID:         result.ID,
-			Content:    result.Content,
-			Similarity: similarityToUnit(result.Similarity),
+			ID:         c.ID,
+			Content:    c.Content,
+			Similarity: hybridScore,
 			Metadata:   meta,
 		})
+		mm.bumpRetrievalCount(mm.knowledgeCollection, c.ID, now)
+		if len(segments) >= k {
+			break
+		}
 	}
 	if len(segments) < k {
 		selected := make(map[string]bool, len(segments))
@@ -584,7 +1048,103 @@ func (mm *MemoryManager) RetrieveKnowledgeSegments(query string, k int) ([]Knowl
 			segments = append(segments, extra...)
 		}
 	}
+	if len(segments) > 0 && mm.topologyCfg.Enabled && mm.topology != nil && mm.topologyCfg.ExpansionLimit > 0 {
+		expanded, linksUsed := mm.topologyExpandSegments(segments, minInt(mm.topologyCfg.ExpansionLimit, maxInt(k, 1)))
+		if len(expanded) > 0 {
+			segments = append(segments, expanded...)
+			sort.SliceStable(segments, func(i, j int) bool {
+				if segments[i].Similarity == segments[j].Similarity {
+					ri := topologyRefFromMetadata(segments[i].Metadata)
+					rj := topologyRefFromMetadata(segments[j].Metadata)
+					if ri == rj {
+						ii := parseMetaInt(segments[i].Metadata, "chunk_index", 0)
+						ij := parseMetaInt(segments[j].Metadata, "chunk_index", 0)
+						return ii < ij
+					}
+					return ri < rj
+				}
+				return segments[i].Similarity > segments[j].Similarity
+			})
+			if len(segments) > k {
+				segments = segments[:k]
+			}
+		}
+		mm.mu.Lock()
+		mm.topologyLinksUsed += int64(linksUsed)
+		mm.mu.Unlock()
+	}
 	return segments, nil
+}
+
+func (mm *MemoryManager) topologyExpandSegments(seed []KnowledgeSegment, limit int) ([]KnowledgeSegment, int) {
+	if mm == nil || mm.topology == nil || len(seed) == 0 || limit <= 0 {
+		return nil, 0
+	}
+	selected := map[string]bool{}
+	seedRefs := map[string]bool{}
+	for _, s := range seed {
+		selected[s.ID] = true
+		if ref := topologyRefFromMetadata(s.Metadata); ref != "" {
+			seedRefs[ref] = true
+		}
+	}
+	if len(seedRefs) == 0 {
+		return nil, 0
+	}
+	related := map[string]float64{}
+	linksUsed := 0
+	for ref := range seedRefs {
+		for _, edge := range mm.topology.Related(ref, mm.topologyCfg.MaxNeighbors) {
+			if edge.Weight <= 0 {
+				continue
+			}
+			linksUsed++
+			if edge.Weight > related[edge.To] {
+				related[edge.To] = edge.Weight
+			}
+		}
+	}
+	if len(related) == 0 {
+		return nil, 0
+	}
+
+	count := mm.knowledgeCollection.Count()
+	if count == 0 {
+		return nil, 0
+	}
+	results, err := mm.knowledgeCollection.Query(context.Background(), " ", count, mm.namespaceWhereFilter(), nil)
+	if err != nil {
+		return nil, 0
+	}
+	out := make([]KnowledgeSegment, 0, limit)
+	now := time.Now().UTC()
+	for _, r := range results {
+		if len(out) >= limit {
+			break
+		}
+		if selected[r.ID] || isArchived(r.Metadata) {
+			continue
+		}
+		ref := topologyRefFromMetadata(r.Metadata)
+		weight, ok := related[ref]
+		if !ok {
+			continue
+		}
+		meta := make(map[string]string, len(r.Metadata))
+		for k, v := range r.Metadata {
+			meta[k] = v
+		}
+		boosted := clamp01(similarityToUnit(r.Similarity)*0.75 + weight*0.25)
+		out = append(out, KnowledgeSegment{
+			ID:         r.ID,
+			Content:    r.Content,
+			Similarity: boosted,
+			Metadata:   meta,
+		})
+		selected[r.ID] = true
+		mm.bumpRetrievalCount(mm.knowledgeCollection, r.ID, now)
+	}
+	return out, linksUsed
 }
 
 // HistoryCount returns the number of items in the history collection.
@@ -718,6 +1278,7 @@ func (mm *MemoryManager) bumpRetrievalCount(col *chromem.Collection, docID strin
 		doc.Metadata[metaTimestamp] = now.Format(time.RFC3339)
 	}
 	_ = col.AddDocument(context.Background(), doc)
+	mm.upsertBM25Doc(col, doc)
 }
 
 func (mm *MemoryManager) refineCollectionImportance(col *chromem.Collection, now time.Time) error {
@@ -762,6 +1323,7 @@ func (mm *MemoryManager) refineCollectionImportance(col *chromem.Collection, now
 		if addErr := col.AddDocument(context.Background(), doc); addErr != nil {
 			continue
 		}
+		mm.upsertBM25Doc(col, doc)
 	}
 	return nil
 }
@@ -825,6 +1387,29 @@ func parseMetaTime(meta map[string]string, key string) *time.Time {
 		return nil
 	}
 	return &t
+}
+
+func topologyRefFromMetadata(meta map[string]string) string {
+	if meta == nil {
+		return ""
+	}
+	if v := strings.TrimSpace(meta[metaTopologyNode]); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(meta["source_path"]); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(meta["source_url"]); v != "" {
+		return v
+	}
+	if ds := strings.TrimSpace(meta["hf_dataset"]); ds != "" {
+		split := strings.TrimSpace(meta["hf_split"])
+		if split == "" {
+			return "hf:" + ds
+		}
+		return "hf:" + ds + ":" + split
+	}
+	return ""
 }
 
 func isArchived(meta map[string]string) bool {
@@ -1027,6 +1612,7 @@ func (mm *MemoryManager) PruneLowSignalContext(maxArchive int) (int, error) {
 		if err := mm.historyCollection.AddDocument(context.Background(), c.doc); err != nil {
 			continue
 		}
+		mm.upsertBM25Doc(mm.historyCollection, c.doc)
 		archived++
 	}
 	return archived, nil
@@ -1053,7 +1639,56 @@ func (mm *MemoryManager) AdjustKnowledgeImportanceByID(docID string, delta float
 	doc.Metadata[metaBaseImportance] = formatFloat(cur + delta)
 	doc.Metadata["belief_shift_reason"] = strings.TrimSpace(reason)
 	doc.Metadata["belief_shift_at"] = time.Now().UTC().Format(time.RFC3339)
-	return mm.knowledgeCollection.AddDocument(context.Background(), doc)
+	if err := mm.knowledgeCollection.AddDocument(context.Background(), doc); err != nil {
+		return err
+	}
+	mm.upsertBM25Doc(mm.knowledgeCollection, doc)
+	return nil
+}
+
+// ArchiveKnowledgeBySourcePath archives active knowledge documents for a given source_path.
+func (mm *MemoryManager) ArchiveKnowledgeBySourcePath(sourcePath, reason string) (int, error) {
+	if mm == nil || mm.knowledgeCollection == nil {
+		return 0, fmt.Errorf("memory manager not initialized")
+	}
+	sourcePath = strings.TrimSpace(sourcePath)
+	if sourcePath == "" {
+		return 0, fmt.Errorf("sourcePath is required")
+	}
+	count := mm.knowledgeCollection.Count()
+	if count == 0 {
+		return 0, nil
+	}
+	results, err := mm.knowledgeCollection.Query(context.Background(), " ", count, mm.namespaceWhereFilter(), nil)
+	if err != nil {
+		return 0, err
+	}
+	archived := 0
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, r := range results {
+		if strings.TrimSpace(r.Metadata["source_path"]) != sourcePath {
+			continue
+		}
+		doc, getErr := mm.knowledgeCollection.GetByID(context.Background(), r.ID)
+		if getErr != nil {
+			continue
+		}
+		if doc.Metadata == nil {
+			doc.Metadata = map[string]string{}
+		}
+		if isArchived(doc.Metadata) {
+			continue
+		}
+		doc.Metadata[metaArchived] = "true"
+		doc.Metadata[metaArchiveReason] = strings.TrimSpace(reason)
+		doc.Metadata[metaLastReindexedAt] = now
+		if addErr := mm.knowledgeCollection.AddDocument(context.Background(), doc); addErr != nil {
+			continue
+		}
+		mm.upsertBM25Doc(mm.knowledgeCollection, doc)
+		archived++
+	}
+	return archived, nil
 }
 
 // ApplyBeliefShift downgrades an old belief and elevates the winning new belief.

@@ -709,12 +709,19 @@ func runChronosMCTS(hyps []ForgeryHypothesis) *ThoughtNode {
 	}
 	engine := MCTSEngine{
 		Config: MCTSConfig{
-			Iterations:     6,
-			BranchFactor:   minIntChronos(maxIntChronos(len(hyps), 3), 5),
-			RolloutDepth:   2,
-			UCB1C:          1.15,
-			PruneThreshold: 0.20,
-			Seed:           42,
+			Iterations:         6,
+			BranchFactor:       minIntChronos(maxIntChronos(len(hyps), 3), 5),
+			RolloutDepth:       2,
+			UCB1C:              1.15,
+			PruneThreshold:     0.20,
+			Seed:               42,
+			Strategy:           MCTSStrategyPUCT,
+			MaxChildrenPerNode: 5,
+			WideningAlpha:      0.5,
+			WideningK:          1.4,
+			PriorWeight:        1.10,
+			MaxConcurrency:     2,
+			Deterministic:      true,
 		},
 		Callbacks: MCTSCallbacks{
 			ProposeBranches: func(_ context.Context, _ string, branchCount int) ([]string, error) {
@@ -754,8 +761,11 @@ func runChronosMCTS(hyps []ForgeryHypothesis) *ThoughtNode {
 			},
 		},
 	}
-	_, _, root, _ := engine.Search(context.Background(), "chronos-forgery-arbitration")
-	return root
+	res, err := engine.SearchV2(context.Background(), "chronos-forgery-arbitration")
+	if err != nil {
+		return nil
+	}
+	return res.Root
 }
 
 func sharesConflictSurface(a, b ScoutFinding) bool {

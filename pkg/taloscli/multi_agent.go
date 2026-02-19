@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -16,6 +15,7 @@ import (
 	"github.com/Thynaptic/P-LMv1/pkg/memory"
 	"github.com/Thynaptic/P-LMv1/pkg/router"
 	"github.com/Thynaptic/P-LMv1/pkg/state"
+	"github.com/Thynaptic/P-LMv1/pkg/toolflow"
 	"github.com/Thynaptic/P-LMv1/pkg/tools"
 	"github.com/ollama/ollama/api"
 	"github.com/spf13/cobra"
@@ -30,7 +30,7 @@ var (
 	maMode             string
 )
 
-var supportedSubAgents = []string{"planner", "researcher", "verifier", "synthesizer"}
+var supportedSubAgents = []string{"planner", "researcher", "docsearcher", "verifier", "synthesizer"}
 
 const (
 	maDefaultFirstTokenTimeout = 75 * time.Second
@@ -81,8 +81,10 @@ var multiAgentCmd = &cobra.Command{
 		}
 		sm, err := state.NewManager()
 		if err == nil {
-			sm.SetPrimaryGoal(query)
-			_ = sm.Save()
+			_, note := applyPersistentGoalLock(sm, query, "multi-agent")
+			if strings.TrimSpace(note) != "" {
+				fmt.Printf("DEBUG: %s\n", strings.TrimSpace(note))
+			}
 		}
 		reindexer := memory.NewReindexer(mm, sm)
 		reindexer.Start()
@@ -196,7 +198,14 @@ func researcherSystemPrompt() string {
 	return `You are the Researcher agent.
 You may call tools to gather evidence.
 Prefer web_search for discovery, fetch_url for page content, http_request for APIs, vector_retrieve for semantic retrieval.
-When done, provide a concise factual summary with source domains if available.`
+When done, provide a concise factual summary and include any available sources (URLs, local paths/docs, hf refs).`
+}
+
+func docSearcherSystemPrompt() string {
+	return `You are the DocSearcher agent.
+You may call tools to gather local evidence.
+Prefer doc_search for recursive local file and directory scans.
+Return concise findings with local path citations (and line hints when available).`
 }
 
 func verifierSystemPrompt() string {
@@ -209,7 +218,7 @@ func synthesizerSystemPrompt() string {
 	return `You are the Synthesizer agent.
 Write the final answer using evidence and verifier notes.
 Use concise, high-signal prose.
-If sources are provided, cite with [n] markers that map to the numbered source list.`
+If sources are provided, cite with [n] markers that map to the numbered source list (URLs and local refs).`
 }
 
 func parseSelectedSubAgents(raw string) ([]string, error) {
@@ -240,12 +249,14 @@ func parseSelectedSubAgents(raw string) ([]string, error) {
 			add("planner")
 		case "researcher", "research":
 			add("researcher")
+		case "docsearcher", "docsearch", "doc-search", "searcher":
+			add("docsearcher")
 		case "verifier", "verify":
 			add("verifier")
 		case "synthesizer", "synth", "synthesis", "final":
 			add("synthesizer")
 		default:
-			return nil, fmt.Errorf("unknown sub-agent %q (supported: planner,researcher,verifier,synthesizer,all)", token)
+			return nil, fmt.Errorf("unknown sub-agent %q (supported: planner,researcher,docsearcher,verifier,synthesizer,all)", token)
 		}
 	}
 	return out, nil
@@ -261,11 +272,12 @@ func runSubAgent(
 ) subAgentResult {
 	res := subAgentResult{Agent: agent}
 	var (
-		systemPrompt string
-		userPrompt   string
-		maxLoops     int
-		allowTools   bool
-		stage        string
+		systemPrompt    string
+		userPrompt      string
+		maxLoops        int
+		allowTools      bool
+		stage           string
+		reflectionStage cognition.ReflectionStage
 	)
 
 	basePrompt := "User query:\n" + query
@@ -280,24 +292,38 @@ func runSubAgent(
 		maxLoops = 1
 		allowTools = false
 		stage = "plan"
+		reflectionStage = cognition.StageMAPlan
 	case "researcher":
 		systemPrompt = researcherSystemPrompt()
 		userPrompt = basePrompt
 		maxLoops = maMaxResearchLoops
+		if maxLoops <= 0 {
+			maxLoops = 1
+		}
 		allowTools = true
 		stage = "research"
+		reflectionStage = cognition.StageMAResearch
+	case "docsearcher":
+		systemPrompt = docSearcherSystemPrompt()
+		userPrompt = basePrompt + "\n\nFocus on exact wording search across local docs/files. Use doc_search."
+		maxLoops = 2
+		allowTools = true
+		stage = "docsearch"
+		reflectionStage = cognition.StageMAResearch
 	case "verifier":
 		systemPrompt = verifierSystemPrompt()
 		userPrompt = basePrompt
 		maxLoops = 1
 		allowTools = true
 		stage = "verify"
+		reflectionStage = cognition.StageMAVerify
 	case "synthesizer":
 		systemPrompt = synthesizerSystemPrompt()
 		userPrompt = basePrompt + "\n\nProvide final answer now."
 		maxLoops = 1
 		allowTools = false
 		stage = "final"
+		reflectionStage = cognition.StageMASynthesize
 	default:
 		res.Err = fmt.Errorf("unsupported sub-agent: %s", agent)
 		return res
@@ -305,12 +331,28 @@ func runSubAgent(
 
 	resp, toolLogs, err := runAgentLoop(client, tc, modelCandidates, systemPrompt, userPrompt, maxLoops, allowTools, query, stage, maFinalLatencyBudgetMS)
 	if err != nil {
+		if isSelectiveInterventionRequiredError(err) {
+			res.Output = selectiveInterventionErrorMessage(err)
+			res.Sources = nil
+			res.ToolLog = toolLogs
+			return res
+		}
 		res.Err = err
 		return res
 	}
 	res.Output = sanitizeModelOutput(resp)
 	res.ToolLog = toolLogs
-	res.Sources = uniqueStrings(extractURLs(strings.Join(toolLogs, "\n") + "\n" + res.Output))
+	res.Sources = extractSourceRefs(strings.Join(toolLogs, "\n") + "\n" + res.Output)
+	res.Output, _ = applyReflectionGate(
+		client,
+		modelCandidates,
+		reflectionStage,
+		query,
+		res.Output,
+		res.Sources,
+		nil,
+		nil,
+	)
 	return res
 }
 
@@ -403,15 +445,44 @@ func runMultiAgentPipeline(
 	modelCandidates []string,
 	query string,
 ) (string, []string, error) {
+	plannerTimeout := boundedStageTimeout(maChatTimeout/4, 30*time.Second, 75*time.Second)
+	researchStepTimeout := boundedStageTimeout(maChatTimeout/3, 45*time.Second, 90*time.Second)
+	verifierTimeout := boundedStageTimeout(maChatTimeout/4, 30*time.Second, 60*time.Second)
+	synthTimeout := boundedStageTimeout(maChatTimeout/4, 30*time.Second, 75*time.Second)
+
 	knowledgeCtx, _, plannerInput := buildPlannerInput(mm, query)
 
-	plannerResp, _, err := runAgentLoop(client, tc, modelCandidates, plannerSystemPrompt(), plannerInput, 1, false, query, "plan", 0)
+	plannerResp, _, err := runAgentLoopWithTimeout(client, tc, modelCandidates, plannerSystemPrompt(), plannerInput, 1, false, query, "plan", 0, plannerTimeout)
 	if err != nil {
+		if isSelectiveInterventionRequiredError(err) {
+			return selectiveInterventionErrorMessage(err), nil, nil
+		}
 		return "", nil, fmt.Errorf("planner failed: %w", err)
 	}
-	steps := parsePlanSteps(plannerResp, query, maMaxPlanSteps)
+	plannerResp, plannerReflectionNotes := applyReflectionGate(
+		client,
+		modelCandidates,
+		cognition.StageMAPlan,
+		query,
+		plannerResp,
+		nil,
+		knowledgeCtx,
+		nil,
+	)
+	for _, note := range plannerReflectionNotes {
+		fmt.Println(note)
+	}
+	steps, autoDecomposed := parsePlanStepsV2(plannerResp, query, maMaxPlanSteps)
 	if len(steps) == 0 {
 		steps = []string{query}
+	}
+	if autoDecomposed {
+		fmt.Println("Goal Decomposition v2: recursive task tree expanded automatically.")
+	}
+	fmt.Printf("Planning complete: %d step(s).\n", len(steps))
+	fmt.Println("Planner outline:")
+	for i, step := range steps {
+		fmt.Printf("  %d. %s\n", i+1, summarizePlanStep(step, 180))
 	}
 
 	if maVerbose {
@@ -425,10 +496,11 @@ func runMultiAgentPipeline(
 	allSources := make(map[string]bool)
 
 	for i, step := range steps {
+		fmt.Printf("Research progress: step %d/%d - %s\n", i+1, len(steps), summarizePlanStep(step, 140))
 		if maVerbose {
 			fmt.Printf("DEBUG: Research step %d/%d\n", i+1, len(steps))
 		}
-		researchResp, toolLogs, runErr := runAgentLoop(
+		researchResp, toolLogs, runErr := runAgentLoopWithTimeout(
 			client, tc, modelCandidates,
 			researcherSystemPrompt(),
 			"Research step:\n"+step+"\n\nOriginal query:\n"+query,
@@ -437,12 +509,29 @@ func runMultiAgentPipeline(
 			query,
 			"research",
 			0,
+			researchStepTimeout,
 		)
 		if runErr != nil {
+			if isSelectiveInterventionRequiredError(runErr) {
+				return selectiveInterventionErrorMessage(runErr), nil, nil
+			}
 			researchResp = "Research step failed: " + runErr.Error()
 		}
-
-		srcs := uniqueStrings(extractURLs(strings.Join(toolLogs, "\n") + "\n" + researchResp))
+		srcs := extractSourceRefs(strings.Join(toolLogs, "\n") + "\n" + researchResp)
+		researchResp, researchReflectionNotes := applyReflectionGate(
+			client,
+			modelCandidates,
+			cognition.StageMAResearch,
+			query,
+			researchResp,
+			srcs,
+			knowledgeCtx,
+			nil,
+		)
+		for _, note := range researchReflectionNotes {
+			fmt.Println(note)
+		}
+		srcs = extractSourceRefs(strings.Join(toolLogs, "\n") + "\n" + researchResp)
 		for _, s := range srcs {
 			allSources[s] = true
 		}
@@ -455,24 +544,47 @@ func runMultiAgentPipeline(
 		})
 	}
 
+	evidence, adversarialReport := hardenEvidenceWithAdversarialSelfPlay(evidence, knowledgeCtx)
+	fmt.Println("Aether Council adversarial self-play complete.")
 	symbolicAudit := buildSymbolicSiblingAudit(query, evidence, knowledgeCtx)
 	verifierInput := "Original query:\n" + query +
 		"\n\nEvidence:\n" + formatEvidenceForVerifier(evidence) +
+		"\n\nAdversarial self-play:\n" + adversarialReport +
 		"\n\nSymbolic consistency audit:\n" + symbolicAudit
-	verifierResp, _, err := runAgentLoop(client, tc, modelCandidates, verifierSystemPrompt(), verifierInput, 1, false, query, "verify", 0)
+	verifierResp, _, err := runAgentLoopWithTimeout(client, tc, modelCandidates, verifierSystemPrompt(), verifierInput, 1, false, query, "verify", 0, verifierTimeout)
 	if err != nil {
+		if isSelectiveInterventionRequiredError(err) {
+			return selectiveInterventionErrorMessage(err), nil, nil
+		}
 		verifierResp = "Verifier unavailable: " + err.Error()
+	}
+	verifierResp, verifierReflectionNotes := applyReflectionGate(
+		client,
+		modelCandidates,
+		cognition.StageMAVerify,
+		query,
+		verifierResp,
+		nil,
+		knowledgeCtx,
+		nil,
+	)
+	for _, note := range verifierReflectionNotes {
+		fmt.Println(note)
 	}
 
 	sourceList := mapKeysSorted(allSources)
 	synthInput := "Query:\n" + query +
 		"\n\nEvidence:\n" + formatEvidenceForSynth(evidence, sourceList) +
+		"\n\nAdversarial self-play:\n" + adversarialReport +
 		"\n\nSymbolic consistency audit:\n" + symbolicAudit +
 		"\n\nVerifier notes:\n" + verifierResp +
 		"\n\nProvide final answer now."
 
-	finalResp, _, err := runAgentLoop(client, tc, modelCandidates, synthesizerSystemPrompt(), synthInput, 1, false, query, "final", maFinalLatencyBudgetMS)
+	finalResp, _, err := runAgentLoopWithTimeout(client, tc, modelCandidates, synthesizerSystemPrompt(), synthInput, 1, false, query, "final", maFinalLatencyBudgetMS, synthTimeout)
 	if err != nil {
+		if isSelectiveInterventionRequiredError(err) {
+			return selectiveInterventionErrorMessage(err), nil, nil
+		}
 		return fallbackSynthesisFromEvidence(query, evidence, sourceList), sourceList, nil
 	}
 
@@ -480,12 +592,44 @@ func runMultiAgentPipeline(
 	if strings.TrimSpace(finalAnswer) == "" {
 		finalAnswer = "I couldn't synthesize a final answer from the current evidence."
 	}
+	finalAnswer, finalReflectionNotes := applyReflectionGate(
+		client,
+		modelCandidates,
+		cognition.StageMASynthesize,
+		query,
+		finalAnswer,
+		sourceList,
+		knowledgeCtx,
+		nil,
+	)
+	for _, note := range finalReflectionNotes {
+		fmt.Println(note)
+	}
+	decision, _ := cognition.RunSymbolicSupervision(cognition.SupervisionInput{
+		Stage:        cognition.StageMultiAgentMerge,
+		Query:        query,
+		Candidate:    finalAnswer,
+		ContextFacts: knowledgeCtx,
+		SourceRefs:   sourceList,
+	}, cognition.DefaultSupervisionPolicy("deep"))
+	if decision.Outcome == cognition.SupervisionHardVeto {
+		finalAnswer = fallbackSynthesisFromEvidence(query, evidence, sourceList)
+	}
 	return finalAnswer, sourceList, nil
 }
 
 func buildPlannerInput(mm *memory.MemoryManager, query string) ([]string, []string, string) {
-	knowledgeCtx, _ := mm.RetrieveKnowledge(query, 4)
-	historyCtx, _ := mm.RetrieveContext(query, 3)
+	knowledgeCtx := []string{}
+	historyCtx := []string{}
+	if mm != nil {
+		if anchored, err := mm.ResolveAnchoredContext(query, 3, 4); err == nil {
+			knowledgeCtx = anchored.Knowledge
+			historyCtx = anchored.History
+		} else {
+			knowledgeCtx, _ = mm.RetrieveKnowledge(query, 4)
+			historyCtx, _ = mm.RetrieveContext(query, 3)
+		}
+	}
 
 	plannerInput := "User query:\n" + query
 	if len(knowledgeCtx) > 0 {
@@ -504,13 +648,16 @@ func runPlanningMode(
 	query string,
 ) (string, []string, error) {
 	_, _, plannerInput := buildPlannerInput(mm, query)
-	plannerResp, _, err := runAgentLoop(client, nil, modelCandidates, plannerSystemPrompt(), plannerInput, 1, false, query, "plan", 0)
+	plannerResp, _, err := runAgentLoopWithTimeout(client, nil, modelCandidates, plannerSystemPrompt(), plannerInput, 1, false, query, "plan", 0, 45*time.Second)
 	if err != nil {
 		return "", nil, fmt.Errorf("planner failed: %w", err)
 	}
-	steps := parsePlanSteps(plannerResp, query, maMaxPlanSteps)
+	steps, autoDecomposed := parsePlanStepsV2(plannerResp, query, maMaxPlanSteps)
 	if len(steps) == 0 {
 		steps = []string{query}
+	}
+	if autoDecomposed {
+		fmt.Println("Goal Decomposition v2: recursive task tree expanded automatically.")
 	}
 
 	var b strings.Builder
@@ -543,6 +690,34 @@ func runAgentLoop(
 	stage string,
 	maxLatencyMS int,
 ) (string, []string, error) {
+	return runAgentLoopWithTimeout(
+		client,
+		tc,
+		modelCandidates,
+		systemPrompt,
+		userPrompt,
+		maxLoops,
+		allowTools,
+		taskQuery,
+		stage,
+		maxLatencyMS,
+		0,
+	)
+}
+
+func runAgentLoopWithTimeout(
+	client *api.Client,
+	tc *tools.GLMToolClient,
+	modelCandidates []string,
+	systemPrompt string,
+	userPrompt string,
+	maxLoops int,
+	allowTools bool,
+	taskQuery string,
+	stage string,
+	maxLatencyMS int,
+	callTimeout time.Duration,
+) (string, []string, error) {
 	resolvedCandidates := modelCandidates
 	if resolved, err := router.ResolveRemote(router.ResolveRequest{
 		Query:        taskQuery,
@@ -560,7 +735,7 @@ func runAgentLoop(
 	var toolLogs []string
 
 	for i := 0; i < maxInt(maxLoops, 1); i++ {
-		resp, modelUsed, err := callLLMWithFallback(client, resolvedCandidates, messages)
+		resp, modelUsed, err := callLLMWithFallbackWithTimeout(client, resolvedCandidates, messages, callTimeout)
 		if err != nil {
 			return "", toolLogs, err
 		}
@@ -574,6 +749,21 @@ func runAgentLoop(
 		}
 
 		toolCalls, hasTools := parseToolCalls(resp)
+		if toolflowV3Enabled() || toolflowShadowEvalEnabled() {
+			if v3Calls, v3Has, dep, v3Err := parseToolCallsV3Aware(resp); v3Err != nil {
+				if maVerbose {
+					fmt.Printf("DEBUG: Toolflow parser warning: %v\n", v3Err)
+				}
+			} else if v3Has {
+				toolCalls = v3Calls
+				hasTools = true
+				if maVerbose && toolflowDeprecationsEnabled() {
+					for _, note := range dep {
+						fmt.Printf("DEBUG: Toolflow deprecation: %s\n", note)
+					}
+				}
+			}
+		}
 		if !hasTools {
 			return clean, toolLogs, nil
 		}
@@ -582,6 +772,127 @@ func runAgentLoop(
 		}
 
 		messages = append(messages, api.Message{Role: "assistant", Content: resp})
+		if toolflowV3Enabled() {
+			sharedBuf := newSharedExecutionBuffer(256)
+			var (
+				collabHub      *collaborativeStreamHub
+				collabWatchers []<-chan collaborativeStreamWatcherSummary
+				collabUnsubs   []func()
+			)
+			if collaborativeToolStreamsEnabled() {
+				collabHub = newCollaborativeStreamHub()
+				for _, watcher := range []string{"planner", "verifier", "synthesizer"} {
+					ch, unsub := collabHub.subscribe(watcher, 64)
+					collabWatchers = append(collabWatchers, watchCollaborativeStream(watcher, ch, 2))
+					collabUnsubs = append(collabUnsubs, unsub)
+				}
+			}
+			pivotReason := ""
+			items, status, depNotes, pivoted, runErr := runToolflowV3Observed(tc, taskQuery, toolCalls, fmt.Sprintf("ma-%s-%d", stage, i), "multi-agent", stage, func(ev toolflow.ExecEvent) bool {
+				sharedBuf.append(ev)
+				if collabHub != nil {
+					collabHub.broadcast(ev)
+				}
+				if ev.Kind != "output" && ev.Kind != "error" {
+					return false
+				}
+				if reason, ok := detectSmokingGunStreamSignal(ev.Chunk); ok {
+					if strings.TrimSpace(pivotReason) == "" {
+						pivotReason = reason
+					}
+					return true
+				}
+				return false
+			})
+			collabSummaries := make([]collaborativeStreamWatcherSummary, 0, len(collabWatchers))
+			if collabHub != nil {
+				for _, unsub := range collabUnsubs {
+					if unsub != nil {
+						unsub()
+					}
+				}
+				for _, resultCh := range collabWatchers {
+					if resultCh == nil {
+						continue
+					}
+					summary, ok := <-resultCh
+					if !ok {
+						continue
+					}
+					summary.Dropped = collabHub.droppedCount(summary.Watcher)
+					collabSummaries = append(collabSummaries, summary)
+				}
+			}
+			if runErr != nil {
+				if isSelectiveInterventionRequiredError(runErr) {
+					return "", toolLogs, runErr
+				}
+				if maVerbose {
+					fmt.Printf("DEBUG: Toolflow V3 failed (fallback to legacy): %v\n", runErr)
+				}
+			} else {
+				if maVerbose && toolflowDeprecationsEnabled() {
+					for _, note := range depNotes {
+						fmt.Printf("DEBUG: Toolflow deprecation: %s\n", note)
+					}
+				}
+				if maVerbose && toolflowTraceEnabled() {
+					fmt.Print(status)
+				}
+				if len(collabSummaries) > 0 {
+					collabStatus := formatCollaborativeStreamStatus(collabSummaries)
+					if maVerbose {
+						fmt.Print(collabStatus)
+					}
+					toolLogs = append(toolLogs, strings.TrimSpace(collabStatus))
+				}
+				if pivoted {
+					latest := sharedBuf.latest(4)
+					if maVerbose && len(latest) > 0 {
+						for _, r := range latest {
+							if strings.TrimSpace(r.Chunk) == "" {
+								continue
+							}
+							fmt.Printf("DEBUG: Stream shard (%s/%s): %s\n", r.Tool, r.Kind, truncateForModel(r.Chunk))
+						}
+					}
+					if strings.TrimSpace(pivotReason) == "" {
+						pivotReason = "high-signal anomaly detected in streamed tool output"
+					}
+					if hitlStreamTriggerEnabled() {
+						decision := promptHITL(
+							fmt.Sprintf("stream-pivot-%s-%d", stage, i),
+							"Collaborative stream detected a high-signal anomaly:\n"+pivotReason+"\nApprove pivot-and-continue or reject to halt this agent stage.",
+							[]hitlDecision{hitlApprove, hitlReject, hitlDefer},
+						)
+						if decision == hitlReject {
+							return "", toolLogs, fmt.Errorf("HITL rejected stream pivot for stage=%s reason=%s", stage, pivotReason)
+						}
+					}
+					toolLogs = append(toolLogs, "Council stream pivot: "+pivotReason)
+					messages = append(messages, api.Message{
+						Role: "user",
+						Content: "Streaming council alert: " + pivotReason + ". " +
+							"Pivot the remaining research plan immediately. " +
+							"Prioritize verification of this anomaly before further broad search.",
+					})
+				}
+				for _, item := range items {
+					out := item.Output
+					if item.Err != nil {
+						if isSelectiveInterventionRequiredError(item.Err) {
+							return "", toolLogs, item.Err
+						}
+						out = "Error executing tool: " + item.Err.Error()
+					}
+					toolLogs = append(toolLogs, out)
+					msg := "Tool result (" + item.Tool + "): " + truncateForModel(out) + "\nContinue."
+					messages = append(messages, api.Message{Role: "user", Content: msg})
+				}
+				continue
+			}
+		}
+		runToolflowShadowEval(taskQuery, toolCalls, fmt.Sprintf("ma-shadow-%s-%d", stage, i))
 
 		for _, raw := range toolCalls {
 			call, note := arbitrateToolCall(raw, taskQuery)
@@ -590,6 +901,9 @@ func runAgentLoop(
 			}
 			out, err := executeToolCall(tc, call)
 			if err != nil {
+				if isSelectiveInterventionRequiredError(err) {
+					return "", toolLogs, err
+				}
 				out = "Error executing tool: " + err.Error()
 			}
 			toolLogs = append(toolLogs, out)
@@ -602,13 +916,17 @@ func runAgentLoop(
 }
 
 func callLLMWithFallback(client *api.Client, modelCandidates []string, messages []api.Message) (string, string, error) {
+	return callLLMWithFallbackWithTimeout(client, modelCandidates, messages, 0)
+}
+
+func callLLMWithFallbackWithTimeout(client *api.Client, modelCandidates []string, messages []api.Message, callTimeout time.Duration) (string, string, error) {
 	if len(modelCandidates) == 0 {
 		return "", "", fmt.Errorf("no model candidates available")
 	}
 
 	var lastErr error
 	for _, modelName := range modelCandidates {
-		resp, err := callLLMOnce(client, modelName, messages)
+		resp, err := callLLMOnce(client, modelName, messages, callTimeout)
 		if err == nil {
 			return resp, modelName, nil
 		}
@@ -636,7 +954,7 @@ func isRetryableAgentError(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "first-token timeout")
 }
 
-func callLLMOnce(client *api.Client, modelName string, messages []api.Message) (string, error) {
+func callLLMOnce(client *api.Client, modelName string, messages []api.Message, callTimeout time.Duration) (string, error) {
 	prompt := ""
 	if len(messages) > 0 {
 		prompt = messages[len(messages)-1].Content
@@ -651,18 +969,27 @@ func callLLMOnce(client *api.Client, modelName string, messages []api.Message) (
 		fmt.Printf("DEBUG: Entropy mode=%s temperature=%.2f top_p=%.2f\n", entropy.Mode, entropy.Temperature, entropy.TopP)
 	}
 
-	totalCtx, totalCancel := context.WithTimeout(context.Background(), maChatTimeout)
+	effectiveTimeout := callTimeout
+	if effectiveTimeout <= 0 {
+		effectiveTimeout = maChatTimeout
+	}
+	totalCtx, totalCancel := context.WithTimeout(context.Background(), effectiveTimeout)
 	defer totalCancel()
 	ctx, cancel := context.WithCancel(totalCtx)
 	defer cancel()
 
+	firstTokenTimeout := maFirstTokenTimeout
+	if firstTokenTimeout > effectiveTimeout {
+		firstTokenTimeout = boundedStageTimeout(effectiveTimeout/2, 10*time.Second, effectiveTimeout)
+	}
+
 	var out strings.Builder
 	var sawFirstToken atomic.Bool
-	var firstTokenTimeout atomic.Bool
+	var firstTokenTimerTriggered atomic.Bool
 
-	timer := time.AfterFunc(maFirstTokenTimeout, func() {
+	timer := time.AfterFunc(firstTokenTimeout, func() {
 		if !sawFirstToken.Load() {
-			firstTokenTimeout.Store(true)
+			firstTokenTimerTriggered.Store(true)
 			cancel()
 		}
 	})
@@ -677,8 +1004,8 @@ func callLLMOnce(client *api.Client, modelName string, messages []api.Message) (
 		return nil
 	})
 	if err != nil {
-		if firstTokenTimeout.Load() && errors.Is(ctx.Err(), context.Canceled) {
-			return "", fmt.Errorf("first-token timeout after %s", maFirstTokenTimeout)
+		if firstTokenTimerTriggered.Load() && errors.Is(ctx.Err(), context.Canceled) {
+			return "", fmt.Errorf("first-token timeout after %s", firstTokenTimeout)
 		}
 		return "", err
 	}
@@ -686,7 +1013,36 @@ func callLLMOnce(client *api.Client, modelName string, messages []api.Message) (
 	return out.String(), nil
 }
 
+func boundedStageTimeout(candidate, minTimeout, maxTimeout time.Duration) time.Duration {
+	if candidate <= 0 {
+		candidate = minTimeout
+	}
+	if candidate < minTimeout {
+		return minTimeout
+	}
+	if maxTimeout > 0 && candidate > maxTimeout {
+		return maxTimeout
+	}
+	return candidate
+}
+
+func summarizePlanStep(step string, maxLen int) string {
+	clean := strings.Join(strings.Fields(strings.TrimSpace(step)), " ")
+	if clean == "" {
+		return "n/a"
+	}
+	if maxLen <= 0 || len(clean) <= maxLen {
+		return clean
+	}
+	return clean[:maxLen] + "..."
+}
+
 func parsePlanSteps(raw, fallback string, maxSteps int) []string {
+	steps, _ := parsePlanStepsV2(raw, fallback, maxSteps)
+	return steps
+}
+
+func parsePlanStepsV2(raw, fallback string, maxSteps int) ([]string, bool) {
 	type plan struct {
 		Steps []string `json:"steps"`
 	}
@@ -694,7 +1050,7 @@ func parsePlanSteps(raw, fallback string, maxSteps int) []string {
 	trimmed := strings.TrimSpace(stripMarkdownCodeFences(stripReasoningSections(raw)))
 	var p plan
 	if err := json.Unmarshal([]byte(trimmed), &p); err == nil && len(p.Steps) > 0 {
-		return clampSteps(p.Steps, maxSteps)
+		return maybeApplyGoalDecompositionV2(fallback, p.Steps, maxSteps)
 	}
 
 	lines := strings.Split(trimmed, "\n")
@@ -707,9 +1063,9 @@ func parsePlanSteps(raw, fallback string, maxSteps int) []string {
 	}
 	steps = clampSteps(steps, maxSteps)
 	if len(steps) > 0 {
-		return steps
+		return maybeApplyGoalDecompositionV2(fallback, steps, maxSteps)
 	}
-	return clampSteps([]string{fallback}, maxSteps)
+	return maybeApplyGoalDecompositionV2(fallback, []string{fallback}, maxSteps)
 }
 
 func clampSteps(steps []string, maxSteps int) []string {
@@ -770,11 +1126,6 @@ func formatEvidenceForSynth(ev []evidenceRecord, sources []string) string {
 		}
 	}
 	return b.String()
-}
-
-func extractURLs(s string) []string {
-	re := regexp.MustCompile(`https?://[^\s"\\]+`)
-	return uniqueStrings(re.FindAllString(s, -1))
 }
 
 func truncateForModel(s string) string {
@@ -868,8 +1219,77 @@ func buildSymbolicSiblingAudit(query string, evidence []evidenceRecord, knowledg
 	return "Detected potential contradictions:\n" + strings.Join(findings, "\n")
 }
 
+func hardenEvidenceWithAdversarialSelfPlay(evidence []evidenceRecord, knowledgeCtx []string) ([]evidenceRecord, string) {
+	if len(evidence) == 0 {
+		return evidence, "No evidence shards available for adversarial review."
+	}
+
+	hardened := make([]evidenceRecord, 0, len(evidence))
+	results := make([]cognition.SelfPlayResult, 0, len(evidence))
+	for _, ev := range evidence {
+		summary := strings.TrimSpace(ev.Summary)
+		if summary == "" {
+			hardened = append(hardened, ev)
+			results = append(results, cognition.SelfPlayResult{})
+			continue
+		}
+
+		ctx := make([]string, 0, len(knowledgeCtx)+len(ev.SourceURL))
+		ctx = append(ctx, knowledgeCtx...)
+		ctx = append(ctx, ev.SourceURL...)
+		sp := cognition.ConductSelfPlay(summary, ctx)
+		refined := strings.TrimSpace(sp.FinalCandidate)
+		if refined != "" {
+			ev.Summary = refined
+		}
+		hardened = append(hardened, ev)
+		results = append(results, sp)
+	}
+	return hardened, buildAdversarialSelfPlayReport(results)
+}
+
+func buildAdversarialSelfPlayReport(results []cognition.SelfPlayResult) string {
+	if len(results) == 0 {
+		return "No adversarial self-play results recorded."
+	}
+	var b strings.Builder
+	for i, r := range results {
+		vector := strings.TrimSpace(r.WinningVector)
+		if vector == "" {
+			vector = "n/a"
+		}
+		finding := strings.TrimSpace(r.OpponentFinding)
+		if finding == "" {
+			finding = "none"
+		}
+		fmt.Fprintf(&b,
+			"- shard %d: vector=%s flaw=%.2f contradictions=%d cycles=%d finding=%s\n",
+			i+1, vector, r.MaxFlawScore, r.Contradictions, r.Cycles, summarizePlanStep(finding, 160),
+		)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func detectSmokingGunStreamSignal(chunk string) (string, bool) {
+	clean := strings.TrimSpace(chunk)
+	if clean == "" {
+		return "", false
+	}
+	l := strings.ToLower(clean)
+	for _, token := range []string{
+		"smoking gun", "critical contradiction", "forgery", "key leaked",
+		"unauthorized", "exploit", "breach", "rce", "zero-day",
+		"credential exposed", "private key", "secret", "token",
+	} {
+		if strings.Contains(l, token) {
+			return "streaming evidence flagged: " + token, true
+		}
+	}
+	return "", false
+}
+
 func init() {
-	multiAgentCmd.Flags().IntVar(&maMaxPlanSteps, "max-plan-steps", 4, "Maximum planner decomposition steps")
+	multiAgentCmd.Flags().IntVar(&maMaxPlanSteps, "max-plan-steps", 10, "Maximum planner decomposition steps")
 	multiAgentCmd.Flags().IntVar(&maMaxResearchLoops, "max-research-loops", 3, "Maximum researcher tool loops per step")
 	multiAgentCmd.Flags().BoolVar(&maVerbose, "verbose", false, "Enable verbose pipeline logs")
 	multiAgentCmd.Flags().StringVar(&maMode, "mode", "pipeline", "Execution mode: pipeline|planning")

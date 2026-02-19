@@ -2,6 +2,7 @@ package taloscli
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/Thynaptic/P-LMv1/pkg/skills"
@@ -13,6 +14,9 @@ func resolveRequestedSkillSelection(query string) (*skills.SkillRecord, error) {
 		return nil, nil
 	}
 	reg := skills.NewSkillRegistry(skills.PermanentSkillsRoot())
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("TALOS_SKILLS_LEGACY_FALLBACK")), "true") {
+		return resolveRequestedSkillSelectionLegacy(reg, query)
+	}
 	recs, err := reg.ListEnabled()
 	if err != nil {
 		return nil, fmt.Errorf("load skills registry: %w", err)
@@ -21,7 +25,52 @@ func resolveRequestedSkillSelection(query string) (*skills.SkillRecord, error) {
 		return nil, fmt.Errorf("no enabled skills are available")
 	}
 
-	qLower := strings.ToLower(query)
+	qLower := strings.ToLower(strings.TrimSpace(query))
+	for _, rec := range recs {
+		if strings.EqualFold(strings.TrimSpace(rec.SkillID), query) || strings.EqualFold(strings.TrimSpace(rec.Name), query) {
+			if active, ok, err := reg.ResolveActive(rec.SkillID); err == nil && ok && active != nil {
+				return active, nil
+			}
+			out := rec
+			return &out, nil
+		}
+		if strings.Contains(strings.ToLower(strings.TrimSpace(rec.ManifestPath)), qLower) ||
+			strings.Contains(strings.ToLower(strings.TrimSpace(rec.RootDir)), qLower) {
+			if active, ok, err := reg.ResolveActive(rec.SkillID); err == nil && ok && active != nil {
+				return active, nil
+			}
+			out := rec
+			return &out, nil
+		}
+	}
+	decision, err := skills.RouteSkill(reg, skills.RouteRequest{
+		Query:     query,
+		HintSkill: query,
+	})
+	if err == nil && decision.Chosen != nil {
+		return decision.Chosen, nil
+	}
+	if match, ok, err := reg.FindMatch(query, query, ""); err == nil && ok && match != nil {
+		if active, aok, aerr := reg.ResolveActive(match.SkillID); aerr == nil && aok && active != nil {
+			return active, nil
+		}
+		return match, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("match skill: %w", err)
+	}
+	return nil, fmt.Errorf("skill not found: %s", query)
+}
+
+func resolveRequestedSkillSelectionLegacy(reg *skills.SkillRegistry, query string) (*skills.SkillRecord, error) {
+	recs, err := reg.ListEnabled()
+	if err != nil {
+		return nil, fmt.Errorf("load skills registry: %w", err)
+	}
+	if len(recs) == 0 {
+		return nil, fmt.Errorf("no enabled skills are available")
+	}
+	qLower := strings.ToLower(strings.TrimSpace(query))
 	for i := range recs {
 		rec := recs[i]
 		if strings.EqualFold(strings.TrimSpace(rec.SkillID), query) || strings.EqualFold(strings.TrimSpace(rec.Name), query) {
@@ -34,7 +83,6 @@ func resolveRequestedSkillSelection(query string) (*skills.SkillRecord, error) {
 			return &out, nil
 		}
 	}
-
 	if match, ok, err := reg.FindMatch(query, query, ""); err == nil && ok && match != nil {
 		return match, nil
 	}
@@ -52,6 +100,15 @@ func skillContextBlock(rec *skills.SkillRecord) string {
 	b.WriteString("Active skill profile:\n")
 	if strings.TrimSpace(rec.SkillID) != "" {
 		b.WriteString("- skill_id: " + strings.TrimSpace(rec.SkillID) + "\n")
+	}
+	if strings.TrimSpace(rec.RevisionID) != "" {
+		b.WriteString("- revision_id: " + strings.TrimSpace(rec.RevisionID) + "\n")
+	}
+	if strings.TrimSpace(rec.Version) != "" {
+		b.WriteString("- version: " + strings.TrimSpace(rec.Version) + "\n")
+	}
+	if strings.TrimSpace(rec.Status) != "" {
+		b.WriteString("- status: " + strings.TrimSpace(rec.Status) + "\n")
 	}
 	if strings.TrimSpace(rec.Name) != "" {
 		b.WriteString("- name: " + strings.TrimSpace(rec.Name) + "\n")

@@ -1,101 +1,54 @@
 package taloscli
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
+	"sort"
 	"strings"
 )
 
 const (
-	helpPageCommandSize = 10
-	helpPageExampleSize = 3
+	helpExampleDisplayLimit = 8
+	helpDescriptionWidth    = 72
 )
-
-var helpStatePath = filepath.Join(".memory", "help_pagination_state.json")
-
-type helpPaginationState struct {
-	CommandOffset int `json:"command_offset"`
-	ExampleOffset int `json:"example_offset"`
-}
 
 type helpCommandRow struct {
 	Name        string
 	Description string
 }
 
-func renderRootHelpPage(w io.Writer, reset bool) {
+func renderRootHelpPage(w io.Writer, _ bool) {
 	rows := collectRootHelpRows()
 	examples := collectRootHelpExamples()
-
-	state := helpPaginationState{}
-	if !reset {
-		loaded, err := loadHelpPaginationState()
-		if err != nil {
-			if os.IsNotExist(err) {
-				fmt.Fprintln(w, "No active help page session. Showing first page.")
-				reset = true
-			} else {
-				fmt.Fprintf(w, "Error loading help pagination state: %v\n", err)
-				return
-			}
-		} else {
-			state = loaded
-		}
-	}
-	if reset {
-		state = helpPaginationState{}
-	}
-
-	cmdStart := clampNonNegative(state.CommandOffset)
-	exStart := clampNonNegative(state.ExampleOffset)
-	if cmdStart >= len(rows) && exStart >= len(examples) {
-		clearHelpPaginationState()
-		fmt.Fprintln(w, "No more help pages. Run \"talos --help\" to restart from page 1.")
-		return
-	}
-
-	cmdEnd := minInt(cmdStart+helpPageCommandSize, len(rows))
-	exEnd := minInt(exStart+helpPageExampleSize, len(examples))
+	topRows := collectTopHelpRows(rows)
 
 	fmt.Fprintln(w, "TALOS CLI HELP")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "USAGE")
 	fmt.Fprintln(w, "  talos [command] [flags]")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "COMMANDS")
-	renderHelpCommandsTable(w, rows[cmdStart:cmdEnd])
+	fmt.Fprintln(w, "TOP COMMANDS")
+	renderHelpCommandsTable(w, topRows)
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "ALL COMMANDS")
+	renderHelpCommandsTable(w, rows)
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "EXAMPLES")
-	if exStart >= len(examples) || len(examples[exStart:exEnd]) == 0 {
+	if len(examples) == 0 {
 		fmt.Fprintln(w, "  [none]")
 	} else {
-		for i, ex := range examples[exStart:exEnd] {
-			fmt.Fprintf(w, "  %d. %s\n", exStart+i+1, ex)
+		n := minInt(len(examples), helpExampleDisplayLimit)
+		for i, ex := range examples[:n] {
+			fmt.Fprintf(w, "  %d. %s\n", i+1, ex)
+		}
+		if len(examples) > n {
+			fmt.Fprintf(w, "  ... (%d more)\n", len(examples)-n)
 		}
 	}
-
-	hasMore := cmdEnd < len(rows) || exEnd < len(examples)
-	if hasMore {
-		next := helpPaginationState{CommandOffset: cmdEnd, ExampleOffset: exEnd}
-		if err := saveHelpPaginationState(next); err != nil {
-			fmt.Fprintf(w, "\nWarning: failed to persist help page state: %v\n", err)
-			return
-		}
-		fmt.Fprintln(w)
-		fmt.Fprintln(w, "MORE")
-		fmt.Fprintf(w, "  commands_shown: %d/%d\n", cmdEnd, len(rows))
-		fmt.Fprintf(w, "  examples_shown: %d/%d\n", exEnd, len(examples))
-		fmt.Fprintln(w, "  run: talos /next")
-		return
-	}
-
-	clearHelpPaginationState()
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "END")
-	fmt.Fprintln(w, "  All help pages shown. Run \"talos --help\" to restart.")
+	fmt.Fprintln(w, "DISCOVER MORE")
+	fmt.Fprintln(w, "  talos find <keyword>")
+	fmt.Fprintln(w, "  talos [command] --help")
 }
 
 func collectRootHelpRows() []helpCommandRow {
@@ -114,10 +67,32 @@ func collectRootHelpRows() []helpCommandRow {
 		}
 		rows = append(rows, helpCommandRow{
 			Name:        name,
-			Description: strings.TrimSpace(c.Short),
+			Description: compactDescription(strings.TrimSpace(c.Short)),
 		})
 	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		return rows[i].Name < rows[j].Name
+	})
 	return rows
+}
+
+func collectTopHelpRows(rows []helpCommandRow) []helpCommandRow {
+	if len(rows) == 0 {
+		return nil
+	}
+	priority := []string{"chat", "research", "learn", "multi-agent", "pipeline", "find", "doctor", "skills"}
+	lookup := make(map[string]helpCommandRow, len(rows))
+	for _, row := range rows {
+		lookup[row.Name] = row
+	}
+
+	out := make([]helpCommandRow, 0, len(priority))
+	for _, name := range priority {
+		if row, ok := lookup[name]; ok {
+			out = append(out, row)
+		}
+	}
+	return out
 }
 
 func collectRootHelpExamples() []string {
@@ -145,48 +120,25 @@ func renderHelpCommandsTable(w io.Writer, rows []helpCommandRow) {
 		}
 	}
 	fmt.Fprintf(w, "  %-*s | %s\n", nameWidth, "COMMAND", "DESCRIPTION")
-	fmt.Fprintf(w, "  %s-+-%s\n", strings.Repeat("-", nameWidth), strings.Repeat("-", 60))
+	fmt.Fprintf(w, "  %s-+-%s\n", strings.Repeat("-", nameWidth), strings.Repeat("-", helpDescriptionWidth))
 	for _, r := range rows {
-		desc := r.Description
+		desc := compactDescription(r.Description)
 		if desc == "" {
 			desc = "n/a"
 		}
-		fmt.Fprintf(w, "  %-*s | %s\n", nameWidth, r.Name, desc)
+		fmt.Fprintf(w, "  %-*s | %-*s\n", nameWidth, r.Name, helpDescriptionWidth, desc)
 	}
 }
 
-func loadHelpPaginationState() (helpPaginationState, error) {
-	blob, err := os.ReadFile(helpStatePath)
-	if err != nil {
-		return helpPaginationState{}, err
+func compactDescription(desc string) string {
+	desc = strings.Join(strings.Fields(strings.TrimSpace(desc)), " ")
+	if desc == "" {
+		return ""
 	}
-	var st helpPaginationState
-	if err := json.Unmarshal(blob, &st); err != nil {
-		return helpPaginationState{}, err
+	if len(desc) <= helpDescriptionWidth {
+		return desc
 	}
-	return st, nil
-}
-
-func saveHelpPaginationState(st helpPaginationState) error {
-	if err := os.MkdirAll(filepath.Dir(helpStatePath), 0o755); err != nil {
-		return err
-	}
-	blob, err := json.MarshalIndent(st, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(helpStatePath, append(blob, '\n'), 0o644)
-}
-
-func clearHelpPaginationState() {
-	_ = os.Remove(helpStatePath)
-}
-
-func clampNonNegative(v int) int {
-	if v < 0 {
-		return 0
-	}
-	return v
+	return desc[:helpDescriptionWidth-3] + "..."
 }
 
 func minInt(a, b int) int {

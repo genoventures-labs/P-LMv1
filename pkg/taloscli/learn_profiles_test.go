@@ -122,6 +122,10 @@ func TestValidateLearnProfileConfigRejectsInvalid(t *testing.T) {
 	if err := validateLearnProfileConfig(cfg); err == nil {
 		t.Fatal("expected validation error for url safety visibility")
 	}
+	cfg = LearnProfileConfig{ChunkChars: 100, ChunkOverlap: 10, MaxPages: 1, RateLimit: 1, MaxBytes: 1, HFMaxRecords: 1, URLSafetyVisibility: "private", TitleMaxChars: -1}
+	if err := validateLearnProfileConfig(cfg); err == nil {
+		t.Fatal("expected validation error for title_max_chars")
+	}
 }
 
 func TestLoadLearnProfilesFileMissing(t *testing.T) {

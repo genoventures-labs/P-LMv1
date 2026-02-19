@@ -51,9 +51,11 @@ MORE INFO
 var nextCmd = &cobra.Command{
 	Use:     "next",
 	Aliases: []string{"/next"},
-	Short:   "Show next page of root help output.",
+	Short:   "Deprecated alias for root help (pagination removed).",
 	Run: func(cmd *cobra.Command, args []string) {
-		renderRootHelpPage(cmd.OutOrStdout(), false)
+		fmt.Fprintln(cmd.OutOrStdout(), "Help pagination retired; showing full root help.")
+		fmt.Fprintln(cmd.OutOrStdout())
+		renderRootHelpPage(cmd.OutOrStdout(), true)
 	},
 }
 
@@ -85,8 +87,8 @@ It leverages the JIT model router to ensure optimal models are available.`,
   talos update check
   talos completion bash > ~/.local/share/bash-completion/completions/talos
   talos --help
-  talos /next
   talos find research
+  talos doc-search "Sasswall" --dir ./docs
   talos pipeline "research run 'What changed in X this week?' --skill analyst ; learn --from-research latest --skill memory_curator"
   talos pipeline "research run 'What changed in X this week?' ; learn --from-research latest"
   talos "research run 'What changed in X this week?' ; learn --from-research latest"

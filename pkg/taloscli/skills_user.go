@@ -23,6 +23,10 @@ var userSkillTaskType string
 var userSkillRequestedTools []string
 var userSkillRequestedDomains []string
 var userSkillShowID string
+var userSkillRevisionID string
+var userSkillExportOut string
+var userSkillImportIn string
+var userSkillMigrateApply bool
 
 var skillsCmd = &cobra.Command{
 	Use:   "skills",
@@ -145,8 +149,10 @@ var skillsListCmd = &cobra.Command{
 				}
 				fmt.Printf("  %d. %s\n", i+1, name)
 				fmt.Printf("     id: %s\n", valueOrPlaceholder(rec.SkillID))
+				fmt.Printf("     revision/version: %s / %s\n", valueOrPlaceholder(rec.RevisionID), valueOrPlaceholder(rec.Version))
 				fmt.Printf("     intent: %s\n", valueOrPlaceholder(rec.Intent))
 				fmt.Printf("     tier/task: %s / %s\n", valueOrPlaceholder(rec.ReasoningTier), valueOrPlaceholder(rec.TaskType))
+				fmt.Printf("     status/active: %s / %t\n", valueOrPlaceholder(rec.Status), rec.Active)
 				fmt.Printf("     updated: %s\n", formatSkillTime(rec.UpdatedAt))
 				fmt.Printf("     path: %s\n", valueOrPlaceholder(rec.RootDir))
 			}
@@ -219,6 +225,221 @@ var skillsShowCmd = &cobra.Command{
 	},
 }
 
+var skillsValidateCmd = &cobra.Command{
+	Use:   "validate",
+	Short: "Mark a skill revision as validated.",
+	Run: func(cmd *cobra.Command, args []string) {
+		query := strings.TrimSpace(userSkillShowID)
+		if query == "" {
+			fmt.Println("Error: --id is required")
+			return
+		}
+		reg := skills.NewSkillRegistry(skills.PermanentSkillsRoot())
+		rec, err := resolveRequestedSkillSelection(query)
+		if err != nil || rec == nil {
+			fmt.Printf("Skill not found: %s\n", query)
+			return
+		}
+		recs, err := reg.ListRevisions(rec.SkillID)
+		if err != nil {
+			fmt.Printf("Error listing revisions: %v\n", err)
+			return
+		}
+		if len(recs) == 0 {
+			fmt.Println("No revisions found.")
+			return
+		}
+		target := recs[0]
+		if strings.TrimSpace(userSkillRevisionID) != "" {
+			for _, r := range recs {
+				if strings.EqualFold(strings.TrimSpace(r.RevisionID), strings.TrimSpace(userSkillRevisionID)) {
+					target = r
+					break
+				}
+			}
+		}
+		target.Status = skills.SkillStatusValidated
+		target.Enabled = true
+		if err := reg.Upsert(target); err != nil {
+			fmt.Printf("Error validating skill: %v\n", err)
+			return
+		}
+		fmt.Printf("Validated skill.\nskill_id=%s\nrevision_id=%s\nstatus=%s\n", target.SkillID, target.RevisionID, target.Status)
+	},
+}
+
+var skillsActivateCmd = &cobra.Command{
+	Use:   "activate",
+	Short: "Activate one skill revision.",
+	Run: func(cmd *cobra.Command, args []string) {
+		query := strings.TrimSpace(userSkillShowID)
+		if query == "" {
+			fmt.Println("Error: --id is required")
+			return
+		}
+		rec, err := resolveRequestedSkillSelection(query)
+		if err != nil || rec == nil {
+			fmt.Printf("Skill not found: %s\n", query)
+			return
+		}
+		reg := skills.NewSkillRegistry(skills.PermanentSkillsRoot())
+		if err := reg.ActivateRevision(rec.SkillID, strings.TrimSpace(userSkillRevisionID)); err != nil {
+			fmt.Printf("Error activating skill revision: %v\n", err)
+			return
+		}
+		active, ok, err := reg.ResolveActive(rec.SkillID)
+		if err != nil || !ok || active == nil {
+			fmt.Printf("Skill activated but active resolution failed: %v\n", err)
+			return
+		}
+		fmt.Printf("Activated skill.\nskill_id=%s\nrevision_id=%s\nstatus=%s\n", active.SkillID, active.RevisionID, active.Status)
+	},
+}
+
+var skillsDeprecateCmd = &cobra.Command{
+	Use:   "deprecate",
+	Short: "Deprecate one skill revision (or all revisions for a skill).",
+	Run: func(cmd *cobra.Command, args []string) {
+		query := strings.TrimSpace(userSkillShowID)
+		if query == "" {
+			fmt.Println("Error: --id is required")
+			return
+		}
+		rec, err := resolveRequestedSkillSelection(query)
+		if err != nil || rec == nil {
+			fmt.Printf("Skill not found: %s\n", query)
+			return
+		}
+		reg := skills.NewSkillRegistry(skills.PermanentSkillsRoot())
+		if err := reg.DeprecateRevision(rec.SkillID, strings.TrimSpace(userSkillRevisionID)); err != nil {
+			fmt.Printf("Error deprecating revision: %v\n", err)
+			return
+		}
+		fmt.Printf("Deprecated skill revision(s).\nskill_id=%s\nrevision_id=%s\n", rec.SkillID, valueOrPlaceholder(strings.TrimSpace(userSkillRevisionID)))
+	},
+}
+
+var skillsRevisionsCmd = &cobra.Command{
+	Use:   "revisions",
+	Short: "List revisions for one skill.",
+	Run: func(cmd *cobra.Command, args []string) {
+		query := strings.TrimSpace(userSkillShowID)
+		if query == "" {
+			fmt.Println("Error: --id is required")
+			return
+		}
+		rec, err := resolveRequestedSkillSelection(query)
+		if err != nil || rec == nil {
+			fmt.Printf("Skill not found: %s\n", query)
+			return
+		}
+		reg := skills.NewSkillRegistry(skills.PermanentSkillsRoot())
+		revs, err := reg.ListRevisions(rec.SkillID)
+		if err != nil {
+			fmt.Printf("Error listing revisions: %v\n", err)
+			return
+		}
+		if len(revs) == 0 {
+			fmt.Println("No revisions found.")
+			return
+		}
+		fmt.Printf("TALOS SKILL REVISIONS\n\nskill_id: %s\ncount: %d\n\nREVISIONS\n", rec.SkillID, len(revs))
+		for i, r := range revs {
+			fmt.Printf("  %d. revision=%s version=%s status=%s active=%t updated=%s\n", i+1, valueOrPlaceholder(r.RevisionID), valueOrPlaceholder(r.Version), valueOrPlaceholder(r.Status), r.Active, formatSkillTime(r.UpdatedAt))
+		}
+	},
+}
+
+var skillsExportCmd = &cobra.Command{
+	Use:   "export",
+	Short: "Export a signed skill bundle for a specific revision.",
+	Run: func(cmd *cobra.Command, args []string) {
+		query := strings.TrimSpace(userSkillShowID)
+		if query == "" {
+			fmt.Println("Error: --id is required")
+			return
+		}
+		out := strings.TrimSpace(userSkillExportOut)
+		if out == "" {
+			fmt.Println("Error: --out is required")
+			return
+		}
+		rec, err := resolveRequestedSkillSelection(query)
+		if err != nil || rec == nil {
+			fmt.Printf("Skill not found: %s\n", query)
+			return
+		}
+		target := *rec
+		if strings.TrimSpace(userSkillRevisionID) != "" {
+			reg := skills.NewSkillRegistry(skills.PermanentSkillsRoot())
+			revs, err := reg.ListRevisions(rec.SkillID)
+			if err == nil {
+				for _, r := range revs {
+					if strings.EqualFold(strings.TrimSpace(r.RevisionID), strings.TrimSpace(userSkillRevisionID)) {
+						target = r
+						break
+					}
+				}
+			}
+		}
+		if err := skills.ExportBundle(target, out); err != nil {
+			fmt.Printf("Error exporting bundle: %v\n", err)
+			return
+		}
+		fmt.Printf("Exported bundle.\nout=%s\nskill_id=%s\nrevision_id=%s\n", out, target.SkillID, target.RevisionID)
+	},
+}
+
+var skillsImportCmd = &cobra.Command{
+	Use:   "import",
+	Short: "Import a signed skill bundle.",
+	Run: func(cmd *cobra.Command, args []string) {
+		in := strings.TrimSpace(userSkillImportIn)
+		if in == "" {
+			fmt.Println("Error: --in is required")
+			return
+		}
+		rec, err := skills.ImportBundle(skills.PermanentSkillsRoot(), in)
+		if err != nil {
+			fmt.Printf("Error importing bundle: %v\n", err)
+			return
+		}
+		reg := skills.NewSkillRegistry(skills.PermanentSkillsRoot())
+		if err := reg.Upsert(rec); err != nil {
+			fmt.Printf("Error writing imported skill: %v\n", err)
+			return
+		}
+		fmt.Printf("Imported bundle.\nskill_id=%s\nrevision_id=%s\nstatus=%s\n", rec.SkillID, rec.RevisionID, rec.Status)
+	},
+}
+
+var skillsMigrateCmd = &cobra.Command{
+	Use:   "migrate",
+	Short: "Migrate legacy skill registry entries to V3 metadata.",
+	Run: func(cmd *cobra.Command, args []string) {
+		w := cmd.OutOrStdout()
+		reg := skills.NewSkillRegistry(skills.PermanentSkillsRoot())
+		report, err := reg.MigrateLegacy(userSkillMigrateApply)
+		if err != nil {
+			fmt.Fprintf(w, "Error migrating skills registry: %v\n", err)
+			return
+		}
+		mode := "DRY-RUN"
+		if userSkillMigrateApply {
+			mode = "APPLIED"
+		}
+		fmt.Fprintf(w, "TALOS SKILLS MIGRATE\n\nMODE\n  %s\n\nSUMMARY\n", mode)
+		fmt.Fprintf(w, "  total_records: %d\n", report.TotalRecords)
+		fmt.Fprintf(w, "  legacy_records: %d\n", report.LegacyRecords)
+		fmt.Fprintf(w, "  updated_records: %d\n", report.UpdatedRecords)
+		if userSkillMigrateApply {
+			fmt.Fprintln(w, "\nRESULT\n  Registry migration completed.")
+		} else {
+			fmt.Fprintln(w, "\nRESULT\n  No files written. Re-run with --apply to persist migration.")
+		}
+	},
+}
+
 func init() {
 	skillsCreateCmd.Flags().StringVar(&userSkillName, "name", "", "Skill name")
 	skillsCreateCmd.Flags().StringVar(&userSkillIntent, "intent", "", "Primary intent/capability description")
@@ -235,11 +456,30 @@ func init() {
 	skillsPreflightCmd.Flags().StringSliceVar(&userSkillRequestedDomains, "requested-domain", nil, "Requested external domain (repeatable)")
 
 	skillsShowCmd.Flags().StringVar(&userSkillShowID, "id", "", "Skill ID, name, or path fragment")
+	skillsValidateCmd.Flags().StringVar(&userSkillShowID, "id", "", "Skill ID/name/path fragment")
+	skillsValidateCmd.Flags().StringVar(&userSkillRevisionID, "revision", "", "Revision ID (optional; defaults latest)")
+	skillsActivateCmd.Flags().StringVar(&userSkillShowID, "id", "", "Skill ID/name/path fragment")
+	skillsActivateCmd.Flags().StringVar(&userSkillRevisionID, "revision", "", "Revision ID (optional; defaults latest)")
+	skillsDeprecateCmd.Flags().StringVar(&userSkillShowID, "id", "", "Skill ID/name/path fragment")
+	skillsDeprecateCmd.Flags().StringVar(&userSkillRevisionID, "revision", "", "Revision ID (optional; empty means all)")
+	skillsRevisionsCmd.Flags().StringVar(&userSkillShowID, "id", "", "Skill ID/name/path fragment")
+	skillsExportCmd.Flags().StringVar(&userSkillShowID, "id", "", "Skill ID/name/path fragment")
+	skillsExportCmd.Flags().StringVar(&userSkillRevisionID, "revision", "", "Revision ID (optional; defaults active/latest)")
+	skillsExportCmd.Flags().StringVar(&userSkillExportOut, "out", "", "Output bundle path")
+	skillsImportCmd.Flags().StringVar(&userSkillImportIn, "in", "", "Input bundle path")
+	skillsMigrateCmd.Flags().BoolVar(&userSkillMigrateApply, "apply", false, "Persist migrated V3 metadata to registry index")
 
 	skillsCmd.AddCommand(skillsCreateCmd)
 	skillsCmd.AddCommand(skillsPreflightCmd)
 	skillsCmd.AddCommand(skillsListCmd)
 	skillsCmd.AddCommand(skillsShowCmd)
+	skillsCmd.AddCommand(skillsValidateCmd)
+	skillsCmd.AddCommand(skillsActivateCmd)
+	skillsCmd.AddCommand(skillsDeprecateCmd)
+	skillsCmd.AddCommand(skillsRevisionsCmd)
+	skillsCmd.AddCommand(skillsExportCmd)
+	skillsCmd.AddCommand(skillsImportCmd)
+	skillsCmd.AddCommand(skillsMigrateCmd)
 	rootCmd.AddCommand(skillsCmd)
 }
 

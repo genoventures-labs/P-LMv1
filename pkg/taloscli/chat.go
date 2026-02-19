@@ -9,7 +9,6 @@ import (
 	"go/format"
 	"io"
 	"math"
-	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -99,6 +98,10 @@ var chatCmd = &cobra.Command{
 		// Check if we have a prompt in arguments
 		if len(args) > 0 {
 			prompt := strings.Join(args, " ")
+			if msg, handled := TryHandleSelectiveInterventionApproval(prompt); handled {
+				fmt.Println(msg)
+				return
+			}
 			if approvalMsg, handled := orchestration.TryHandleAgencyApproval(prompt); handled {
 				fmt.Println(approvalMsg)
 				return
@@ -110,8 +113,11 @@ var chatCmd = &cobra.Command{
 				return
 			}
 			if sm != nil && strings.TrimSpace(normalized) != "" {
-				sm.SetPrimaryGoal(normalized)
-				_ = sm.Save()
+				locked, note := applyPersistentGoalLock(sm, normalized, "chat")
+				normalized = locked
+				if strings.TrimSpace(note) != "" {
+					fmt.Printf("DEBUG: %s\n", strings.TrimSpace(note))
+				}
 			}
 			err := handleChatTurn(client, mm, tc, r, normalized, nil, sm, selectedSkill)
 			if err != nil {
@@ -206,6 +212,10 @@ var chatCmd = &cobra.Command{
 				fmt.Println("Exiting chat session. Goodbye!")
 				break
 			}
+			if msg, handled := TryHandleSelectiveInterventionApproval(input); handled {
+				fmt.Println(msg)
+				continue
+			}
 			if approvalMsg, handled := orchestration.TryHandleAgencyApproval(input); handled {
 				fmt.Println(approvalMsg)
 				continue
@@ -217,8 +227,11 @@ var chatCmd = &cobra.Command{
 				continue
 			}
 			if sm != nil && strings.TrimSpace(normalized) != "" {
-				sm.SetPrimaryGoal(normalized)
-				_ = sm.Save()
+				locked, note := applyPersistentGoalLock(sm, normalized, "chat")
+				normalized = locked
+				if strings.TrimSpace(note) != "" {
+					fmt.Printf("DEBUG: %s\n", strings.TrimSpace(note))
+				}
 			}
 			err := handleChatTurn(client, mm, tc, r, normalized, &conversationHistory, sm, selectedSkill)
 			if err != nil {
@@ -237,91 +250,22 @@ var chatWarmup bool
 var chatCognitionMode string
 
 func applyIntentCorrection(raw string, sm *state.Manager, mm *memory.MemoryManager) (string, string) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return raw, ""
+	env, proceed, clarification := preprocessUserIntent(raw, sm, mm, "chat")
+	if !proceed {
+		return "", clarification
 	}
-
-	mission := buildIntentMissionContext(mm, raw)
-	intent := state.NormalizeIntent(raw, mission)
-	if intent.ClarificationRequest != "" {
-		if sm != nil {
-			sm.UpdateDelta(map[string]float64{
-				"Frustration": 0.04,
-				"Confidence":  -0.03,
-			})
-			_ = sm.Save()
-		}
-		return "", intent.ClarificationRequest
+	if strings.TrimSpace(env.Normalized) != strings.TrimSpace(raw) {
+		fmt.Printf("DEBUG: Normalized intent: %s\n", strings.TrimSpace(env.Normalized))
 	}
-
-	seed := strings.TrimSpace(intent.CorrectedInput)
-	if seed == "" {
-		seed = raw
-	}
-
-	if seed != raw {
-		fmt.Printf("DEBUG: Mission-normalized intent: %s\n", seed)
-	}
-
-	if sm == nil {
-		return seed, ""
-	}
-
-	current := sm.GetSnapshot()
-	normalized, delta, subtext, moodScore := cognition.NormalizeIntent(seed, current)
-	normalized = strings.TrimSpace(normalized)
-	if normalized == "" {
-		normalized = seed
-	}
-
-	if normalized != seed {
-		fmt.Printf("DEBUG: Normalized intent: %s\n", normalized)
-	}
-
-	if len(delta) > 0 {
-		sm.UpdateDelta(delta)
-		if err := sm.Save(); err != nil {
-			fmt.Printf("Warning: Failed saving state update from intent correction: %v\n", err)
-		}
-	}
-	if moodScore != 0 {
-		sm.UpdateState(moodScore)
-	}
-	if len(subtext) > 0 || moodScore != 0 {
-		sm.IngestSubtext(subtext, moodScore)
-		if err := sm.Save(); err != nil {
-			fmt.Printf("Warning: Failed saving mood curve update: %v\n", err)
-		}
-	}
-	return normalized, ""
+	return strings.TrimSpace(env.Normalized), ""
 }
 
 func applyIntentCorrectionWithTimeout(raw string, sm *state.Manager, mm *memory.MemoryManager) (string, string) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return raw, ""
+	env, proceed, clarification := preprocessUserIntent(raw, sm, mm, "chat")
+	if !proceed {
+		return "", clarification
 	}
-	if isTrivialPrompt(raw) {
-		return raw, ""
-	}
-	timeout := durationFromEnv("PLM_INTENT_CORRECTION_TIMEOUT", 4*time.Second)
-	type result struct {
-		normalized    string
-		clarification string
-	}
-	done := make(chan result, 1)
-	go func() {
-		n, c := applyIntentCorrection(raw, sm, mm)
-		done <- result{normalized: n, clarification: c}
-	}()
-	select {
-	case r := <-done:
-		return r.normalized, r.clarification
-	case <-time.After(timeout):
-		fmt.Printf("DEBUG: Intent correction timed out after %s; continuing with raw prompt.\n", timeout)
-		return raw, ""
-	}
+	return strings.TrimSpace(env.Normalized), ""
 }
 
 func isTrivialPrompt(raw string) bool {
@@ -501,16 +445,17 @@ const systemPrompt = `You are a helpful Personal AI Assistant. You have access t
 - Never expose secrets (api keys/tokens). If internal provisioning is used, keep credentials internal only.
 
 Available tools:
-- web_search: Search the web for current information. Args: {"query": "search query"}
-- fetch_url: Get content from a URL. Args: {"url": "https://..."}
-- http_request: Make direct HTTP requests with optional headers/body/allowlist profile. Args: {"method":"GET|POST|...","url":"https://...","headers":{"k":"v"},"body":"...","allowlist_profile":"public_web|internal_api"}
-- vector_retrieve: Semantic retrieval from vector memory/KB. Args: {"query":"...","namespace":"documentation|knowledge_base","top_k":5,"filters":{"key":"value"}}
+- web_search: Search the web for current information. Args: {"query": "search query","artifact_id":"research-...|latest","artifact_path":".memory/research_artifacts/<id>.json","reflection_audit_path":".memory/reflection_audit.jsonl","include_evidence_notes":true}
+- fetch_url: Get content from a URL. If url omitted and artifact has sources, first source URL is used. Args: {"url":"https://...","artifact_id":"research-...|latest","artifact_path":".memory/research_artifacts/<id>.json"}
+- http_request: Make direct HTTP requests with optional headers/body/allowlist profile. If url omitted and artifact has sources, first source URL is used. Args: {"method":"GET|POST|...","url":"https://...","headers":{"k":"v"},"body":"...","allowlist_profile":"public_web|internal_api","artifact_id":"research-...|latest","artifact_path":".memory/research_artifacts/<id>.json"}
+- vector_retrieve: Semantic retrieval from vector memory/KB. Args: {"query":"...","namespace":"documentation|knowledge_base","top_k":5,"filters":{"key":"value"},"artifact_id":"research-...|latest","reflection_audit_path":".memory/reflection_audit.jsonl","include_reflection_notes":true}
 - execute_code: Run code in a sandbox. Args: {"language": "python|javascript|go|bash", "code": "source code"}
 - sys_exec: Verified local Linux command execution with blacklist + read-first policy. Args: {"command":"...","override":false,"timeout_seconds":20}
 - capture_screen: Local screenshot capture with mandatory consent gate and privacy shutter. Args: {"consent":false,"mode":"screen|window","window_id":"optional","output_path":"optional","timeout_seconds":15}
 - watch_terminal: Capture active terminal window over time during long builds. Args: {"consent":false,"duration_seconds":30,"interval_ms":2500,"output_dir":"optional"}
 - draw_box: Draw temporary HUD highlight box on desktop. Args: {"consent":false,"x":120,"y":240,"w":220,"h":120,"text":"target","duration_ms":3200}
 - draw_war_room: Draw multiple color-coded HUD highlights (e.g., contradiction/document/date). Args: {"consent":false,"duration_ms":10000,"boxes":[{"x":120,"y":240,"w":220,"h":120,"text":"signature","kind":"document","color":"blue"}]}
+- analyze_visual_target: Analyze one specific visual ROI from overlays/capture with intent + snippet context. Args: {"consent":true,"intent":"analyze_ui_element","target":{"capture_path":".memory/captures/x.png","x":120,"y":340,"width":180,"height":90,"label":"Save button","snippet":"Save","confidence":0.84}}
 - provision_client (internal): Provision admin client credentials and store locally. Args: {"client_id":"optional-id","activate":true}
 - rotate_client_key (internal): Rotate key, store locally. Args: {"client_id":"required","activate":true}
 - revoke_client (internal): Revoke key and remove local record. Args: {"client_id":"required"}
@@ -522,7 +467,6 @@ Available tools:
 const (
 	maxToolResultChars  = 3500
 	maxToolCallsPerTurn = 4
-	totMaxBranches      = 3
 	mctsIterations      = 5
 	mctsBranchFactor    = 3
 	mctsRolloutDepth    = 2
@@ -577,15 +521,6 @@ type toolInvocation struct {
 type totBranch struct {
 	Answer string  `json:"answer"`
 	Score  float64 `json:"score"`
-}
-
-type mctsNode struct {
-	Answer   string
-	Depth    int
-	Visits   int
-	ValueSum float64
-	Parent   *mctsNode
-	Children []*mctsNode
 }
 
 type reflexAlert struct {
@@ -683,6 +618,17 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 
 	tc = maybeProvisionSubAgentClient(tc, input)
 	cognitionPlan := planCognitionBudget(input, sm, chatCognitionMode)
+	modulation := cognition.BuildReasoningModulation(sm, input, cognitionPlan.Mode)
+	cognitionPlan = applyReasoningModulationBudget(cognitionPlan, modulation)
+	styleProfile := cognition.ResolveStyleProfile(sm, mm, input, cognitionPlan.Mode)
+	var chainedSkills []skills.SkillRecord
+	if drafted, chain, note := maybeDraftJITSuperSkill(selectedSkill, input, cognitionPlan.ComplexityScore); drafted != nil {
+		selectedSkill = drafted
+		chainedSkills = chain
+		if strings.TrimSpace(note) != "" {
+			fmt.Printf("DEBUG: %s\n", note)
+		}
+	}
 	fmt.Printf("DEBUG: Cognition mode=%s score=%d thoughtgraph=%t tot=%t mcts=%t context=(h:%d,k:%d)\n",
 		cognitionPlan.Mode,
 		cognitionPlan.ComplexityScore,
@@ -692,6 +638,21 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 		cognitionPlan.HistoryTopK,
 		cognitionPlan.KnowledgeTopK,
 	)
+	fmt.Printf("DEBUG: Modulation entropy=%s load=%.2f persistence=%.2f density=%.2f branches=%d prune=%.2f\n",
+		modulation.Entropy.Mode,
+		modulation.EmotionPressure,
+		modulation.GoalPersistence,
+		modulation.DensityScale,
+		resolveToTBranchCap(modulation),
+		modulation.PruneThreshold,
+	)
+	if strings.TrimSpace(modulation.PredictiveIntervention) != "" {
+		fmt.Printf("DEBUG: Predictive Intervention=%s trend=%.2f volatility=%.2f\n",
+			modulation.PredictiveIntervention,
+			modulation.EmotionTrend,
+			modulation.EmotionVolatility,
+		)
+	}
 
 	// 0. Select model based on complexity
 	modelName := r.ResolveModel(router.ResolveRequest{
@@ -722,28 +683,37 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 
 	if cognitionPlan.UseThoughtGraph && shouldUseThoughtGraph(input) {
 		fmt.Println("DEBUG: Complex query detected. Using ThoughtGraph orchestration.")
-		if err := executeThoughtGraphTurn(client, mm, tc, r, modelCandidates, input, history, sm); err == nil {
+		if err := executeThoughtGraphTurn(client, mm, tc, r, modelCandidates, input, history, sm, modulation, styleProfile); err == nil {
 			return nil
 		} else {
 			fmt.Printf("Warning: ThoughtGraph execution failed, falling back to linear flow: %v\n", err)
 		}
 	}
 
-	// 1. Retrieve context from memory
-	historyContext, err := mm.RetrieveDynamicContext(input, cognitionPlan.HistoryTopK)
-	if err != nil {
-		fmt.Printf("Warning: Error retrieving history: %v\n", err)
-	}
-
-	knowledgeContext, err := mm.RetrieveKnowledge(input, cognitionPlan.KnowledgeTopK)
-	if err != nil {
-		fmt.Printf("Warning: Error retrieving knowledge: %v\n", err)
-	}
+	// 1. Retrieve context from memory (memory-anchored reasoning).
+	historyContext, knowledgeContext := resolveAnchoredTurnContext(mm, input, cognitionPlan.HistoryTopK, cognitionPlan.KnowledgeTopK)
 
 	// 2. Build the context-enriched message
 	var contextParts []string
+	if selectedSkill != nil {
+		execRes, execErr := skills.ExecuteWithPolicy(context.Background(), skills.ExecutionRequest{
+			Skill: *selectedSkill,
+			Query: input,
+			Input: map[string]any{"query": input},
+			Chain: chainedSkills,
+		})
+		if execErr != nil {
+			fmt.Printf("Warning: Skill runtime policy check failed: %v\n", execErr)
+		} else if strings.EqualFold(strings.TrimSpace(execRes.Status), "denied") {
+			fmt.Printf("Skill policy fallback: %s\n", strings.TrimSpace(firstNonEmpty(execRes.DeniedReason, strings.Join(execRes.PolicyNotes, "; "))))
+			selectedSkill = nil
+		}
+	}
 	if skillCtx := skillContextBlock(selectedSkill); skillCtx != "" {
 		contextParts = append(contextParts, skillCtx)
+	}
+	if cognition.StyleV2Enabled() {
+		contextParts = append(contextParts, cognition.BuildStylePromptContract(styleProfile))
 	}
 	if len(historyContext) > 0 {
 		contextParts = append(contextParts, "Relevant conversation history:\n"+strings.Join(historyContext, "\n"))
@@ -778,7 +748,32 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 		fmt.Printf("Warning: Error adding user message to memory: %v\n", err)
 	}
 
-	return performChatWithTools(client, mm, tc, modelCandidates, 0, input, requestMessages, history, 0, sm, cognitionPlan)
+	return performChatWithTools(client, mm, tc, modelCandidates, 0, input, requestMessages, history, 0, sm, cognitionPlan, modulation, styleProfile)
+}
+
+func resolveAnchoredTurnContext(mm *memory.MemoryManager, query string, historyK int, knowledgeK int) ([]string, []string) {
+	if mm == nil {
+		return nil, nil
+	}
+	ctx, err := mm.ResolveAnchoredContext(query, historyK, knowledgeK)
+	if err != nil {
+		historyContext, hErr := mm.RetrieveDynamicContext(query, historyK)
+		if hErr != nil {
+			fmt.Printf("Warning: Error retrieving history: %v\n", hErr)
+		}
+		knowledgeContext, kErr := mm.RetrieveKnowledge(query, knowledgeK)
+		if kErr != nil {
+			fmt.Printf("Warning: Error retrieving knowledge: %v\n", kErr)
+		}
+		if strings.TrimSpace(err.Error()) != "" {
+			fmt.Printf("Warning: Memory-anchored resolver fallback triggered: %v\n", err)
+		}
+		return historyContext, knowledgeContext
+	}
+	if ctx.Policy.StatusReport {
+		fmt.Print(ctx.AnchoredStatusReport())
+	}
+	return ctx.History, ctx.Knowledge
 }
 
 func maybeHandleUserSkillCreate(input string, tc *tools.GLMToolClient) (bool, string) {
@@ -984,7 +979,7 @@ func shouldRunRecursiveSourceOptimization(input string) bool {
 		(strings.Contains(q, "optimize") && strings.Contains(q, "pkg/"))
 }
 
-func executeThoughtGraphTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMToolClient, r *router.Router, modelCandidates []string, input string, history *[]api.Message, sm *state.Manager) error {
+func executeThoughtGraphTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMToolClient, r *router.Router, modelCandidates []string, input string, history *[]api.Message, sm *state.Manager, modulation cognition.ReasoningModulationProfile, styleProfile cognition.StyleProfile) error {
 	turnStarted := time.Now()
 	if len(modelCandidates) == 0 {
 		return fmt.Errorf("no model candidates available for thought graph")
@@ -1021,8 +1016,16 @@ func executeThoughtGraphTurn(client *api.Client, mm *memory.MemoryManager, tc *t
 	reflection.AttachMemory(mm)
 	reflection.AttachPredictive(cognition.NewPredictiveForecaster(mm))
 	topology := cognition.DetermineTopology(input)
+	truthShiftSeverity := 0.0
+	truthShiftDetected := false
+	truthShiftReason := ""
+	if sev, detected, reason := loadTruthShiftSeverityForGeometry(); detected || sev > 0 {
+		truthShiftSeverity = sev
+		truthShiftDetected = detected
+		truthShiftReason = reason
+	}
 	if sm != nil {
-		topology = cognition.DetermineTopologyWithState(input, sm.GetSnapshot())
+		topology = cognition.DetermineTopologyWithTruthShift(input, sm.GetSnapshot(), truthShiftDetected, truthShiftSeverity, truthShiftSeverity)
 	}
 	if sm != nil && topology == cognition.TopologyArchitect {
 		sm.UpdateDelta(map[string]float64{
@@ -1030,6 +1033,10 @@ func executeThoughtGraphTurn(client *api.Client, mm *memory.MemoryManager, tc *t
 			"GoalPersistence": 0.2,
 		})
 		_ = sm.Save()
+	}
+	if truthShiftSeverity > 0 || truthShiftDetected {
+		fmt.Printf("DEBUG: Reasoning geometry truth-shift severity=%.2f detected=%t reason=%s\n",
+			truthShiftSeverity, truthShiftDetected, summarizePlanStep(truthShiftReason, 140))
 	}
 	fmt.Printf("DEBUG: Selected topology: %s\n", topology)
 	_ = orchestration.AppendDecisionFeed(decisionFeedPath, orchestration.DecisionRecord{
@@ -1044,7 +1051,7 @@ func executeThoughtGraphTurn(client *api.Client, mm *memory.MemoryManager, tc *t
 			string(cognition.TopologyOuroboros),
 			string(cognition.TopologyArchitect),
 		},
-		Reasoning: fmt.Sprintf("Selected %s based on query complexity and current session state.", topology),
+		Reasoning: fmt.Sprintf("Selected %s based on query complexity, session state, and truth-shift severity %.2f.", topology, truthShiftSeverity),
 	})
 	output.PrintReasoningMirrorLine(os.Stdout, chooseThoughtHeader(input), sm, chatRawOutput)
 
@@ -1053,7 +1060,7 @@ func executeThoughtGraphTurn(client *api.Client, mm *memory.MemoryManager, tc *t
 		MaxSteps:        12,
 		Reflection:      reflection,
 		Compiler: func(tp cognition.Topology) (cognition.CompiledTopology, error) {
-			return compileTopologyGraph(tp, client, mm, tc, graphCandidates, input, goal)
+			return compileTopologyGraph(tp, client, mm, tc, graphCandidates, input, goal, modulation, styleProfile)
 		},
 	}
 
@@ -1090,11 +1097,11 @@ func executeThoughtGraphTurn(client *api.Client, mm *memory.MemoryManager, tc *t
 
 	if history == nil {
 		fmt.Print("LLM Response: ")
-		output.PrintBreathAware(finalOutput, sm, chatRawOutput)
+		output.PrintBreathAwareStyledWithProfile(os.Stdout, finalOutput, styleOutputForCurrentState(finalOutput, sm), sm, chatRawOutput, styleCadenceProfileFromCognition(styleProfile))
 		fmt.Println()
 	} else {
 		fmt.Print("<<< LLM: ")
-		output.PrintBreathAware(finalOutput, sm, chatRawOutput)
+		output.PrintBreathAwareStyledWithProfile(os.Stdout, finalOutput, styleOutputForCurrentState(finalOutput, sm), sm, chatRawOutput, styleCadenceProfileFromCognition(styleProfile))
 		fmt.Println()
 	}
 
@@ -1116,6 +1123,8 @@ func compileTopologyGraph(
 	graphCandidates []string,
 	input string,
 	goal string,
+	modulation cognition.ReasoningModulationProfile,
+	styleProfile cognition.StyleProfile,
 ) (cognition.CompiledTopology, error) {
 	switch topology {
 	case cognition.TopologyArchitect:
@@ -1134,7 +1143,7 @@ func compileTopologyGraph(
 				buildAdversarialNode(mm, input),
 				buildSynthesisNode(mm, input, "final_synthesis"),
 				buildRecoveryNode(client, graphCandidates, goal, input, "planner"),
-				buildFinalSynthesisNode(client, mm, graphCandidates, input, "alignment_correction"),
+				buildFinalSynthesisNode(client, mm, graphCandidates, input, "alignment_correction", modulation, styleProfile),
 				buildAlignmentNode(graphCandidates, "final_code_audit"),
 				buildFinalCodeAuditNode(input),
 				buildFinalCodeAuditGateNode(),
@@ -1155,7 +1164,7 @@ func compileTopologyGraph(
 				buildVisualNode(input, "synthesis_report"),
 				buildSynthesisNode(mm, input, "final_synthesis"),
 				buildRecoveryNode(client, graphCandidates, goal, input, "fusion"),
-				buildFinalSynthesisNode(client, mm, graphCandidates, input, "alignment_correction"),
+				buildFinalSynthesisNode(client, mm, graphCandidates, input, "alignment_correction", modulation, styleProfile),
 				buildAlignmentNode(graphCandidates, "final_code_audit"),
 				buildFinalCodeAuditNode(input),
 				buildFinalCodeAuditGateNode(),
@@ -1178,7 +1187,7 @@ func compileTopologyGraph(
 				buildBloomEvalNode(client, graphCandidates, input, "synthesis_report"),
 				buildSynthesisNode(mm, input, "final_synthesis"),
 				buildRecoveryNode(client, graphCandidates, goal, input, "fusion"),
-				buildFinalSynthesisNode(client, mm, graphCandidates, input, "alignment_correction"),
+				buildFinalSynthesisNode(client, mm, graphCandidates, input, "alignment_correction", modulation, styleProfile),
 				buildAlignmentNode(graphCandidates, "final_code_audit"),
 				buildFinalCodeAuditNode(input),
 				buildFinalCodeAuditGateNode(),
@@ -1210,7 +1219,7 @@ func compileTopologyGraph(
 				buildAdversarialNode(mm, input),
 				buildSynthesisNode(mm, input, "final_synthesis"),
 				buildRecoveryNode(client, graphCandidates, goal, input, "fusion"),
-				buildFinalSynthesisNode(client, mm, graphCandidates, input, "alignment_correction"),
+				buildFinalSynthesisNode(client, mm, graphCandidates, input, "alignment_correction", modulation, styleProfile),
 				buildAlignmentNode(graphCandidates, "final_code_audit"),
 				buildFinalCodeAuditNode(input),
 				buildFinalCodeAuditGateNode(),
@@ -1462,8 +1471,30 @@ func buildPolicyAuditNode(input string) cognition.Node {
 				pkgs := projectPackageList()
 				ctx.Metadata["project_packages"] = strings.Join(pkgs, ",")
 				goModule, goAllowed, nodeAllowed := cognition.LoadDependencyAllowlist(".")
-				violations := runSymbolicGoAudit(code, input, pkgs, goModule, goAllowed, nodeAllowed)
-				if len(violations) == 0 {
+				decision, _ := cognition.RunSymbolicSupervision(cognition.SupervisionInput{
+					Stage:     cognition.StageFinalCode,
+					Query:     input,
+					Candidate: code,
+					Session: func() state.SessionState {
+						if sm == nil {
+							return state.SessionState{}
+						}
+						return sm.GetSnapshot()
+					}(),
+					CodeAudit: &cognition.CodeAuditOptions{
+						Query:               input,
+						Code:                code,
+						ProjectPackages:     pkgs,
+						GoModule:            goModule,
+						AllowedGoModules:    goAllowed,
+						AllowedNodePackages: nodeAllowed,
+					},
+				}, cognition.DefaultSupervisionPolicy(chatCognitionMode))
+				violations := append([]string(nil), decision.Violations...)
+				// Preserve project-specific audit check.
+				legacyViolations := runSymbolicGoAudit(code, input, pkgs, goModule, goAllowed, nodeAllowed)
+				violations = dedupeStrings(append(violations, legacyViolations...))
+				if len(violations) == 0 && decision.Outcome != cognition.SupervisionHardVeto {
 					recordAlignmentAuditTelemetry(false)
 					ctx.Metadata["policy_audit_status"] = "pass"
 					return ctx.Output, nil, nil
@@ -1721,6 +1752,35 @@ func buildResearchNode(client *api.Client, mm *memory.MemoryManager, tc *tools.G
 					synth, err := orch.Orchestrate(input, graphCandidates, 28)
 					if err == nil && strings.TrimSpace(synth.StructuredAnswer) != "" {
 						answer := strings.TrimSpace(synth.StructuredAnswer)
+						if len(synth.RouteReport.SelectedDocs) > 0 || synth.RouteReport.FallbackUsed {
+							routeLines := orchestration.CompactRouteReportLines(synth.RouteReport, 5)
+							if len(routeLines) > 0 {
+								answer += "\n\nRouting:\n" + strings.Join(routeLines, "\n")
+							}
+							ctx.Metadata["doc_route_docs"] = fmt.Sprintf("%d", len(synth.RouteReport.SelectedDocs))
+							ctx.Metadata["doc_route_candidates"] = fmt.Sprintf("%d", synth.RouteReport.CandidateSegments)
+							ctx.Metadata["doc_route_fallback"] = fmt.Sprintf("%t", synth.RouteReport.FallbackUsed)
+						}
+						if len(synth.SectionMaps) > 0 || synth.HierarchyReport.CandidateSections > 0 {
+							hierLines := orchestration.CompactHierarchySummaryLines(synth.HierarchyReport, synth.SectionMaps, 5)
+							if len(hierLines) > 0 {
+								answer += "\n\nHierarchy:\n" + strings.Join(hierLines, "\n")
+							}
+							ctx.Metadata["doc_hier_sections"] = fmt.Sprintf("%d", synth.HierarchyReport.SelectedSections)
+							ctx.Metadata["doc_hier_candidates"] = fmt.Sprintf("%d", synth.HierarchyReport.CandidateSections)
+							ctx.Metadata["doc_hier_inferred"] = fmt.Sprintf("%t", synth.HierarchyReport.InferenceUsed)
+						}
+						ctx.Metadata["longform_triggered"] = fmt.Sprintf("%t", synth.ReasoningReport.Triggered)
+						ctx.Metadata["longform_passes"] = fmt.Sprintf("%d", synth.ReasoningReport.PassesRun)
+						ctx.Metadata["longform_citation_coverage"] = fmt.Sprintf("%.2f", synth.ReasoningReport.CitationCoverage)
+						ctx.Metadata["longform_fallback"] = fmt.Sprintf("%t", synth.ReasoningReport.FallbackUsed)
+						ctx.Metadata["section_link_count"] = fmt.Sprintf("%d", len(synth.SectionCrossLinks))
+						if len(synth.SectionCrossLinks) > 0 {
+							linkLines := orchestration.CompactSectionCrossLinkLines(synth.SectionCrossLinks, 5)
+							if len(linkLines) > 0 {
+								answer += "\n\nSection Links:\n" + strings.Join(linkLines, "\n")
+							}
+						}
 						if len(synth.CrossLinks) > 0 {
 							answer += "\n\nCross-links:\n"
 							for _, l := range synth.CrossLinks {
@@ -2075,34 +2135,112 @@ func buildVisualNode(input string, next string) cognition.Node {
 				}
 				actions := skills.BuildGroundedActions(beforeReason, shellCtx)
 				primaryTarget, hasTarget := skills.SelectPrimaryAction(actions)
+				overlayPolicy := skills.DefaultOverlayPolicy()
+				overlaySessionID := "chat_visual_session"
+				explicitOverlay := containsAnyToken(strings.ToLower(input), "overlay", "highlight", "hud", "mark", "point out")
+				var overlayCandidates []skills.OverlayCandidate
 				if hasTarget {
-					ctx.Metadata["visual_target_xy"] = fmt.Sprintf("(%d, %d)", primaryTarget.X, primaryTarget.Y)
-					ctx.Metadata["visual_target_action"] = summarizeForMetadata(primaryTarget.Action, 200)
-					drawText := "Target"
-					if strings.TrimSpace(primaryTarget.Target) != "" {
-						drawText = summarizeForMetadata(primaryTarget.Target, 36)
+					priority := skills.OverlayPriorityMedium
+					if primaryTarget.Confidence >= 0.8 || corr >= 0.8 {
+						priority = skills.OverlayPriorityHigh
 					}
-					draw := skills.DrawBox(skills.DrawBoxRequest{
-						Consent:    true,
+					overlayCandidates = append(overlayCandidates, skills.OverlayCandidate{
+						Kind:       skills.OverlayKindTarget,
+						Text:       summarizeForMetadata(primaryTarget.Target, 36),
 						X:          primaryTarget.X - maxInt(primaryTarget.Width/2, 40),
 						Y:          primaryTarget.Y - maxInt(primaryTarget.Height/2, 24),
 						W:          maxInt(primaryTarget.Width, 180),
 						H:          maxInt(primaryTarget.Height, 90),
-						Text:       drawText,
-						DurationMS: 3600,
+						Confidence: math.Max(0.50, primaryTarget.Confidence),
+						Priority:   priority,
+						Source:     "visual_reasoning",
 					})
-					if draw.Allowed {
-						ctx.Metadata["visual_hud_pid"] = fmt.Sprintf("%d", draw.PID)
-						ctx.Metadata["visual_hud_state"] = strings.TrimSpace(draw.StatePath)
+				}
+				overlayDecision := skills.EvaluateOverlayCandidates(overlayCandidates, skills.OverlayContext{
+					Stage:         "chat_visual_reasoning",
+					Explicit:      explicitOverlay,
+					HighRiskScore: corr,
+					SessionID:     overlaySessionID,
+				}, overlayPolicy)
+				ctx.Metadata["visual_overlay_decision"] = summarizeForMetadata(overlayDecision.Reason, 160)
+				if hasTarget {
+					ctx.Metadata["visual_target_xy"] = fmt.Sprintf("(%d, %d)", primaryTarget.X, primaryTarget.Y)
+					ctx.Metadata["visual_target_action"] = summarizeForMetadata(primaryTarget.Action, 200)
+					if overlayDecision.Render && len(overlayDecision.Selected) > 0 {
+						box := overlayDecision.Selected[0]
+						draw := skills.DrawBox(skills.DrawBoxRequest{
+							Consent:    true,
+							SessionID:  overlaySessionID,
+							X:          box.X,
+							Y:          box.Y,
+							W:          box.W,
+							H:          box.H,
+							Text:       box.Text,
+							DurationMS: 3600,
+						})
+						if draw.Allowed {
+							ctx.Metadata["visual_hud_pid"] = fmt.Sprintf("%d", draw.PID)
+							ctx.Metadata["visual_hud_state"] = strings.TrimSpace(draw.StatePath)
+						}
+						output.PrintReasoningMirrorLine(os.Stdout, fmt.Sprintf("Highlighting the discrepancy in the terminal at (%d,%d)...", primaryTarget.X, primaryTarget.Y), sm, chatRawOutput)
+						fmt.Println()
+						hud := fmt.Sprintf("Targeting the overlap at (%d, %d)... CSS fix applied. Verifying now.", primaryTarget.X, primaryTarget.Y)
+						if !containsAnyToken(strings.ToLower(primaryTarget.Target), "overlap", "sidebar", "svelte", "layout") {
+							hud = fmt.Sprintf("Targeting %q at (%d, %d)... applying fix. Verifying now.", primaryTarget.Target, primaryTarget.X, primaryTarget.Y)
+						}
+						output.PrintReasoningMirrorLine(os.Stdout, hud, sm, chatRawOutput)
+						fmt.Println()
 					}
-					output.PrintReasoningMirrorLine(os.Stdout, fmt.Sprintf("Highlighting the discrepancy in the terminal at (%d,%d)...", primaryTarget.X, primaryTarget.Y), sm, chatRawOutput)
-					fmt.Println()
-					hud := fmt.Sprintf("Targeting the overlap at (%d, %d)... CSS fix applied. Verifying now.", primaryTarget.X, primaryTarget.Y)
-					if !containsAnyToken(strings.ToLower(primaryTarget.Target), "overlap", "sidebar", "svelte", "layout") {
-						hud = fmt.Sprintf("Targeting %q at (%d, %d)... applying fix. Verifying now.", primaryTarget.Target, primaryTarget.X, primaryTarget.Y)
+				}
+				handshakeSummary := ""
+				if hasTarget && shouldAutoDispatchVisualHandshake(input, primaryTarget, corr, overlayDecision) {
+					target := map[string]interface{}{
+						"capture_path":     before.Path,
+						"capture_mode":     mode,
+						"window_id":        windowID,
+						"target_id":        fmt.Sprintf("target_%d_%d", primaryTarget.X, primaryTarget.Y),
+						"x":                primaryTarget.X - maxInt(primaryTarget.Width/2, 0),
+						"y":                primaryTarget.Y - maxInt(primaryTarget.Height/2, 0),
+						"width":            maxInt(primaryTarget.Width, 80),
+						"height":           maxInt(primaryTarget.Height, 48),
+						"label":            primaryTarget.Target,
+						"snippet":          resolveVisualSnippetForTarget(beforeReason, primaryTarget),
+						"confidence":       primaryTarget.Confidence,
+						"overlay_kind":     "target",
+						"source_model":     beforeReason.Model,
+						"spatial_elements": buildSpatialElementsForHandshake(beforeReason.SpatialElements, 12),
+						"provenance": map[string]interface{}{
+							"surface": "chat",
+							"stage":   "visual_reasoning",
+							"turn_id": fmt.Sprintf("graph_%d", time.Now().UnixNano()),
+						},
 					}
-					output.PrintReasoningMirrorLine(os.Stdout, hud, sm, chatRawOutput)
-					fmt.Println()
+					hsCall := toolInvocation{
+						Tool: "analyze_visual_target",
+						Args: map[string]interface{}{
+							"consent":       true,
+							"intent":        inferVisualHandshakeIntent(input),
+							"target":        target,
+							"shell_context": shellCtx,
+						},
+					}
+					hsRaw, hsErr := executeToolCall(nil, hsCall)
+					if hsErr != nil {
+						ctx.Metadata["visual_handshake_status"] = "failed"
+						ctx.Metadata["visual_handshake_error"] = summarizeForMetadata(hsErr.Error(), 160)
+					} else {
+						var hsRes skills.AnalyzeVisualTargetResult
+						if err := json.Unmarshal([]byte(hsRaw), &hsRes); err == nil {
+							ctx.Metadata["visual_handshake_status"] = "ok"
+							ctx.Metadata["visual_handshake_summary"] = summarizeForMetadata(hsRes.Summary, 180)
+							handshakeSummary = summarizeForMetadata(hsRes.Summary, 220)
+							if len(hsRes.Citations) > 0 {
+								ctx.Metadata["visual_handshake_citation"] = summarizeForMetadata(strings.Join(hsRes.Citations, ", "), 180)
+							}
+						} else {
+							ctx.Metadata["visual_handshake_status"] = "parse_failed"
+						}
+					}
 				}
 
 				out := strings.TrimSpace(ctx.Output)
@@ -2121,6 +2259,9 @@ func buildVisualNode(input string, next string) cognition.Node {
 					if strings.TrimSpace(primaryTarget.Action) != "" {
 						out += "\n- Action map: " + summarizeForMetadata(primaryTarget.Action, 180)
 					}
+				}
+				if strings.TrimSpace(handshakeSummary) != "" {
+					out += "\n- Vision-to-tool handshake: " + strings.TrimSpace(handshakeSummary)
 				}
 
 				if shouldRunVisualCorrectionLoop(input, ctx.Output) {
@@ -2177,6 +2318,17 @@ func buildFusionNode(client *api.Client, mm *memory.MemoryManager, graphCandidat
 					return ctx.Output, map[string]float64{"AnalyticalMode": 0.05}, nil
 				}
 				ctx.Metadata["fusion_conflict_index"] = fmt.Sprintf("%.2f", fused.ConflictIndex)
+				if strings.TrimSpace(fused.TruthState.TruthHash) != "" {
+					ctx.Metadata["worldview_truth_hash"] = strings.TrimSpace(fused.TruthState.TruthHash)
+				}
+				if fused.TruthShift.Detected {
+					ctx.Metadata["worldview_truth_shift"] = "detected"
+					if strings.TrimSpace(fused.TruthShift.Reason) != "" {
+						ctx.Metadata["worldview_truth_shift_reason"] = strings.TrimSpace(fused.TruthShift.Reason)
+					}
+				} else {
+					ctx.Metadata["worldview_truth_shift"] = "stable"
+				}
 				if len(fused.Perspectives) >= 2 {
 					ctx.Metadata["worldview_1"] = fused.Perspectives[0].Name + ": " + fused.Perspectives[0].Summary
 					ctx.Metadata["worldview_2"] = fused.Perspectives[1].Name + ": " + fused.Perspectives[1].Summary
@@ -2529,7 +2681,7 @@ func buildRecoveryNode(client *api.Client, graphCandidates []string, goal string
 	}
 }
 
-func buildFinalSynthesisNode(client *api.Client, mm *memory.MemoryManager, graphCandidates []string, input string, next string) cognition.Node {
+func buildFinalSynthesisNode(client *api.Client, mm *memory.MemoryManager, graphCandidates []string, input string, next string, modulation cognition.ReasoningModulationProfile, styleProfile cognition.StyleProfile) cognition.Node {
 	return cognition.Node{
 		ID:   "final_synthesis",
 		Next: next,
@@ -2568,10 +2720,10 @@ func buildFinalSynthesisNode(client *api.Client, mm *memory.MemoryManager, graph
 					candidate = "No draft answer yet."
 				}
 				modelName := graphCandidates[0]
-				if optimized, ok := runMonteCarloThoughtSearch(client, mm, modelName, input, candidate); ok {
+				if optimized, ok := runMonteCarloThoughtSearch(client, mm, modelName, input, candidate, modulation); ok {
 					candidate = optimized
 				}
-				if optimized, ok := runTreeOfThought(client, modelName, input, candidate); ok {
+				if optimized, ok := runTreeOfThought(client, modelName, input, candidate, styleProfile, resolveToTBranchCap(modulation)); ok {
 					candidate = optimized
 				}
 				return candidate, map[string]float64{"AnalyticalMode": 0.05, "Confidence": 0.04}, nil
@@ -2587,26 +2739,43 @@ func buildFinalCodeAuditNode(input string) cognition.Node {
 		Action: &cognition.ActionNode{
 			Name: "FinalSymbolicCodeAudit",
 			Run: func(_ string, ctx *cognition.GraphContext, sm *state.Manager) (string, map[string]float64, error) {
-				if leaks := cognition.DetectSecretLeaks(ctx.Output); len(leaks) > 0 {
-					virtual := "symbolic secret-leak veto:\n- " + strings.Join(leaks, "\n- ")
-					recordAlignmentAuditTelemetry(true)
-					mirrorLine := output.BuildLeadEngineerAuditNarrative(virtual, leaks)
-					output.PrintReasoningMirrorLine(os.Stdout, mirrorLine, sm, chatRawOutput)
-					ctx.Metadata["final_code_audit_status"] = "fail"
-					ctx.Metadata["final_code_audit_stderr"] = virtual
-					return ctx.Output, map[string]float64{"AnalyticalMode": 0.1, "Frustration": 0.06, "Confidence": -0.08}, nil
-				}
-				code, ok := extractGoCodeCandidate(ctx.Output)
-				if !ok {
-					ctx.Metadata["final_code_audit_status"] = "skipped"
-					return ctx.Output, nil, nil
-				}
+				code, hasCode := extractGoCodeCandidate(ctx.Output)
 				pkgs := projectPackageList()
 				goModule, goAllowed, nodeAllowed := cognition.LoadDependencyAllowlist(".")
-				violations := runSymbolicGoAudit(code, input, pkgs, goModule, goAllowed, nodeAllowed)
-				if len(violations) == 0 {
+				supInput := cognition.SupervisionInput{
+					Stage:        cognition.StageFinalCode,
+					Query:        input,
+					Candidate:    ctx.Output,
+					ContextFacts: nil,
+					Session: func() state.SessionState {
+						if sm == nil {
+							return state.SessionState{}
+						}
+						return sm.GetSnapshot()
+					}(),
+				}
+				if hasCode {
+					supInput.CodeAudit = &cognition.CodeAuditOptions{
+						Query:               input,
+						Code:                code,
+						ProjectPackages:     pkgs,
+						GoModule:            goModule,
+						AllowedGoModules:    goAllowed,
+						AllowedNodePackages: nodeAllowed,
+					}
+				}
+				decision, _ := cognition.RunSymbolicSupervision(supInput, cognition.DefaultSupervisionPolicy(chatCognitionMode))
+				violations := append([]string(nil), decision.Violations...)
+				if hasCode {
+					violations = dedupeStrings(append(violations, runSymbolicGoAudit(code, input, pkgs, goModule, goAllowed, nodeAllowed)...))
+				}
+				if len(violations) == 0 && decision.Outcome != cognition.SupervisionHardVeto {
 					recordAlignmentAuditTelemetry(false)
-					ctx.Metadata["final_code_audit_status"] = "pass"
+					if !hasCode {
+						ctx.Metadata["final_code_audit_status"] = "skipped"
+					} else {
+						ctx.Metadata["final_code_audit_status"] = "pass"
+					}
 					return ctx.Output, nil, nil
 				}
 				virtual := "final symbolic code audit failed:\n- " + strings.Join(violations, "\n- ")
@@ -2886,8 +3055,12 @@ func runDraftAnswerWithReframe(client *api.Client, mm *memory.MemoryManager, mod
 func runDraftAnswerPrompted(client *api.Client, mm *memory.MemoryManager, modelCandidates []string, input string, overridePayload string) (string, string, error) {
 	_, _ = cognition.MineAndPersistPreferences(mm)
 	styleDelta := cognition.BuildStyleLogicDelta(mm, input)
-	historyContext, _ := mm.RetrieveDynamicContext(input, 3)
-	knowledgeContext, _ := mm.RetrieveKnowledge(input, 3)
+	styleProfile := cognition.ResolveStyleProfile(nil, mm, input, "balanced")
+	styleContract := ""
+	if cognition.StyleV2Enabled() {
+		styleContract = cognition.BuildStylePromptContract(styleProfile)
+	}
+	historyContext, knowledgeContext := resolveAnchoredTurnContext(mm, input, 3, 3)
 
 	var contextParts []string
 	if len(historyContext) > 0 {
@@ -2914,10 +3087,17 @@ func runDraftAnswerPrompted(client *api.Client, mm *memory.MemoryManager, modelC
 			Content: `You are a high-signal reasoning assistant.
 Provide a concise, accurate draft answer.
 Do not include chain-of-thought.` + func() string {
-				if strings.TrimSpace(styleDelta) == "" {
+				parts := []string{}
+				if strings.TrimSpace(styleContract) != "" {
+					parts = append(parts, strings.TrimSpace(styleContract))
+				}
+				if strings.TrimSpace(styleDelta) != "" {
+					parts = append(parts, strings.TrimSpace(styleDelta))
+				}
+				if len(parts) == 0 {
 					return ""
 				}
-				return "\n\n" + strings.TrimSpace(styleDelta)
+				return "\n\n" + strings.Join(parts, "\n\n")
 			}(),
 		},
 		{Role: "user", Content: userMessage},
@@ -2984,7 +3164,7 @@ Return JSON only:
 	return score, nil
 }
 
-func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMToolClient, modelCandidates []string, modelIndex int, taskQuery string, messages []api.Message, history *[]api.Message, depth int, sm *state.Manager, budget cognitionBudget) error {
+func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMToolClient, modelCandidates []string, modelIndex int, taskQuery string, messages []api.Message, history *[]api.Message, depth int, sm *state.Manager, budget cognitionBudget, modulation cognition.ReasoningModulationProfile, styleProfile cognition.StyleProfile) error {
 	turnStarted := time.Now()
 	if depth > 5 {
 		return fmt.Errorf("maximum tool call depth exceeded")
@@ -3113,14 +3293,14 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 				fmt.Printf("DEBUG: Model %s timed out after %s. Falling back to %s.\n", modelName, llmChatTimeout, nextModel)
 			}
 			stopWaitLoop()
-			return performChatWithTools(client, mm, tc, resolvedCandidates, modelIndex+1, taskQuery, messages, history, depth, sm, budget)
+			return performChatWithTools(client, mm, tc, resolvedCandidates, modelIndex+1, taskQuery, messages, history, depth, sm, budget, modulation, styleProfile)
 		}
 		if depth > 0 && (isTotalTimeout || isFirstTokenTimeout || isTransient) {
 			if fallbackAnswer := buildFallbackAnswerFromToolResults(messages); fallbackAnswer != "" {
 				fallbackAnswer = redactSensitiveOutput(fallbackAnswer)
 				fmt.Printf("DEBUG: Returning fallback answer from latest tool result at depth %d.\n", depth)
 				segments := styleOutputForCurrentState(fallbackAnswer, sm)
-				output.PrintBreathAwareStyled(os.Stdout, fallbackAnswer, segments, sm, chatRawOutput)
+				output.PrintBreathAwareStyledWithProfile(os.Stdout, fallbackAnswer, segments, sm, chatRawOutput, styleCadenceProfileFromCognition(styleProfile))
 				fmt.Println()
 				if err := mm.AddMessage("assistant", fallbackAnswer); err != nil {
 					fmt.Printf("Warning: Error adding assistant message to memory: %v\n", err)
@@ -3146,14 +3326,27 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 
 	fullResponse := responseContent.String()
 	toolCalls, hasToolCalls := parseToolCalls(fullResponse)
+	if toolflowV3Enabled() || toolflowShadowEvalEnabled() {
+		if v3Calls, v3Has, deprecations, v3Err := parseToolCallsV3Aware(fullResponse); v3Err != nil {
+			fmt.Printf("DEBUG: Toolflow parser warning: %v\n", v3Err)
+		} else if v3Has {
+			toolCalls = v3Calls
+			hasToolCalls = true
+			if toolflowDeprecationsEnabled() {
+				for _, note := range deprecations {
+					fmt.Printf("DEBUG: Toolflow deprecation: %s\n", note)
+				}
+			}
+		}
+	}
 	if !hasToolCalls {
 		if budget.UseTreeOfThought && shouldUseTreeOfThought(taskQuery, depth) {
 			if budget.UseMCTS {
-				if optimized, ok := runMonteCarloThoughtSearch(client, mm, modelName, taskQuery, sanitizeModelOutput(fullResponse)); ok {
+				if optimized, ok := runMonteCarloThoughtSearch(client, mm, modelName, taskQuery, sanitizeModelOutput(fullResponse), modulation); ok {
 					fullResponse = optimized
 				}
 			}
-			if optimized, ok := runTreeOfThought(client, modelName, taskQuery, sanitizeModelOutput(fullResponse)); ok {
+			if optimized, ok := runTreeOfThought(client, modelName, taskQuery, sanitizeModelOutput(fullResponse), styleProfile, resolveToTBranchCap(modulation)); ok {
 				fullResponse = optimized
 			}
 		}
@@ -3169,7 +3362,7 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 				output.PrintReasoningMirrorLine(os.Stdout, "Logic Glimpse: "+glimpse, sm, chatRawOutput)
 			}
 			segments := styleOutputForCurrentState(finalOutput, sm)
-			output.PrintBreathAwareStyled(os.Stdout, finalOutput, segments, sm, chatRawOutput)
+			output.PrintBreathAwareStyledWithProfile(os.Stdout, finalOutput, segments, sm, chatRawOutput, styleCadenceProfileFromCognition(styleProfile))
 			recordInferenceAndTelemetryFeed(turnStarted, finalOutput)
 		}
 		fmt.Println()
@@ -3188,6 +3381,82 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 			*history = append(*history, assistantMsg)
 		}
 
+		if toolflowV3Enabled() {
+			items, status, depNotes, err := runToolflowV3(tc, taskQuery, toolCalls, fmt.Sprintf("chat-depth-%d", depth), "chat", "chat")
+			if err != nil {
+				if isSelectiveInterventionRequiredError(err) {
+					msg := selectiveInterventionErrorMessage(err)
+					if strings.TrimSpace(msg) == "" {
+						msg = strings.TrimSpace(err.Error())
+					}
+					segments := styleOutputForCurrentState(msg, sm)
+					output.PrintBreathAwareStyledWithProfile(os.Stdout, msg, segments, sm, chatRawOutput, styleCadenceProfileFromCognition(styleProfile))
+					fmt.Println()
+					if err := mm.AddMessage("assistant", msg); err != nil {
+						fmt.Printf("Warning: Error adding assistant message to memory: %v\n", err)
+					}
+					if history != nil {
+						*history = append(*history, api.Message{Role: "assistant", Content: msg})
+					}
+					recordInferenceAndTelemetryFeed(turnStarted, msg)
+					return nil
+				}
+				fmt.Printf("DEBUG: Toolflow V3 failed (fallback to legacy): %v\n", err)
+			} else {
+				if toolflowDeprecationsEnabled() {
+					for _, note := range depNotes {
+						fmt.Printf("DEBUG: Toolflow deprecation: %s\n", note)
+					}
+				}
+				if toolflowTraceEnabled() {
+					fmt.Print(status)
+				}
+				for i, item := range items {
+					fmt.Printf("\n[LLM tool step %d/%d: %s]\n", i+1, len(items), item.Tool)
+					toolResult := redactSensitiveOutput(item.Output)
+					if item.Err != nil {
+						if isSelectiveInterventionRequiredError(item.Err) {
+							msg := selectiveInterventionErrorMessage(item.Err)
+							if strings.TrimSpace(msg) == "" {
+								msg = strings.TrimSpace(item.Err.Error())
+							}
+							segments := styleOutputForCurrentState(msg, sm)
+							output.PrintBreathAwareStyledWithProfile(os.Stdout, msg, segments, sm, chatRawOutput, styleCadenceProfileFromCognition(styleProfile))
+							fmt.Println()
+							if err := mm.AddMessage("assistant", msg); err != nil {
+								fmt.Printf("Warning: Error adding assistant message to memory: %v\n", err)
+							}
+							if history != nil {
+								*history = append(*history, api.Message{Role: "assistant", Content: msg})
+							}
+							recordInferenceAndTelemetryFeed(turnStarted, msg)
+							return nil
+						}
+						recordToolFailure(item.Tool, taskQuery, item.Err)
+						toolResult = fmt.Sprintf("Error executing tool: %v", item.Err)
+					}
+					toolResultForModel := toolResult
+					if len(toolResultForModel) > maxToolResultChars {
+						toolResultForModel = toolResultForModel[:maxToolResultChars] + "\n...(truncated for context size)"
+					}
+					followup := "Use the tool result above to continue solving the task. If more tools are needed, call the next tool. If done, provide the final answer now."
+					if item.Tool == "sys_exec" && (strings.Contains(toolResultForModel, `"trigger_ouroboros":true`) || strings.Contains(toolResultForModel, `"exit_code":1`) || strings.Contains(toolResultForModel, `"exit_code":2`)) {
+						followup = "Analyze the sys_exec failure using Ouroboros loop, propose a safe fix command, and then continue."
+					}
+					toolResultMsg := api.Message{
+						Role:    "user",
+						Content: fmt.Sprintf("Tool result (%s): %s\n\n%s", item.Tool, toolResultForModel, followup),
+					}
+					messages = append(messages, toolResultMsg)
+					if history != nil {
+						*history = append(*history, toolResultMsg)
+					}
+				}
+				fmt.Printf("DEBUG: Requesting next step/final answer with %d total messages...\n", len(messages))
+				return performChatWithTools(client, mm, tc, modelCandidates, modelIndex, taskQuery, messages, history, depth+1, sm, budget, modulation, styleProfile)
+			}
+		}
+		runToolflowShadowEval(taskQuery, toolCalls, fmt.Sprintf("chat-shadow-depth-%d", depth))
 		for i, rawCall := range toolCalls {
 			call, arbitrationNote := arbitrateToolCall(rawCall, taskQuery)
 			fmt.Printf("\n[LLM tool step %d/%d: %s]\n", i+1, len(toolCalls), call.Tool)
@@ -3198,6 +3467,23 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 
 			toolResult, toolErr := executeToolCall(tc, call)
 			if toolErr != nil {
+				if isSelectiveInterventionRequiredError(toolErr) {
+					msg := selectiveInterventionErrorMessage(toolErr)
+					if strings.TrimSpace(msg) == "" {
+						msg = strings.TrimSpace(toolErr.Error())
+					}
+					segments := styleOutputForCurrentState(msg, sm)
+					output.PrintBreathAwareStyledWithProfile(os.Stdout, msg, segments, sm, chatRawOutput, styleCadenceProfileFromCognition(styleProfile))
+					fmt.Println()
+					if err := mm.AddMessage("assistant", msg); err != nil {
+						fmt.Printf("Warning: Error adding assistant message to memory: %v\n", err)
+					}
+					if history != nil {
+						*history = append(*history, api.Message{Role: "assistant", Content: msg})
+					}
+					recordInferenceAndTelemetryFeed(turnStarted, msg)
+					return nil
+				}
 				recordToolFailure(call.Tool, taskQuery, toolErr)
 				toolResult = fmt.Sprintf("Error executing tool: %v", toolErr)
 			}
@@ -3231,7 +3517,7 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 		}
 
 		fmt.Printf("DEBUG: Requesting next step/final answer with %d total messages...\n", len(messages))
-		return performChatWithTools(client, mm, tc, modelCandidates, modelIndex, taskQuery, messages, history, depth+1, sm, budget)
+		return performChatWithTools(client, mm, tc, modelCandidates, modelIndex, taskQuery, messages, history, depth+1, sm, budget, modulation, styleProfile)
 	}
 	if hasToolCalls && tc == nil {
 		if depth >= 2 {
@@ -3254,7 +3540,7 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 			*history = append(*history, api.Message{Role: "assistant", Content: fullResponse})
 			*history = append(*history, api.Message{Role: "user", Content: "Tools are unavailable in this session. Do not emit tool calls. Provide a direct final answer now."})
 		}
-		return performChatWithTools(client, mm, tc, modelCandidates, modelIndex, taskQuery, messages, history, depth+1, sm, budget)
+		return performChatWithTools(client, mm, tc, modelCandidates, modelIndex, taskQuery, messages, history, depth+1, sm, budget, modulation, styleProfile)
 	}
 
 	safeOutput := sanitizeModelOutput(fullResponse)
@@ -3281,6 +3567,16 @@ func styleOutputForCurrentState(text string, sm *state.Manager) []output.TonalSe
 	}
 	markers := sm.GetSnapshot().Subtext
 	return output.ColorSegmentsWithSubtext(segments, markers)
+}
+
+func styleCadenceProfileFromCognition(p cognition.StyleProfile) *output.StyleCadenceProfile {
+	if !cognition.StyleV2Enabled() {
+		return nil
+	}
+	return &output.StyleCadenceProfile{
+		Density: p.Density,
+		Tone:    p.Tone,
+	}
 }
 
 func withStrategicProposal(base string, mm *memory.MemoryManager, sm *state.Manager, query string) string {
@@ -3311,6 +3607,25 @@ func withAgencyPendingPrompt(base string) string {
 		return base
 	}
 	return base + "\n\n" + prompt
+}
+
+func loadTruthShiftSeverityForGeometry() (float64, bool, string) {
+	shift, _, foundShift, err := orchestration.LoadLatestWorldviewTruthShift()
+	if err != nil {
+		return 0, false, ""
+	}
+	if foundShift {
+		return clampFloat(shift.Severity), shift.Detected, strings.TrimSpace(shift.Reason)
+	}
+	state, foundState, stateErr := orchestration.LoadCurrentWorldviewTruth()
+	if stateErr != nil || !foundState {
+		return 0, false, ""
+	}
+	reason := "worldview conflict index fallback"
+	if state.ConflictIndex >= 0.60 {
+		return clampFloat(state.ConflictIndex), true, reason
+	}
+	return clampFloat(state.ConflictIndex), false, reason
 }
 
 func isTransientLLMError(err error) bool {
@@ -3449,26 +3764,43 @@ func shouldUseTreeOfThought(taskQuery string, depth int) bool {
 	return len(q) > 120
 }
 
-func runMonteCarloThoughtSearch(client *api.Client, mm *memory.MemoryManager, modelName, taskQuery, draftAnswer string) (string, bool) {
+func runMonteCarloThoughtSearch(client *api.Client, mm *memory.MemoryManager, modelName, taskQuery, draftAnswer string, modulation cognition.ReasoningModulationProfile) (string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), mctsTimeout)
 	defer cancel()
 
 	logicContext := buildSymbolicContext(mm, taskQuery)
+	branchFactor := clampInt(resolveToTBranchCap(modulation), 3, 5)
+	if branchFactor == 0 {
+		branchFactor = clampInt(mctsBranchFactor, 3, 5)
+	}
+	pruneThreshold := modulation.PruneThreshold
+	if pruneThreshold <= 0 {
+		pruneThreshold = 0.30
+	}
+	strategy := strings.ToLower(strings.TrimSpace(os.Getenv("TALOS_MCTS_STRATEGY")))
+	resolvedStrategy := cognition.MCTSStrategyPUCT
+	if strategy == string(cognition.MCTSStrategyUCB1) || strings.EqualFold(strings.TrimSpace(os.Getenv("TALOS_MCTS_LEGACY_FALLBACK")), "true") {
+		resolvedStrategy = cognition.MCTSStrategyUCB1
+	}
 	engine := cognition.MCTSEngine{
 		Config: cognition.MCTSConfig{
-			Iterations: mctsIterations,
-			BranchFactor: func() int {
-				if mctsBranchFactor < 3 {
-					return 3
-				}
-				if mctsBranchFactor > 5 {
-					return 5
-				}
-				return mctsBranchFactor
-			}(),
-			RolloutDepth:   mctsRolloutDepth,
-			UCB1C:          mctsUCB1C,
-			PruneThreshold: 0.30,
+			Iterations:         mctsIterations,
+			BranchFactor:       branchFactor,
+			RolloutDepth:       mctsRolloutDepth,
+			UCB1C:              mctsUCB1C,
+			PruneThreshold:     pruneThreshold,
+			BaseWeight:         modulation.Weights.Base,
+			AdvWeight:          modulation.Weights.Adversarial,
+			EvidenceWeight:     modulation.Weights.Evidence,
+			ContraWeight:       modulation.Weights.ContradictionPenalty,
+			Strategy:           resolvedStrategy,
+			MaxChildrenPerNode: mctsEnvInt("TALOS_MCTS_MAX_CHILDREN_PER_NODE", branchFactor),
+			WideningAlpha:      mctsEnvFloat("TALOS_MCTS_WIDENING_ALPHA", 0.5),
+			WideningK:          mctsEnvFloat("TALOS_MCTS_WIDENING_K", 1.5),
+			PriorWeight:        mctsEnvFloat("TALOS_MCTS_PRIOR_WEIGHT", 1.25),
+			VirtualLoss:        mctsEnvFloat("TALOS_MCTS_VIRTUAL_LOSS", 0.2),
+			MaxConcurrency:     mctsEnvInt("TALOS_MCTS_MAX_CONCURRENCY", 4),
+			EvalTimeout:        mctsCallTimeout,
 		},
 		Callbacks: cognition.MCTSCallbacks{
 			ProposeBranches: func(ctx context.Context, currentAnswer string, branchCount int) ([]string, error) {
@@ -3520,10 +3852,11 @@ func runMonteCarloThoughtSearch(client *api.Client, mm *memory.MemoryManager, mo
 		},
 	}
 
-	best, ok, root, err := engine.Search(ctx, draftAnswer)
-	if err != nil || !ok {
+	result, err := engine.SearchV2(ctx, draftAnswer)
+	if err != nil || strings.TrimSpace(result.BestAnswer) == "" {
 		return "", false
 	}
+	root := result.Root
 	if root != nil && liveTelemetry != nil {
 		liveTelemetry.RecordDecisionCertainty(collectThoughtConfidences(root))
 	}
@@ -3547,69 +3880,100 @@ func runMonteCarloThoughtSearch(client *api.Client, mm *memory.MemoryManager, mo
 			Source:       "mcts_branch_search",
 			ChosenPath:   "mcts_winning_path",
 			Alternatives: alt,
-			Reasoning:    strings.TrimSpace(glimpse),
+			Reasoning:    strings.TrimSpace(glimpse) + fmt.Sprintf(" | strategy=%s iterations=%d expanded=%d pruned=%d elapsed_ms=%d", result.Strategy, result.IterationsRun, result.ExpandedNodes, result.PrunedNodes, result.ElapsedMS),
 			Confidence:   topConf,
 		})
 	}
-	return sanitizeModelOutput(best), true
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("TALOS_MCTS_STATUS_ENABLED")), "true") {
+		fmt.Printf("MCTS status: strategy=%s iterations=%d expanded=%d pruned=%d confidence=%.2f elapsed_ms=%d\n", result.Strategy, result.IterationsRun, result.ExpandedNodes, result.PrunedNodes, result.Confidence, result.ElapsedMS)
+	}
+	appendMCTSTrace(taskQuery, draftAnswer, result)
+	return sanitizeModelOutput(result.BestAnswer), true
 }
 
-func mctsSelectNode(root *mctsNode, rng *rand.Rand) *mctsNode {
-	node := root
-	for len(node.Children) > 0 && node.Depth < mctsRolloutDepth {
-		var unvisited []*mctsNode
-		for _, c := range node.Children {
-			if c.Visits == 0 {
-				unvisited = append(unvisited, c)
-			}
-		}
-		if len(unvisited) > 0 {
-			return unvisited[rng.Intn(len(unvisited))]
-		}
-		best := node.Children[0]
-		bestUCB := mctsUCB(best, node.Visits)
-		for _, c := range node.Children[1:] {
-			ucb := mctsUCB(c, node.Visits)
-			if ucb > bestUCB {
-				best = c
-				bestUCB = ucb
-			}
-		}
-		node = best
+func mctsEnvInt(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
 	}
-	return node
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	if v <= 0 {
+		return fallback
+	}
+	return v
 }
 
-func mctsUCB(node *mctsNode, parentVisits int) float64 {
-	if node.Visits == 0 {
-		return math.Inf(1)
+func mctsEnvFloat(key string, fallback float64) float64 {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
 	}
-	avg := node.ValueSum / float64(node.Visits)
-	explore := mctsUCB1C * math.Sqrt(math.Log(float64(maxInt(parentVisits, 1)))/float64(node.Visits))
-	return avg + explore
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return fallback
+	}
+	if math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
+		return fallback
+	}
+	return v
 }
 
-func mctsExpandNode(ctx context.Context, client *api.Client, modelName, taskQuery string, node *mctsNode) error {
-	branches, ok := mctsProposeBranches(ctx, client, modelName, taskQuery, node.Answer)
-	if !ok || len(branches) == 0 {
-		return fmt.Errorf("no branches proposed")
-	}
-	for _, b := range branches {
-		ans := strings.TrimSpace(b.Answer)
-		if ans == "" {
-			continue
-		}
-		node.Children = append(node.Children, &mctsNode{
-			Answer: ans,
-			Depth:  node.Depth + 1,
-			Parent: node,
-		})
-	}
-	return nil
+type mctsTraceEntry struct {
+	Timestamp  time.Time `json:"timestamp"`
+	Query      string    `json:"query"`
+	SeedAnswer string    `json:"seed_answer"`
+	BestAnswer string    `json:"best_answer"`
+	Strategy   string    `json:"strategy"`
+	Iterations int       `json:"iterations"`
+	Expanded   int       `json:"expanded"`
+	Pruned     int       `json:"pruned"`
+	Confidence float64   `json:"confidence"`
+	ElapsedMS  int64     `json:"elapsed_ms"`
 }
 
-func mctsProposeBranches(ctx context.Context, client *api.Client, modelName, taskQuery, currentAnswer string) ([]totBranch, bool) {
-	return mctsProposeBranchesN(ctx, client, modelName, taskQuery, currentAnswer, mctsBranchFactor)
+func appendMCTSTrace(query string, draft string, result cognition.MCTSResult) {
+	path := strings.TrimSpace(os.Getenv("TALOS_MCTS_TRACE_PATH"))
+	if path == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	entry := mctsTraceEntry{
+		Timestamp:  time.Now().UTC(),
+		Query:      strings.TrimSpace(query),
+		SeedAnswer: mctsTraceTrim(strings.TrimSpace(draft), 400),
+		BestAnswer: mctsTraceTrim(strings.TrimSpace(result.BestAnswer), 400),
+		Strategy:   strings.TrimSpace(result.Strategy),
+		Iterations: result.IterationsRun,
+		Expanded:   result.ExpandedNodes,
+		Pruned:     result.PrunedNodes,
+		Confidence: result.Confidence,
+		ElapsedMS:  result.ElapsedMS,
+	}
+	line, err := json.Marshal(entry)
+	if err != nil {
+		return
+	}
+	_, _ = f.Write(append(line, '\n'))
+}
+
+func mctsTraceTrim(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	if max < 4 {
+		return s[:max]
+	}
+	return s[:max-3] + "..."
 }
 
 func mctsProposeBranchesN(ctx context.Context, client *api.Client, modelName, taskQuery, currentAnswer string, branchCount int) ([]totBranch, bool) {
@@ -3652,7 +4016,7 @@ Return JSON only:
 		return nil, false
 	}
 
-	branches, ok := parseToTBranches(out.String())
+	branches, ok := parseToTBranches(out.String(), branchCount)
 	if !ok || len(branches) == 0 {
 		return nil, false
 	}
@@ -3780,6 +4144,167 @@ func shouldRunVisualCorrectionLoop(query string, candidate string) bool {
 	fixIntent := containsAnyToken(q, "fix", "update", "adjust", "change", "patch", "correct")
 	uiIntent := containsAnyToken(q, "ui", "button", "screen", "window", "frontend", "visual", "layout", "css", "svelte")
 	return fixIntent && uiIntent
+}
+
+func visualHandshakeEnabled() bool {
+	return envBoolDefault("TALOS_VISUAL_HANDSHAKE_ENABLED", true)
+}
+
+func visualHandshakeAutoDispatchEnabled() bool {
+	return envBoolDefault("TALOS_VISUAL_HANDSHAKE_AUTO_DISPATCH", true)
+}
+
+func visualHandshakeMinConfidence() float64 {
+	v := strings.TrimSpace(os.Getenv("TALOS_VISUAL_HANDSHAKE_MIN_CONFIDENCE"))
+	if v == "" {
+		return 0.68
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0.68
+	}
+	if f < 0.10 {
+		return 0.10
+	}
+	if f > 1.0 {
+		return 1.0
+	}
+	return f
+}
+
+func shouldAutoDispatchVisualHandshake(query string, target skills.VisualAction, corr float64, overlayDecision skills.OverlayDecision) bool {
+	if !visualHandshakeEnabled() || !visualHandshakeAutoDispatchEnabled() {
+		return false
+	}
+	if strings.TrimSpace(target.Target) == "" {
+		return false
+	}
+	q := strings.ToLower(strings.TrimSpace(query))
+	intentMatch := containsAnyToken(q,
+		"analyze this", "analyze this ui element", "ui element", "looking at", "inspect this", "specific element", "this button",
+		"focus this", "analyze visual", "visual target", "element on screen")
+	if !intentMatch && !overlayDecision.Render {
+		return false
+	}
+	score := math.Max(target.Confidence, corr)
+	return score >= visualHandshakeMinConfidence()
+}
+
+func inferVisualHandshakeIntent(query string) string {
+	q := strings.ToLower(strings.TrimSpace(query))
+	switch {
+	case containsAnyToken(q, "verify", "validated", "confirm fixed", "is it fixed"):
+		return "verify_fix"
+	case containsAnyToken(q, "error", "exception", "failed", "bug"):
+		return "inspect_error"
+	default:
+		return "analyze_ui_element"
+	}
+}
+
+func resolveVisualSnippetForTarget(vr skills.VisualReasoningResult, target skills.VisualAction) string {
+	best := strings.TrimSpace(target.Target)
+	bestDist := math.MaxFloat64
+	for _, el := range vr.SpatialElements {
+		label := strings.TrimSpace(el.Label)
+		if label == "" {
+			continue
+		}
+		cx := float64(el.X + maxInt(el.Width/2, 0))
+		cy := float64(el.Y + maxInt(el.Height/2, 0))
+		d := math.Hypot(cx-float64(target.X), cy-float64(target.Y))
+		if d < bestDist {
+			bestDist = d
+			best = label
+		}
+	}
+	return summarizeForMetadata(strings.TrimSpace(best), envIntDefault("TALOS_VISUAL_HANDSHAKE_MAX_SNIPPET_CHARS", 280))
+}
+
+func buildSpatialElementsForHandshake(in []skills.SpatialElement, maxN int) []interface{} {
+	if maxN <= 0 {
+		maxN = 12
+	}
+	capN := len(in)
+	if capN > maxN {
+		capN = maxN
+	}
+	out := make([]interface{}, 0, capN)
+	for i, el := range in {
+		if i >= maxN {
+			break
+		}
+		out = append(out, map[string]interface{}{
+			"kind":       strings.TrimSpace(el.Kind),
+			"label":      strings.TrimSpace(el.Label),
+			"x":          el.X,
+			"y":          el.Y,
+			"width":      el.Width,
+			"height":     el.Height,
+			"confidence": el.Confidence,
+		})
+	}
+	return out
+}
+
+func maybeDraftJITSuperSkill(selectedSkill *skills.SkillRecord, query string, complexityScore int) (*skills.SkillRecord, []skills.SkillRecord, string) {
+	if selectedSkill != nil {
+		return selectedSkill, nil, ""
+	}
+	if !envBoolDefault("TALOS_JIT_SKILL_CHAINING_ENABLED", true) {
+		return nil, nil, ""
+	}
+	minComplexity := envIntDefault("TALOS_JIT_SKILL_CHAIN_MIN_COMPLEXITY", 7)
+	if complexityScore < minComplexity {
+		return nil, nil, ""
+	}
+	minConfidence := envFloatDefault("TALOS_JIT_SKILL_CHAIN_MIN_CONFIDENCE", 0.35)
+	reg := skills.NewSkillRegistry(skills.PermanentSkillsRoot())
+	decision, err := skills.RouteSkill(reg, skills.RouteRequest{Query: strings.TrimSpace(query)})
+	if err != nil || len(decision.Candidates) == 0 {
+		return nil, nil, ""
+	}
+	picks := make([]skills.SkillRecord, 0, 3)
+	seen := map[string]bool{}
+	for _, cand := range decision.Candidates {
+		if cand.Confidence < minConfidence {
+			continue
+		}
+		id := strings.TrimSpace(cand.Record.SkillID)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		picks = append(picks, cand.Record)
+		if len(picks) == 3 {
+			break
+		}
+	}
+	if len(picks) < 3 {
+		return nil, nil, ""
+	}
+	super, chain, err := skills.DraftTemporarySuperSkill(strings.TrimSpace(query), picks)
+	if err != nil {
+		return nil, nil, ""
+	}
+	note := fmt.Sprintf("Planner drafted JIT Super-Skill chain: %s -> %s -> %s",
+		strings.TrimSpace(chain[0].SkillID),
+		strings.TrimSpace(chain[1].SkillID),
+		strings.TrimSpace(chain[2].SkillID),
+	)
+	return &super, chain, note
+}
+
+func envFloatDefault(key string, fallback float64) float64 {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return fallback
+	}
+	return v
 }
 
 func buildVisualReasoningOverlay(query string, vr skills.VisualReasoningResult) string {
@@ -4050,13 +4575,6 @@ func gofmtPass(code string) (string, bool, error) {
 	return out, out != src, nil
 }
 
-func mctsBackpropagate(node *mctsNode, score float64) {
-	for n := node; n != nil; n = n.Parent {
-		n.Visits++
-		n.ValueSum += score
-	}
-}
-
 func maxInt(a, b int) int {
 	if a > b {
 		return a
@@ -4064,16 +4582,30 @@ func maxInt(a, b int) int {
 	return b
 }
 
-func runTreeOfThought(client *api.Client, modelName, taskQuery, draftAnswer string) (string, bool) {
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+func runTreeOfThought(client *api.Client, modelName, taskQuery, draftAnswer string, styleProfile cognition.StyleProfile, maxBranches int) (string, bool) {
+	maxBranches = clampInt(maxBranches, 2, 5)
 	arbiterPrompt := `You are a Tree-of-Thought arbiter.
 Generate multiple candidate final answers for the user query, score each candidate from 0.0 to 1.0, and return JSON only.
 Do not include chain-of-thought.
 Return exactly:
 {"branches":[{"answer":"...","score":0.0}]}
 Requirements:
-- between 2 and ` + fmt.Sprintf("%d", totMaxBranches) + ` branches
+- between 2 and ` + fmt.Sprintf("%d", maxBranches) + ` branches
 - concise answers
 - score reflects correctness + relevance + clarity.`
+	if cognition.StyleV2Enabled() {
+		arbiterPrompt += "\n\n" + cognition.BuildStylePromptContract(styleProfile)
+	}
 
 	userPrompt := "User query:\n" + taskQuery
 	if strings.TrimSpace(draftAnswer) != "" {
@@ -4104,7 +4636,7 @@ Requirements:
 		return "", false
 	}
 
-	branches, ok := parseToTBranches(out.String())
+	branches, ok := parseToTBranches(out.String(), maxBranches)
 	if !ok || len(branches) == 0 {
 		return "", false
 	}
@@ -4122,7 +4654,7 @@ Requirements:
 	return bestAnswer, true
 }
 
-func parseToTBranches(raw string) ([]totBranch, bool) {
+func parseToTBranches(raw string, maxBranches int) ([]totBranch, bool) {
 	trimmed := strings.TrimSpace(stripMarkdownCodeFences(stripReasoningSections(raw)))
 	if trimmed == "" {
 		return nil, false
@@ -4130,7 +4662,7 @@ func parseToTBranches(raw string) ([]totBranch, bool) {
 
 	var direct []totBranch
 	if err := json.Unmarshal([]byte(trimmed), &direct); err == nil {
-		b := sanitizeBranches(direct)
+		b := sanitizeBranches(direct, maxBranches)
 		return b, len(b) > 0
 	}
 
@@ -4138,13 +4670,14 @@ func parseToTBranches(raw string) ([]totBranch, bool) {
 		Branches []totBranch `json:"branches"`
 	}
 	if err := json.Unmarshal([]byte(trimmed), &obj); err == nil {
-		b := sanitizeBranches(obj.Branches)
+		b := sanitizeBranches(obj.Branches, maxBranches)
 		return b, len(b) > 0
 	}
 	return nil, false
 }
 
-func sanitizeBranches(in []totBranch) []totBranch {
+func sanitizeBranches(in []totBranch, maxBranches int) []totBranch {
+	maxBranches = clampInt(maxBranches, 2, 5)
 	var out []totBranch
 	for _, b := range in {
 		ans := strings.TrimSpace(b.Answer)
@@ -4163,10 +4696,18 @@ func sanitizeBranches(in []totBranch) []totBranch {
 		}
 		out = append(out, totBranch{Answer: ans, Score: score})
 	}
-	if len(out) > totMaxBranches {
-		out = out[:totMaxBranches]
+	if len(out) > maxBranches {
+		out = out[:maxBranches]
 	}
 	return out
+}
+
+func resolveToTBranchCap(mod cognition.ReasoningModulationProfile) int {
+	limit := mod.BranchBudget
+	if limit <= 0 {
+		return 3
+	}
+	return clampInt(limit, 2, 5)
 }
 
 func buildFallbackAnswerFromToolResults(messages []api.Message) string {
@@ -4318,7 +4859,7 @@ func parseToolCalls(fullResponse string) ([]toolInvocation, bool) {
 
 	var alt map[string]interface{}
 	if err := json.Unmarshal([]byte(trimmed), &alt); err == nil {
-		for _, candidate := range []string{"web_search", "fetch_url", "http_request", "vector_retrieve", "execute_code", "sys_exec", "capture_screen", "watch_terminal", "draw_box", "draw_war_room", "provision_client", "rotate_client_key", "revoke_client"} {
+		for _, candidate := range []string{"web_search", "fetch_url", "http_request", "vector_retrieve", "execute_code", "sys_exec", "capture_screen", "watch_terminal", "draw_box", "draw_war_room", "analyze_visual_target", "doc_search", "multimodal_tool", "auto_tool", "provision_client", "rotate_client_key", "revoke_client", "admin_list_clients", "admin_create_client", "admin_rotate_client", "admin_delete_client"} {
 			if args, found := alt[candidate]; found {
 				if m, ok := args.(map[string]interface{}); ok {
 					calls := sanitizeToolCalls([]toolInvocation{{Tool: candidate, Args: m}})
@@ -4455,6 +4996,29 @@ func arbitrateToolCall(call toolInvocation, taskQuery string) (toolInvocation, s
 		if getArgInt(args, "duration_ms", 0) <= 0 {
 			args["duration_ms"] = 10_000
 		}
+	case "auto_tool":
+		if getArgString(args, "goal", "") == "" {
+			if resolved := strings.TrimSpace(resolveAutoToolGoal(toolInvocation{Tool: tool, Args: args})); resolved != "" {
+				args["goal"] = resolved
+			} else {
+				args["goal"] = taskQuery
+			}
+		}
+		maxDepth := getArgInt(args, "max_depth", 0)
+		if maxDepth > 0 {
+			args["max_depth"] = clampInt(maxDepth, 1, 4)
+		}
+	case "multimodal_tool":
+		if strings.TrimSpace(resolveMultimodalQuery(args, artifactBundle{})) == "" {
+			args["query"] = taskQuery
+		}
+	case "doc_search":
+		if getArgString(args, "query", "") == "" {
+			args["query"] = taskQuery
+		}
+		if getArgString(args, "dir", "") == "" {
+			args["dir"] = "."
+		}
 	}
 
 	if tool != original {
@@ -4464,6 +5028,9 @@ func arbitrateToolCall(call toolInvocation, taskQuery string) (toolInvocation, s
 }
 
 func executeToolCall(tc *tools.GLMToolClient, call toolInvocation) (string, error) {
+	if err := maybeRequireSelectiveIntervention(call); err != nil {
+		return "", err
+	}
 	switch call.Tool {
 	case "web_search":
 		query := getArgString(call.Args, "query", "")
@@ -4594,6 +5161,55 @@ func executeToolCall(tc *tools.GLMToolClient, call toolInvocation) (string, erro
 			Boxes:      getArgWarRoomBoxes(call.Args, "boxes"),
 		})
 		return mustJSON(result), nil
+	case "analyze_visual_target":
+		target := getArgMap(call.Args, "target")
+		res := skills.AnalyzeVisualTarget(skills.AnalyzeVisualTargetRequest{
+			Consent:      getArgBool(call.Args, "consent", false),
+			Intent:       getArgString(call.Args, "intent", "analyze_ui_element"),
+			ShellContext: getArgString(call.Args, "shell_context", ""),
+			Target: skills.VisualTargetPayload{
+				CapturePath:     getArgString(target, "capture_path", ""),
+				CaptureMode:     getArgString(target, "capture_mode", ""),
+				WindowID:        getArgString(target, "window_id", ""),
+				TargetID:        getArgString(target, "target_id", ""),
+				X:               getArgInt(target, "x", 0),
+				Y:               getArgInt(target, "y", 0),
+				Width:           getArgInt(target, "width", getArgInt(target, "w", 160)),
+				Height:          getArgInt(target, "height", getArgInt(target, "h", 90)),
+				Label:           getArgString(target, "label", ""),
+				Snippet:         getArgString(target, "snippet", ""),
+				Confidence:      getArgFloat(target, "confidence", 0.55),
+				OverlayKind:     getArgString(target, "overlay_kind", ""),
+				SourceModel:     getArgString(target, "source_model", ""),
+				SpatialElements: getArgSpatialElements(target, "spatial_elements"),
+				Provenance:      getArgStringMap(target, "provenance"),
+			},
+		})
+		return mustJSON(res), nil
+	case "multimodal_tool":
+		return executeMultimodalTool(tc, call)
+	case "doc_search":
+		report, err := runDocSearch(DocSearchOptions{
+			Query:         getArgString(call.Args, "query", ""),
+			Dir:           getArgString(call.Args, "dir", "."),
+			Regex:         getArgBool(call.Args, "regex", false),
+			CaseSensitive: getArgBool(call.Args, "case_sensitive", false),
+			Extensions:    getArgStringSlice(call.Args, "extensions"),
+			ExcludeDirs:   getArgStringSlice(call.Args, "exclude_dirs"),
+			IncludeHidden: getArgBool(call.Args, "include_hidden", false),
+			FollowSymlink: getArgBool(call.Args, "follow_symlinks", false),
+			MaxFiles:      getArgInt(call.Args, "max_files", 0),
+			MaxMatches:    getArgInt(call.Args, "max_matches", 0),
+			MaxPerFile:    getArgInt(call.Args, "max_per_file", 0),
+			MaxFileBytes:  int64(getArgInt(call.Args, "max_file_bytes", 0)),
+			ContextLines:  getArgInt(call.Args, "context_lines", 0),
+		})
+		if err != nil {
+			return "", err
+		}
+		return docSearchReportJSON(report), nil
+	case "auto_tool":
+		return executeRecursiveAutoTool(tc, call, 0)
 	case "admin_list_clients":
 		admin, err := tools.NewGLMAdminClientFromEnv()
 		if err != nil {
@@ -5813,6 +6429,14 @@ func normalizeToolName(name string) string {
 		return "draw_box"
 	case "draw_warroom", "war_room", "multi_highlight", "highlight_multi", "warroom":
 		return "draw_war_room"
+	case "analyze_visual", "visual_target", "analyze_ui_element", "vision_target":
+		return "analyze_visual_target"
+	case "docsearch", "search_docs", "docs_search", "document_search":
+		return "doc_search"
+	case "multimodal", "multi_modal", "multimodal_route", "multi_modal_route", "omni_tool", "multi_tool":
+		return "multimodal_tool"
+	case "autotool", "auto_tools", "auto_tool_recursive", "recursive_tool", "recursive_tools":
+		return "auto_tool"
 	case "provision", "provision_key", "provision_api_key":
 		return "provision_client"
 	case "rotate_key", "rotate_api_key":
@@ -5833,7 +6457,7 @@ func normalizeToolName(name string) string {
 
 func isSupportedTool(tool string) bool {
 	switch tool {
-	case "web_search", "fetch_url", "http_request", "vector_retrieve", "execute_code", "sys_exec", "capture_screen", "watch_terminal", "draw_box", "draw_war_room",
+	case "web_search", "fetch_url", "http_request", "vector_retrieve", "execute_code", "sys_exec", "capture_screen", "watch_terminal", "draw_box", "draw_war_room", "analyze_visual_target", "doc_search", "multimodal_tool", "auto_tool",
 		"provision_client", "rotate_client_key", "revoke_client",
 		"admin_list_clients", "admin_create_client", "admin_rotate_client", "admin_delete_client":
 		return true
@@ -5870,6 +6494,31 @@ func getArgInt(args map[string]interface{}, key string, fallback int) int {
 		return int(n)
 	}
 	return fallback
+}
+
+func getArgFloat(args map[string]interface{}, key string, fallback float64) float64 {
+	v, ok := args[key]
+	if !ok || v == nil {
+		return fallback
+	}
+	switch n := v.(type) {
+	case float64:
+		return n
+	case float32:
+		return float64(n)
+	case int:
+		return float64(n)
+	case int64:
+		return float64(n)
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
+		if err != nil {
+			return fallback
+		}
+		return parsed
+	default:
+		return fallback
+	}
 }
 
 func getArgBool(args map[string]interface{}, key string, fallback bool) bool {
@@ -5978,6 +6627,34 @@ func getArgWarRoomBoxes(args map[string]interface{}, key string) []skills.WarRoo
 			Color: getArgString(m, "color", ""),
 		}
 		out = append(out, box)
+	}
+	return out
+}
+
+func getArgSpatialElements(args map[string]interface{}, key string) []skills.SpatialElement {
+	raw, ok := args[key]
+	if !ok || raw == nil {
+		return nil
+	}
+	arr, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]skills.SpatialElement, 0, len(arr))
+	for _, el := range arr {
+		m, ok := el.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		out = append(out, skills.SpatialElement{
+			Kind:       getArgString(m, "kind", ""),
+			Label:      getArgString(m, "label", ""),
+			X:          getArgInt(m, "x", 0),
+			Y:          getArgInt(m, "y", 0),
+			Width:      getArgInt(m, "width", getArgInt(m, "w", 0)),
+			Height:     getArgInt(m, "height", getArgInt(m, "h", 0)),
+			Confidence: getArgFloat(m, "confidence", 0),
+		})
 	}
 	return out
 }
