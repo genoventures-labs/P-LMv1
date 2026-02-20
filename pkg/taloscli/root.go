@@ -69,6 +69,7 @@ It leverages the JIT model router to ensure optimal models are available.
 Use chat domain pinning (--domain / PLM_CHAT_DOMAIN) plus learn namespaces (--namespace) to isolate work domains under zero-trust retrieval.`,
 	Example: `  talos chat "Summarize latest telemetry"
    talos chat --domain talos-runtime "Summarize latest telemetry"
+   talos chat --text-gen talos-native "Summarize recent learn sessions"
    talos chat --cognition minimal --timeout-profile quick "Online?"
   talos --skill report2markdown chat "Convert this into markdown release notes"
   talos research run "What changed in X this week?"
@@ -98,6 +99,7 @@ Use chat domain pinning (--domain / PLM_CHAT_DOMAIN) plus learn namespaces (--na
   talos learn profile create --name hf-train-default --hf-dataset TeichAI/claude-4.5-opus-high-reasoning-250x --hf-config default --hf-split train
    talos learn --profile hf-train-default
    talos learn --dir ./docs --namespace talos-runtime
+   talos learn --synthetic-text-out .memory/synthetic/train.jsonl "Capture stable native text-gen examples"
    talos learn "Store this project note"
   talos learned --last 5
   talos skills create --name report2markdown --description "Converts research reports to markdown files"

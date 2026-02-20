@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -68,6 +69,7 @@ var learnIncrementalManifest string
 var learnNamespace string
 var learnDryRun bool
 var learnVerbose bool
+var learnSyntheticTextOut string
 
 // Google Workspace + Notion connector flags
 var learnGmailQuery string
@@ -157,6 +159,12 @@ All sources are chunked and indexed into persistent memory for future retrieval.
 				return
 			}
 			fmt.Println(plan)
+			return
+		}
+		if strings.TrimSpace(learnSyntheticTextOut) != "" {
+			if err := executeLearnSyntheticText(args); err != nil {
+				fmt.Printf("Error generating synthetic text artifacts: %v\n", err)
+			}
 			return
 		}
 		if strings.TrimSpace(learnFromResearch) != "" {
@@ -604,6 +612,7 @@ func init() {
 
 func bindLearnConfigFlags(fs *pflag.FlagSet) {
 	fs.StringVarP(&learnFile, "file", "f", "", "Path to a file to learn from")
+	fs.StringVar(&learnSyntheticTextOut, "synthetic-text-out", "", "Write deterministic synthetic text-generation artifacts (JSONL) and skip indexing")
 	fs.StringVarP(&learnDir, "dir", "d", "", "Path to a directory of documents to index")
 	fs.StringVar(&learnNamespace, "namespace", "", "Optional memory namespace for all ingested records in this run")
 	fs.BoolVarP(&learnRecursive, "recursive", "r", true, "Recursively index subdirectories when using --dir")
@@ -671,6 +680,93 @@ func bindLearnConfigFlags(fs *pflag.FlagSet) {
 
 	// Chain — ordered multi-source ingestion
 	fs.StringVar(&learnChain, "chain", "", "Ordered comma-separated source tokens (e.g. \"dir,github,hf,kaggle,books\"). Valid: file,dir,url,hf,kaggle,gmail,drive,notion,books,github,research")
+}
+
+func executeLearnSyntheticText(args []string) error {
+	var content string
+	source := "inline"
+	if strings.TrimSpace(learnFile) != "" {
+		data, err := os.ReadFile(learnFile)
+		if err != nil {
+			return err
+		}
+		content = string(data)
+		source = strings.TrimSpace(learnFile)
+	} else if len(args) > 0 {
+		content = strings.Join(args, " ")
+	} else {
+		return fmt.Errorf("provide inline text or --file when using --synthetic-text-out")
+	}
+	lines := buildSyntheticTextJSONLLines(content, source, learnChunkChars)
+	if len(lines) == 0 {
+		return fmt.Errorf("no synthetic artifacts produced from input")
+	}
+	outPath := strings.TrimSpace(learnSyntheticTextOut)
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(outPath, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		return err
+	}
+	session := newLearnSession("SYNTHETIC_TEXT", outPath, []string{source}, map[string]string{
+		"synthetic_text_out": outPath,
+	})
+	annotateLearnSessionWithProfile(&session, learnProfileApplied)
+	session.finish("SUCCESS", "Synthetic text artifacts generated.", "", map[string]int64{
+		"items_indexed":    0,
+		"synthetic_chunks": int64(len(lines)),
+	})
+	if logErr := appendLearnSessionRecord(session); logErr != nil {
+		fmt.Printf("Warning: Failed to write learn session log: %v\n", logErr)
+	}
+	fmt.Printf("Synthetic text artifacts written: %s (%d lines)\n", outPath, len(lines))
+	return nil
+}
+
+func buildSyntheticTextJSONLLines(content, source string, chunkChars int) []string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil
+	}
+	if chunkChars <= 0 {
+		chunkChars = 1200
+	}
+	normalized := strings.Join(strings.Fields(content), " ")
+	if normalized == "" {
+		return nil
+	}
+	chunks := make([]string, 0, 4)
+	for len(normalized) > 0 {
+		if len(normalized) <= chunkChars {
+			chunks = append(chunks, strings.TrimSpace(normalized))
+			break
+		}
+		cut := strings.LastIndex(normalized[:chunkChars], " ")
+		if cut <= 0 {
+			cut = chunkChars
+		}
+		chunks = append(chunks, strings.TrimSpace(normalized[:cut]))
+		normalized = strings.TrimSpace(normalized[cut:])
+	}
+	lines := make([]string, 0, len(chunks))
+	for i, chunk := range chunks {
+		record := map[string]any{
+			"type":         "synthetic_text",
+			"source":       source,
+			"chunk_index":  i + 1,
+			"chunk_total":  len(chunks),
+			"prompt":       "Ground the answer in this chunk.",
+			"target_text":  chunk,
+			"token_est":    len(strings.Fields(chunk)),
+			"created_mode": "deterministic",
+		}
+		b, err := json.Marshal(record)
+		if err != nil {
+			continue
+		}
+		lines = append(lines, string(b))
+	}
+	return lines
 }
 
 func summaryConfigFromLearnFlags() memory.SourceSummaryConfig {

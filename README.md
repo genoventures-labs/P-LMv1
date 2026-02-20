@@ -80,6 +80,12 @@ talos chat --domain talos-runtime "What changed in our toolserver policy?"
 PLM_CHAT_DOMAIN=talos-runtime talos chat "Summarize latest runtime learnings"
 ```
 
+Run experimental TALOS-native text generation (no Ollama calls in that mode):
+
+```bash
+talos chat --text-gen talos-native "Summarize recent learn sessions"
+```
+
 Recommended namespace workflow:
 
 ```bash
@@ -153,6 +159,13 @@ Learn from a Kaggle dataset:
 
 ```bash
 KAGGLE_USERNAME=your_user KAGGLE_KEY=your_key talos learn --kaggle-dataset zillow/zecon --kaggle-max-records 100
+```
+
+Generate deterministic synthetic text artifacts (JSONL) from inline/file input:
+
+```bash
+talos learn --synthetic-text-out .memory/synthetic/train.jsonl "Capture stable response examples for native text-gen"
+talos learn --file ./docs/ops.md --synthetic-text-out .memory/synthetic/ops.jsonl
 ```
 
 Chain multiple training sources in a fixed order:

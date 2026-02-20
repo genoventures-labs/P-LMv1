@@ -19,6 +19,10 @@ func renderLearnDryRunPlan(args []string) (string, error) {
 			fmt.Sprintf("include_research_summary=%t", learnIncludeResearchSummary),
 			fmt.Sprintf("include_research_sources=%t", learnIncludeResearchSources),
 		)
+	} else if strings.TrimSpace(learnSyntheticTextOut) != "" {
+		mode = "SYNTHETIC_TEXT"
+		target = strings.TrimSpace(learnSyntheticTextOut)
+		notes = append(notes, "synthetic_text_out="+target)
 	} else if strings.TrimSpace(learnDir) != "" {
 		mode = "DIRECTORY"
 		target = strings.TrimSpace(learnDir)
