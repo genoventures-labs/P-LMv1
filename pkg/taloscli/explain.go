@@ -150,6 +150,7 @@ var capabilityDocs = []capabilityDoc{
 			"Supports explicit domain pinning via --domain (or PLM_CHAT_DOMAIN) to scope retrieval to one work domain namespace.",
 			"Supports explicit skill selection with global --skill flag.",
 			"Supports experimental TALOS-native text generation via --text-gen (no value required; no Ollama calls in that mode).",
+			"Supports PLM_CHAT_TEXT_GEN_PRIMARY=1 to make native text-gen the default output path unless overridden.",
 			"Supports cognition budgeting to avoid heavy reasoning on simple prompts.",
 			"Supports latency profiles and warmup behavior for chat responsiveness.",
 		},

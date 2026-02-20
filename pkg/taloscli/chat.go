@@ -302,6 +302,9 @@ func resolveChatTextGenMode(raw string) (string, error) {
 		mode = strings.ToLower(strings.TrimSpace(os.Getenv("PLM_CHAT_TEXT_GEN")))
 	}
 	if mode == "" {
+		if boolFromEnv("PLM_CHAT_TEXT_GEN_PRIMARY", false) {
+			return chatTextGenModeTalosNative, nil
+		}
 		return chatTextGenModeOllama, nil
 	}
 	switch mode {
@@ -7171,7 +7174,7 @@ func init() {
 	chatCmd.Flags().StringVar(&chatCognitionMode, "cognition", "", "Cognition orchestration mode: auto|minimal|balanced|deep (default from PLM_COGNITION_MODE or auto)")
 	chatCmd.Flags().StringVar(&chatDomain, "domain", "", "Pin chat to a memory domain namespace (falls back to PLM_CHAT_DOMAIN)")
 	chatCmd.Flags().StringVar(&chatNamespace, "namespace", "", "Alias of --domain for chat namespace pinning")
-	chatCmd.Flags().StringVar(&chatTextGen, "text-gen", "", "Text generation runtime: ollama|talos-native (use --text-gen with no value to select talos-native)")
+	chatCmd.Flags().StringVar(&chatTextGen, "text-gen", "", "Text generation runtime: ollama|talos-native (use --text-gen with no value to select talos-native; PLM_CHAT_TEXT_GEN_PRIMARY=1 makes native default)")
 	if f := chatCmd.Flags().Lookup("text-gen"); f != nil {
 		f.NoOptDefVal = chatTextGenModeTalosNative
 	}

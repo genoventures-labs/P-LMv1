@@ -216,12 +216,25 @@ func TestResolveChatTextGenModeDefaultsToOllama(t *testing.T) {
 	prev := chatTextGen
 	defer func() { chatTextGen = prev }()
 	t.Setenv("PLM_CHAT_TEXT_GEN", "")
+	t.Setenv("PLM_CHAT_TEXT_GEN_PRIMARY", "")
 	got, err := resolveChatTextGenMode("")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if got != chatTextGenModeOllama {
 		t.Fatalf("expected default ollama mode, got %q", got)
+	}
+}
+
+func TestResolveChatTextGenModePrimaryEnvDefaultsToNative(t *testing.T) {
+	t.Setenv("PLM_CHAT_TEXT_GEN", "")
+	t.Setenv("PLM_CHAT_TEXT_GEN_PRIMARY", "1")
+	got, err := resolveChatTextGenMode("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != chatTextGenModeTalosNative {
+		t.Fatalf("expected primary env to default native mode, got %q", got)
 	}
 }
 

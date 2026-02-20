@@ -84,6 +84,7 @@ Run experimental TALOS-native text generation (no Ollama calls in that mode):
 
 ```bash
 talos chat "Summarize recent learn sessions" --text-gen
+PLM_CHAT_TEXT_GEN_PRIMARY=1 talos chat "Summarize recent learn sessions"
 ```
 
 Recommended namespace workflow:

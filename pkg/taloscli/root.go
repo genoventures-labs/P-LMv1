@@ -70,6 +70,7 @@ Use chat domain pinning (--domain / PLM_CHAT_DOMAIN) plus learn namespaces (--na
 	Example: `  talos chat "Summarize latest telemetry"
    talos chat --domain talos-runtime "Summarize latest telemetry"
    talos chat "Summarize recent learn sessions" --text-gen
+   PLM_CHAT_TEXT_GEN_PRIMARY=1 talos chat "Summarize recent learn sessions"
    talos chat --cognition minimal --timeout-profile quick "Online?"
   talos --skill report2markdown chat "Convert this into markdown release notes"
   talos research run "What changed in X this week?"
