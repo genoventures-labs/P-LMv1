@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Thynaptic/P-LMv1/pkg/state"
 )
 
 func TestIsTrivialPrompt(t *testing.T) {
@@ -189,16 +191,39 @@ func TestResolveChatDomainPrefersFlagThenEnv(t *testing.T) {
 	t.Setenv("PLM_CHAT_DOMAIN", "ops")
 	chatDomain = ""
 	chatNamespace = ""
-	if got := resolveChatDomain(); got != "ops" {
+	if got := resolveChatDomain(nil); got != "ops" {
 		t.Fatalf("expected env fallback domain ops, got %q", got)
 	}
 	chatNamespace = "runtime-ns"
-	if got := resolveChatDomain(); got != "runtime-ns" {
+	if got := resolveChatDomain(nil); got != "runtime-ns" {
 		t.Fatalf("expected namespace alias runtime-ns, got %q", got)
 	}
 	chatDomain = "talos-runtime"
-	if got := resolveChatDomain(); got != "talos-runtime" {
+	if got := resolveChatDomain(nil); got != "talos-runtime" {
 		t.Fatalf("expected flag domain talos-runtime, got %q", got)
+	}
+}
+
+func TestResolveChatDomainFallsBackToPersistedState(t *testing.T) {
+	prev := chatDomain
+	prevNs := chatNamespace
+	defer func() {
+		chatDomain = prev
+		chatNamespace = prevNs
+	}()
+	t.Setenv("PLM_CHAT_DOMAIN", "")
+	chatDomain = ""
+	chatNamespace = ""
+	sm, err := state.NewManagerWithPath(filepath.Join(t.TempDir(), "session_state.json"))
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	sm.SetActiveNamespace("persisted-runtime")
+	if err := sm.Save(); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	if got := resolveChatDomain(sm); got != "persisted-runtime" {
+		t.Fatalf("expected persisted namespace fallback, got %q", got)
 	}
 }
 

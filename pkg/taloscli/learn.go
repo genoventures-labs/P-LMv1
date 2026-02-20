@@ -19,6 +19,7 @@ import (
 	"github.com/Thynaptic/P-LMv1/pkg/connectors/notion"
 	"github.com/Thynaptic/P-LMv1/pkg/memory"
 	"github.com/Thynaptic/P-LMv1/pkg/rag"
+	"github.com/Thynaptic/P-LMv1/pkg/state"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -147,12 +148,28 @@ URL CRAWL RULES
   - In strict mode, only matching URL path extensions are crawled/indexed; extensionless URLs are skipped.
   - Use --verbose to show the current detailed technical learn summary output.
   - Use --namespace to write all ingested records into an isolated memory domain namespace.
+  - When --namespace is supplied, it becomes the persisted active namespace for future chat/research runs.
 
 All sources are chunked and indexed into persistent memory for future retrieval.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if _, err := resolveLearnProfileForRun(cmd); err != nil {
 			fmt.Printf("Error resolving learn profile: %v\n", err)
 			return
+		}
+		sm, _ := state.NewManager()
+		explicitNamespace := strings.ToLower(strings.TrimSpace(learnNamespace))
+		if explicitNamespace != "" {
+			learnNamespace = explicitNamespace
+			if sm != nil {
+				sm.SetActiveNamespace(learnNamespace)
+				if err := sm.Save(); err != nil {
+					fmt.Printf("Warning: Failed to persist active namespace: %v\n", err)
+				}
+			}
+		} else if sm != nil {
+			if persisted := strings.ToLower(strings.TrimSpace(sm.ActiveNamespace())); persisted != "" {
+				learnNamespace = persisted
+			}
 		}
 		if learnDryRun {
 			plan, err := renderLearnDryRunPlan(args)

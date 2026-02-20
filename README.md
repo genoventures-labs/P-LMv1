@@ -95,6 +95,9 @@ talos learn --dir ./docs/runtime --namespace talos-runtime
 
 # 2) Pin chat to that same namespace
 talos chat --domain talos-runtime "What changed in our runtime architecture?"
+
+# Namespace pins are persisted as active runtime scope for future chat/research runs
+# when --domain/--namespace and PLM_CHAT_DOMAIN are not provided.
 ```
 
 Learn an entire directory (all supported default document types):

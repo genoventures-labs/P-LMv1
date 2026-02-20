@@ -41,6 +41,7 @@ var chatCmd = &cobra.Command{
 	Long: `This command starts an interactive chat session if no prompt is provided. If a prompt is provided as an argument, it sends it to the LLM, prints the response, and exits.
 
 Use --domain <namespace> (or --namespace / PLM_CHAT_DOMAIN) to pin retrieval to a work domain namespace for strict zero-trust context isolation.
+When set explicitly, the active namespace is persisted and reused by later runs when flags/env are unset.
 Use --text-gen (no value) to run an experimental TALOS-owned text generator path (no Ollama calls in that mode).`,
 	Run: func(cmd *cobra.Command, args []string) {
 		textGenMode, err := resolveChatTextGenMode(chatTextGen)
@@ -104,9 +105,16 @@ Use --text-gen (no value) to run an experimental TALOS-owned text generator path
 		}
 		chatCognitionMode = normalizeCognitionMode(chatCognitionMode)
 		debugPrintf("DEBUG: Cognition orchestrator default=%s\n", chatCognitionMode)
-		if domain := resolveChatDomain(); domain != "" {
+		explicitDomain := explicitChatDomain()
+		if domain := resolveChatDomain(sm); domain != "" {
 			mm.SetActiveNamespace(domain)
 			debugPrintf("DEBUG: Domain namespace=%s\n", domain)
+			if explicitDomain != "" && sm != nil {
+				sm.SetActiveNamespace(domain)
+				if err := sm.Save(); err != nil {
+					debugPrintf("DEBUG: Failed to persist active namespace: %v\n", err)
+				}
+			}
 		}
 
 		// Check if we have a prompt in arguments
@@ -286,14 +294,29 @@ func debugPrintln(args ...any) {
 	fmt.Println(args...)
 }
 
-func resolveChatDomain() string {
+func explicitChatDomain() string {
 	if v := strings.TrimSpace(chatDomain); v != "" {
 		return strings.ToLower(v)
 	}
 	if v := strings.TrimSpace(chatNamespace); v != "" {
 		return strings.ToLower(v)
 	}
-	return strings.ToLower(strings.TrimSpace(os.Getenv("PLM_CHAT_DOMAIN")))
+	return ""
+}
+
+func resolveChatDomain(sm *state.Manager) string {
+	if v := explicitChatDomain(); v != "" {
+		return v
+	}
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("PLM_CHAT_DOMAIN"))); v != "" {
+		return v
+	}
+	if sm != nil {
+		if v := strings.ToLower(strings.TrimSpace(sm.ActiveNamespace())); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func resolveChatTextGenMode(raw string) (string, error) {

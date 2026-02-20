@@ -66,7 +66,8 @@ var rootCmd = &cobra.Command{
 	Long: `talos is a CLI tool to interact with your personal LLM hosted on an Ollama VPS.
 It leverages the JIT model router to ensure optimal models are available.
 
-Use chat domain pinning (--domain / --namespace / PLM_CHAT_DOMAIN) plus learn namespaces (--namespace) to isolate work domains under zero-trust retrieval.`,
+Use chat domain pinning (--domain / --namespace / PLM_CHAT_DOMAIN) plus learn namespaces (--namespace) to isolate work domains under zero-trust retrieval.
+Explicit namespace selections are persisted and reused across later runs when not overridden.`,
 	Example: `  talos chat "Summarize latest telemetry"
     talos chat --domain talos-runtime "Summarize latest telemetry"
     talos chat --namespace talos-runtime "Summarize latest telemetry"
