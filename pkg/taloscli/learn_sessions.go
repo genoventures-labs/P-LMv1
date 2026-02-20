@@ -12,8 +12,10 @@ import (
 )
 
 const defaultLearnSessionsPath = ".memory/learn_sessions.jsonl"
+const defaultNativeGroundingPath = ".memory/native_text_grounding.jsonl"
 
 var learnSessionsPath = defaultLearnSessionsPath
+var nativeGroundingPath = defaultNativeGroundingPath
 
 type LearnSessionRecord struct {
 	SessionID      string            `json:"session_id"`
@@ -27,6 +29,16 @@ type LearnSessionRecord struct {
 	Summary        string            `json:"summary"`
 	FailureReason  string            `json:"failure_reason,omitempty"`
 	ConfigSnapshot map[string]string `json:"config,omitempty"`
+}
+
+type NativeGroundingRecord struct {
+	SessionID     string   `json:"session_id"`
+	Mode          string   `json:"mode"`
+	Status        string   `json:"status"`
+	QueryOrTarget string   `json:"query_or_target,omitempty"`
+	Summary       string   `json:"summary"`
+	Sources       []string `json:"sources,omitempty"`
+	CapturedAt    string   `json:"captured_at"`
 }
 
 func newLearnSession(mode, target string, sources []string, config map[string]string) LearnSessionRecord {
@@ -73,7 +85,11 @@ func appendLearnSessionRecord(rec LearnSessionRecord) error {
 	}
 	defer f.Close()
 	enc := json.NewEncoder(f)
-	return enc.Encode(rec)
+	if err := enc.Encode(rec); err != nil {
+		return err
+	}
+	_ = appendNativeGroundingRecord(rec)
+	return nil
 }
 
 func readLearnSessionRecords() ([]LearnSessionRecord, int, error) {
@@ -95,6 +111,62 @@ func readLearnSessionRecords() ([]LearnSessionRecord, int, error) {
 			continue
 		}
 		var rec LearnSessionRecord
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			corrupt++
+			continue
+		}
+		out = append(out, rec)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, 0, err
+	}
+	return out, corrupt, nil
+}
+
+func appendNativeGroundingRecord(rec LearnSessionRecord) error {
+	gr := NativeGroundingRecord{
+		SessionID:     strings.TrimSpace(rec.SessionID),
+		Mode:          strings.TrimSpace(rec.Mode),
+		Status:        strings.TrimSpace(rec.Status),
+		QueryOrTarget: strings.TrimSpace(rec.QueryOrTarget),
+		Summary:       strings.TrimSpace(rec.Summary),
+		Sources:       uniqueStrings(rec.Sources),
+		CapturedAt:    time.Now().UTC().Format(time.RFC3339),
+	}
+	if gr.Summary == "" {
+		gr.Summary = "No summary recorded."
+	}
+	if err := os.MkdirAll(filepath.Dir(nativeGroundingPath), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(nativeGroundingPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	return enc.Encode(gr)
+}
+
+func readNativeGroundingRecords() ([]NativeGroundingRecord, int, error) {
+	f, err := os.Open(nativeGroundingPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, 0, nil
+		}
+		return nil, 0, err
+	}
+	defer f.Close()
+
+	var out []NativeGroundingRecord
+	corrupt := 0
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var rec NativeGroundingRecord
 		if err := json.Unmarshal([]byte(line), &rec); err != nil {
 			corrupt++
 			continue

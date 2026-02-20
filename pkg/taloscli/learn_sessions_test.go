@@ -9,8 +9,13 @@ import (
 
 func TestLearnSessionAppendReadFilter(t *testing.T) {
 	orig := learnSessionsPath
+	origGrounding := nativeGroundingPath
 	learnSessionsPath = filepath.Join(t.TempDir(), "learn_sessions.jsonl")
-	t.Cleanup(func() { learnSessionsPath = orig })
+	nativeGroundingPath = filepath.Join(t.TempDir(), "native_text_grounding.jsonl")
+	t.Cleanup(func() {
+		learnSessionsPath = orig
+		nativeGroundingPath = origGrounding
+	})
 
 	r1 := newLearnSession("DIRECTORY", "./docs", []string{"./docs"}, nil)
 	r1.finish("SUCCESS", "ok", "", map[string]int64{"files_indexed": 10})
@@ -40,6 +45,16 @@ func TestLearnSessionAppendReadFilter(t *testing.T) {
 	filtered := filterLearnSessionRecords(records, "failed", nil, 5)
 	if len(filtered) != 1 || strings.ToUpper(filtered[0].Status) != "FAILED" {
 		t.Fatalf("unexpected failed filter result: %#v", filtered)
+	}
+	grounding, groundingCorrupt, err := readNativeGroundingRecords()
+	if err != nil {
+		t.Fatalf("read native grounding: %v", err)
+	}
+	if groundingCorrupt != 0 {
+		t.Fatalf("expected no corrupt grounding records, got %d", groundingCorrupt)
+	}
+	if len(grounding) != 2 {
+		t.Fatalf("expected 2 grounding records, got %d", len(grounding))
 	}
 	report := renderLearnedReport(records, 5, corrupt)
 	if !strings.Contains(report, "TALOS LEARNED REPORT") || !strings.Contains(report, "AGGREGATE METRICS") {

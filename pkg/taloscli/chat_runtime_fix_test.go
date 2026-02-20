@@ -1,6 +1,9 @@
 package taloscli
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -246,6 +249,34 @@ func TestComposeNativeTextGenResponseUsesContext(t *testing.T) {
 		if !strings.Contains(out, token) {
 			t.Fatalf("expected token %q in output: %s", token, out)
 		}
+	}
+}
+
+func TestCollectNativeMemoryContextUsesGroundingRecords(t *testing.T) {
+	orig := nativeGroundingPath
+	nativeGroundingPath = filepath.Join(t.TempDir(), "native_grounding.jsonl")
+	t.Cleanup(func() { nativeGroundingPath = orig })
+	recs := []NativeGroundingRecord{
+		{SessionID: "1", Summary: "Runtime telemetry update for sandbox", QueryOrTarget: "runtime telemetry", CapturedAt: "2026-01-01T00:00:00Z"},
+		{SessionID: "2", Summary: "Marketing notes only", QueryOrTarget: "branding", CapturedAt: "2026-01-02T00:00:00Z"},
+	}
+	var lines []string
+	for _, r := range recs {
+		b, err := json.Marshal(r)
+		if err != nil {
+			t.Fatalf("marshal record: %v", err)
+		}
+		lines = append(lines, string(b))
+	}
+	if err := os.WriteFile(nativeGroundingPath, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write grounding file: %v", err)
+	}
+	ctx := collectNativeMemoryContext("telemetry runtime", 2)
+	if len(ctx) == 0 {
+		t.Fatal("expected native context results")
+	}
+	if !strings.Contains(strings.ToLower(ctx[0]), "telemetry") {
+		t.Fatalf("expected telemetry-grounded result first, got %q", ctx[0])
 	}
 }
 

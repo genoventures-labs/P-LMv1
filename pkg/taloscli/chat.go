@@ -370,14 +370,14 @@ func nativeTextGenAnswer(query string) string {
 }
 
 func collectNativeMemoryContext(query string, limit int) []string {
-	records, _, err := readLearnSessionRecords()
+	records, _, err := readNativeGroundingRecords()
 	if err != nil || len(records) == 0 {
 		return nil
 	}
 	tokens := tokenizeNativeQuery(query)
-	rank := func(rec LearnSessionRecord) int {
+	rank := func(rec NativeGroundingRecord) int {
 		score := 0
-		blob := strings.ToLower(strings.TrimSpace(rec.QueryOrTarget + " " + rec.Summary))
+		blob := strings.ToLower(strings.TrimSpace(rec.QueryOrTarget + " " + rec.Summary + " " + strings.Join(rec.Sources, " ")))
 		for _, t := range tokens {
 			if strings.Contains(blob, t) {
 				score++
@@ -388,7 +388,7 @@ func collectNativeMemoryContext(query string, limit int) []string {
 	sort.SliceStable(records, func(i, j int) bool {
 		si, sj := rank(records[i]), rank(records[j])
 		if si == sj {
-			return records[i].StartedAt > records[j].StartedAt
+			return records[i].CapturedAt > records[j].CapturedAt
 		}
 		return si > sj
 	})
