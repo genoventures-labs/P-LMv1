@@ -353,13 +353,8 @@ All sources are chunked and indexed into persistent memory for future retrieval.
 				}
 			}
 			remoteOpts.OnEvent = func(ev rag.RemoteEvent) {
-				switch ev.Outcome {
-				case "indexed", "hf-indexed-record", "kaggle-indexed-record":
-					fmt.Printf("[%d fetched | %d indexed] %s: %s\n", ev.ItemsFetched, ev.ItemsIndexed, ev.Outcome, ev.Source)
-				case "safety-allowed", "safety-cache-hit", "safety-cache-miss":
-					fmt.Printf("[%d fetched | %d indexed] %s: %s (%s)\n", ev.ItemsFetched, ev.ItemsIndexed, ev.Outcome, ev.Source, ev.Detail)
-				case "safety-blocked", "safety-error", "preflight-failed", "skipped-domain", "invalid-url", "parse-error", "http-error", "http-status", "hf-http-error", "hf-http-status", "hf-parse-error", "index-error", "hf-index-error", "kaggle-http-error", "kaggle-http-status", "kaggle-parse-error", "kaggle-index-error", "kaggle-invalid-dataset", "kaggle-no-files", "skipped-extension", "skipped-unsupported":
-					fmt.Printf("[%d fetched | %d indexed] %s: %s (%s)\n", ev.ItemsFetched, ev.ItemsIndexed, ev.Outcome, ev.Source, ev.Detail)
+				if line, ok := formatRemoteLearnEventLine(ev, learnVerbose); ok {
+					fmt.Println(line)
 				}
 			}
 
@@ -425,16 +420,20 @@ All sources are chunked and indexed into persistent memory for future retrieval.
 					}
 					return
 				}
-				fmt.Printf("Indexing remote URLs: %d seed(s)\n", len(seedURLs))
-				if !learnCrawl {
-					fmt.Println("Crawl mode: disabled (single URL mode)")
+				if learnVerbose {
+					fmt.Printf("Indexing remote URLs: %d seed(s)\n", len(seedURLs))
+					if !learnCrawl {
+						fmt.Println("Crawl mode: disabled (single URL mode)")
+					} else {
+						fmt.Printf("Crawl mode: enabled (depth=%d, max-pages=%d, rate=%.2f req/s)\n", learnCrawlDepth, learnMaxPages, learnRateLimit)
+					}
+					if remoteOpts.URLSafetyEnabled {
+						fmt.Printf("URL safety: enabled (visibility=%s, timeout=%s, cache-ttl=%s, fail-open=%t)\n", remoteOpts.URLSafetyVisibility, remoteOpts.URLSafetyTimeout, remoteOpts.URLSafetyCacheTTL, remoteOpts.URLSafetyFailOpen)
+					} else {
+						fmt.Println("URL safety: disabled")
+					}
 				} else {
-					fmt.Printf("Crawl mode: enabled (depth=%d, max-pages=%d, rate=%.2f req/s)\n", learnCrawlDepth, learnMaxPages, learnRateLimit)
-				}
-				if remoteOpts.URLSafetyEnabled {
-					fmt.Printf("URL safety: enabled (visibility=%s, timeout=%s, cache-ttl=%s, fail-open=%t)\n", remoteOpts.URLSafetyVisibility, remoteOpts.URLSafetyTimeout, remoteOpts.URLSafetyCacheTTL, remoteOpts.URLSafetyFailOpen)
-				} else {
-					fmt.Println("URL safety: disabled")
+					fmt.Printf("Learning remote URLs: %d seed(s)\n", len(seedURLs))
 				}
 				urlStats, urlErr := rag.IndexURLs(mm, seedURLs, remoteOpts)
 				totalStats = mergeRemoteStats(totalStats, urlStats)
@@ -1085,6 +1084,31 @@ func renderRemoteLearnSummaryFriendly(sources []string, stats rag.RemoteIndexSta
 	errors := stats.PreflightFailures + stats.SafetyBlocked + stats.SafetyErrors + stats.ParseErrors + stats.HTTPErrors + stats.IndexErrors
 	b.WriteString(fmt.Sprintf("  errors: %d", errors))
 	return b.String()
+}
+
+func formatRemoteLearnEventLine(ev rag.RemoteEvent, verbose bool) (string, bool) {
+	if verbose {
+		switch ev.Outcome {
+		case "indexed", "hf-indexed-record", "kaggle-indexed-record":
+			return fmt.Sprintf("[%d fetched | %d indexed] %s: %s", ev.ItemsFetched, ev.ItemsIndexed, ev.Outcome, ev.Source), true
+		case "safety-allowed", "safety-cache-hit", "safety-cache-miss":
+			return fmt.Sprintf("[%d fetched | %d indexed] %s: %s (%s)", ev.ItemsFetched, ev.ItemsIndexed, ev.Outcome, ev.Source, ev.Detail), true
+		case "safety-blocked", "safety-error", "preflight-failed", "skipped-domain", "invalid-url", "parse-error", "http-error", "http-status", "hf-http-error", "hf-http-status", "hf-parse-error", "index-error", "hf-index-error", "kaggle-http-error", "kaggle-http-status", "kaggle-parse-error", "kaggle-index-error", "kaggle-invalid-dataset", "kaggle-no-files", "skipped-extension", "skipped-unsupported":
+			return fmt.Sprintf("[%d fetched | %d indexed] %s: %s (%s)", ev.ItemsFetched, ev.ItemsIndexed, ev.Outcome, ev.Source, ev.Detail), true
+		}
+		return "", false
+	}
+	switch ev.Outcome {
+	case "indexed":
+		return fmt.Sprintf("Indexed page: %s (%d fetched | %d indexed)", ev.Source, ev.ItemsFetched, ev.ItemsIndexed), true
+	case "safety-blocked", "safety-error", "preflight-failed", "parse-error", "http-error", "http-status", "index-error":
+		if strings.TrimSpace(ev.Detail) != "" {
+			return fmt.Sprintf("Skipped page: %s (%s: %s)", ev.Source, ev.Outcome, ev.Detail), true
+		}
+		return fmt.Sprintf("Skipped page: %s (%s)", ev.Source, ev.Outcome), true
+	default:
+		return "", false
+	}
 }
 
 func appendSummaryMetricsSection(b *strings.Builder, m memory.SourceSummaryMetrics) {

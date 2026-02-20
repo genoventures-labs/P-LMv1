@@ -163,6 +163,31 @@ func TestURLAllowedByExtensionStrict(t *testing.T) {
 	}
 }
 
+func TestURLAllowedForFetchDefaultHTMLOnly(t *testing.T) {
+	if !urlAllowedForFetch("https://example.com/path", nil) {
+		t.Fatal("expected extensionless URL allowed for HTML-page crawling")
+	}
+	if !urlAllowedForFetch("https://example.com/page.html", nil) {
+		t.Fatal("expected .html URL allowed")
+	}
+	if urlAllowedForFetch("https://example.com/_next/static/app.css", nil) {
+		t.Fatal("expected .css URL blocked in default HTML-only mode")
+	}
+	if urlAllowedForFetch("https://example.com/app.js", nil) {
+		t.Fatal("expected .js URL blocked in default HTML-only mode")
+	}
+}
+
+func TestURLAllowedForFetchWithExplicitExtensions(t *testing.T) {
+	allowed := map[string]bool{".md": true}
+	if !urlAllowedForFetch("https://example.com/readme.md", allowed) {
+		t.Fatal("expected allowlisted extension to pass")
+	}
+	if urlAllowedForFetch("https://example.com/index.html", allowed) {
+		t.Fatal("expected non-allowlisted extension blocked when strict extensions are set")
+	}
+}
+
 func TestParseKaggleRowsCSV(t *testing.T) {
 	body := []byte("name,score\nalice,10\nbob,12\n")
 	rows, err := parseKaggleRows("train.csv", body, 10)

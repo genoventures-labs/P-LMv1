@@ -69,9 +69,6 @@ var chatCmd = &cobra.Command{
 			fmt.Println("Proceeding without intent correction middleware.")
 		}
 		liveTelemetry = state.NewCognitiveTelemetry(contextWindowFromEnv())
-		reindexer := memory.NewReindexer(mm, sm)
-		reindexer.Start()
-		defer reindexer.Stop()
 
 		// Setup Ollama API client
 		client, err := api.ClientFromEnvironment()
@@ -127,6 +124,10 @@ var chatCmd = &cobra.Command{
 		}
 
 		// No arguments, start REPL
+		reindexer := memory.NewReindexer(mm, sm)
+		reindexer.Start()
+		defer reindexer.Stop()
+
 		selfAuditor := cognition.NewSelfModelAuditor()
 		selfAuditor.Start()
 		defer selfAuditor.Stop()
@@ -261,11 +262,34 @@ func applyIntentCorrection(raw string, sm *state.Manager, mm *memory.MemoryManag
 }
 
 func applyIntentCorrectionWithTimeout(raw string, sm *state.Manager, mm *memory.MemoryManager) (string, string) {
+	if shouldBypassIntentCorrection(raw) {
+		return strings.TrimSpace(raw), ""
+	}
 	env, proceed, clarification := preprocessUserIntent(raw, sm, mm, "chat")
 	if !proceed {
 		return "", clarification
 	}
 	return strings.TrimSpace(env.Normalized), ""
+}
+
+func shouldBypassIntentCorrection(raw string) bool {
+	r := strings.TrimSpace(raw)
+	if r == "" {
+		return true
+	}
+	if len(r) > 96 || strings.Contains(r, "\n") {
+		return false
+	}
+	lower := strings.ToLower(r)
+	for _, marker := range []string{
+		" and ", " then ", " because ", " compare ", " analyze ", " research ",
+		"multi-step", "step by step", "tradeoff", "architecture",
+	} {
+		if strings.Contains(lower, marker) {
+			return false
+		}
+	}
+	return true
 }
 
 func isTrivialPrompt(raw string) bool {
@@ -464,6 +488,13 @@ Available tools:
 - admin_rotate_client (internal): Rotate credentials for client. Args: {"client_id":"required","activate":true}
 - admin_delete_client (internal): Revoke client credentials. Args: {"client_id":"required"}`
 
+const minimalSystemPrompt = `You are TALOS, a concise production assistant.
+
+Rules:
+- Answer directly and briefly.
+- Do not emit tool-call JSON unless the user explicitly asks to run a tool/action.
+- Keep internal reasoning private and never expose secrets.`
+
 const (
 	maxToolResultChars  = 3500
 	maxToolCallsPerTurn = 4
@@ -491,6 +522,7 @@ var (
 	totTimeout           = 60 * time.Second
 	mctsTimeout          = 45 * time.Second
 	mctsCallTimeout      = 15 * time.Second
+	chatModelKeepAlive   = durationFromEnv("PLM_CHAT_MODEL_KEEPALIVE", 30*time.Minute)
 	chatWarmupTimeout    = durationFromEnv("PLM_CHAT_WARMUP_TIMEOUT", 3*time.Second)
 	chatWarmupOnce       sync.Once
 	subAgentCredMu       sync.Mutex
@@ -617,12 +649,13 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 	}
 
 	tc = maybeProvisionSubAgentClient(tc, input)
-	cognitionPlan := planCognitionBudget(input, sm, chatCognitionMode)
-	modulation := cognition.BuildReasoningModulation(sm, input, cognitionPlan.Mode)
+	requestQuery := primaryUserRequest(input)
+	cognitionPlan := planCognitionBudget(requestQuery, sm, chatCognitionMode)
+	modulation := cognition.BuildReasoningModulation(sm, requestQuery, cognitionPlan.Mode)
 	cognitionPlan = applyReasoningModulationBudget(cognitionPlan, modulation)
-	styleProfile := cognition.ResolveStyleProfile(sm, mm, input, cognitionPlan.Mode)
+	styleProfile := cognition.ResolveStyleProfile(sm, mm, requestQuery, cognitionPlan.Mode)
 	var chainedSkills []skills.SkillRecord
-	if drafted, chain, note := maybeDraftJITSuperSkill(selectedSkill, input, cognitionPlan.ComplexityScore); drafted != nil {
+	if drafted, chain, note := maybeDraftJITSuperSkill(selectedSkill, requestQuery, cognitionPlan.ComplexityScore); drafted != nil {
 		selectedSkill = drafted
 		chainedSkills = chain
 		if strings.TrimSpace(note) != "" {
@@ -656,12 +689,12 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 
 	// 0. Select model based on complexity
 	modelName := r.ResolveModel(router.ResolveRequest{
-		Query:  input,
+		Query:  requestQuery,
 		Stage:  "chat",
 		Models: r.Models,
 	})
 	modelCandidates := buildModelCandidates(r.Models, modelName)
-	if isTrivialPrompt(input) {
+	if isTrivialPrompt(requestQuery) || cognitionPlan.Mode == "minimal" {
 		modelCandidates = prioritizeLowLatencyModels(modelCandidates)
 	}
 	if cognitionPlan.MaxLinearModels > 0 {
@@ -681,9 +714,9 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 		})
 	}
 
-	if cognitionPlan.UseThoughtGraph && shouldUseThoughtGraph(input) {
+	if cognitionPlan.UseThoughtGraph && shouldUseThoughtGraph(requestQuery) {
 		fmt.Println("DEBUG: Complex query detected. Using ThoughtGraph orchestration.")
-		if err := executeThoughtGraphTurn(client, mm, tc, r, modelCandidates, input, history, sm, modulation, styleProfile); err == nil {
+		if err := executeThoughtGraphTurn(client, mm, tc, r, modelCandidates, requestQuery, history, sm, modulation, styleProfile); err == nil {
 			return nil
 		} else {
 			fmt.Printf("Warning: ThoughtGraph execution failed, falling back to linear flow: %v\n", err)
@@ -691,7 +724,7 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 	}
 
 	// 1. Retrieve context from memory (memory-anchored reasoning).
-	historyContext, knowledgeContext := resolveAnchoredTurnContext(mm, input, cognitionPlan.HistoryTopK, cognitionPlan.KnowledgeTopK)
+	historyContext, knowledgeContext := resolveAnchoredTurnContext(mm, requestQuery, cognitionPlan.HistoryTopK, cognitionPlan.KnowledgeTopK)
 
 	// 2. Build the context-enriched message
 	var contextParts []string
@@ -729,8 +762,8 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 
 	// 3. Prepare message list
 	var requestMessages []api.Message
-	// Always include system prompt at the beginning
-	requestMessages = append(requestMessages, api.Message{Role: "system", Content: systemPrompt})
+	// Always include system prompt at the beginning.
+	requestMessages = append(requestMessages, api.Message{Role: "system", Content: systemPromptForTurn(cognitionPlan, 0)})
 
 	if history != nil {
 		// Add existing history to request
@@ -755,6 +788,12 @@ func resolveAnchoredTurnContext(mm *memory.MemoryManager, query string, historyK
 	if mm == nil {
 		return nil, nil
 	}
+	const (
+		maxHistoryContextChars   = 1200
+		maxKnowledgeContextChars = 1600
+		maxHistoryTotalChars     = 1600
+		maxKnowledgeTotalChars   = 2400
+	)
 	ctx, err := mm.ResolveAnchoredContext(query, historyK, knowledgeK)
 	if err != nil {
 		historyContext, hErr := mm.RetrieveDynamicContext(query, historyK)
@@ -768,12 +807,66 @@ func resolveAnchoredTurnContext(mm *memory.MemoryManager, query string, historyK
 		if strings.TrimSpace(err.Error()) != "" {
 			fmt.Printf("Warning: Memory-anchored resolver fallback triggered: %v\n", err)
 		}
-		return historyContext, knowledgeContext
+		return truncateContextEntries(historyContext, maxHistoryContextChars, maxHistoryTotalChars), truncateContextEntries(knowledgeContext, maxKnowledgeContextChars, maxKnowledgeTotalChars)
 	}
 	if ctx.Policy.StatusReport {
 		fmt.Print(ctx.AnchoredStatusReport())
 	}
-	return ctx.History, ctx.Knowledge
+	return truncateContextEntries(ctx.History, maxHistoryContextChars, maxHistoryTotalChars), truncateContextEntries(ctx.Knowledge, maxKnowledgeContextChars, maxKnowledgeTotalChars)
+}
+
+func truncateContextEntries(entries []string, maxPerEntry, maxTotal int) []string {
+	if len(entries) == 0 {
+		return nil
+	}
+	if maxPerEntry <= 0 {
+		maxPerEntry = 1200
+	}
+	if maxTotal <= 0 {
+		maxTotal = maxPerEntry
+	}
+	out := make([]string, 0, len(entries))
+	used := 0
+	for _, e := range entries {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		r := []rune(e)
+		if len(r) > maxPerEntry {
+			e = strings.TrimSpace(string(r[:maxPerEntry])) + " ..."
+		}
+		if used+len(e) > maxTotal {
+			break
+		}
+		out = append(out, e)
+		used += len(e)
+	}
+	return out
+}
+
+func systemPromptForTurn(budget cognitionBudget, depth int) string {
+	if depth == 0 && strings.EqualFold(strings.TrimSpace(budget.Mode), "minimal") {
+		return minimalSystemPrompt
+	}
+	return systemPrompt
+}
+
+func primaryUserRequest(input string) string {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		return trimmed
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, "request:") {
+		if idx := strings.LastIndex(lower, "request:"); idx >= 0 && idx+len("request:") < len(trimmed) {
+			req := strings.TrimSpace(trimmed[idx+len("request:"):])
+			if req != "" {
+				return req
+			}
+		}
+	}
+	return trimmed
 }
 
 func maybeHandleUserSkillCreate(input string, tc *tools.GLMToolClient) (bool, string) {
@@ -3203,6 +3296,9 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 	req := &api.ChatRequest{
 		Model:    modelName,
 		Messages: messages,
+		KeepAlive: &api.Duration{
+			Duration: chatModelKeepAlive,
+		},
 	}
 	if sm != nil {
 		snapshot := sm.GetSnapshot()
@@ -3222,6 +3318,14 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 				"top_p":       entropy.TopP,
 			}
 			fmt.Printf("DEBUG: Entropy mode=%s temperature=%.2f top_p=%.2f\n", entropy.Mode, entropy.Temperature, entropy.TopP)
+		}
+	}
+	if depth == 0 && strings.EqualFold(strings.TrimSpace(budget.Mode), "minimal") {
+		if req.Options == nil {
+			req.Options = map[string]any{}
+		}
+		if _, exists := req.Options["num_predict"]; !exists {
+			req.Options["num_predict"] = 192
 		}
 	}
 
@@ -3271,7 +3375,7 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 	defer stopWaitLoop()
 
 	err := client.Chat(ctx, req, func(resp api.ChatResponse) error {
-		if !sawFirstToken.Load() {
+		if !sawFirstToken.Load() && hasVisibleToken(resp.Message.Content) {
 			sawFirstToken.Store(true)
 			firstTokenTimer.Stop()
 		}
@@ -3558,6 +3662,10 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 		*history = append(*history, api.Message{Role: "assistant", Content: fullResponse})
 	}
 	return nil
+}
+
+func hasVisibleToken(content string) bool {
+	return strings.TrimSpace(content) != ""
 }
 
 func styleOutputForCurrentState(text string, sm *state.Manager) []output.TonalSegment {

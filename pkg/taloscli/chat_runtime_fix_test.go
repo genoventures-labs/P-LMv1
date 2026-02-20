@@ -1,6 +1,9 @@
 package taloscli
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestIsTrivialPrompt(t *testing.T) {
 	if !isTrivialPrompt("Online?") {
@@ -52,5 +55,76 @@ func TestParseToolCallsDocSearchTool(t *testing.T) {
 	}
 	if calls[0].Tool != "doc_search" {
 		t.Fatalf("expected doc_search, got %s", calls[0].Tool)
+	}
+}
+
+func TestTruncateContextEntriesTrimsPerEntryAndTotal(t *testing.T) {
+	in := []string{
+		"  " + strings.Repeat("a", 20) + "  ",
+		strings.Repeat("b", 20),
+	}
+	out := truncateContextEntries(in, 10, 40)
+	if len(out) != 2 {
+		t.Fatalf("expected 2 truncated entries, got %d (%v)", len(out), out)
+	}
+	if out[0] != strings.Repeat("a", 10)+" ..." {
+		t.Fatalf("unexpected first entry: %q", out[0])
+	}
+	if out[1] != strings.Repeat("b", 10)+" ..." {
+		t.Fatalf("unexpected second entry: %q", out[1])
+	}
+}
+
+func TestTruncateContextEntriesRespectsTotalCap(t *testing.T) {
+	in := []string{
+		strings.Repeat("x", 15),
+		strings.Repeat("y", 15),
+	}
+	out := truncateContextEntries(in, 15, 15)
+	if len(out) != 1 {
+		t.Fatalf("expected total cap to keep one entry, got %d", len(out))
+	}
+}
+
+func TestSystemPromptForTurnUsesMinimalForTopLevelMinimalMode(t *testing.T) {
+	got := systemPromptForTurn(cognitionBudget{Mode: "minimal"}, 0)
+	if got != minimalSystemPrompt {
+		t.Fatal("expected minimal prompt for top-level minimal cognition mode")
+	}
+}
+
+func TestSystemPromptForTurnUsesFullForRecursiveTurns(t *testing.T) {
+	got := systemPromptForTurn(cognitionBudget{Mode: "minimal"}, 1)
+	if got != systemPrompt {
+		t.Fatal("expected full prompt for recursive turns")
+	}
+}
+
+func TestPrimaryUserRequestExtractsGoalLockRequest(t *testing.T) {
+	in := "Keep focus on active objective [abc]. Request: Summarize last learning run"
+	got := primaryUserRequest(in)
+	if got != "Summarize last learning run" {
+		t.Fatalf("unexpected extracted request: %q", got)
+	}
+}
+
+func TestShouldBypassIntentCorrectionForShortOperationalPrompt(t *testing.T) {
+	if !shouldBypassIntentCorrection("Summarize last learning run") {
+		t.Fatal("expected short operational prompt to bypass intent correction")
+	}
+}
+
+func TestShouldBypassIntentCorrectionFalseForComplexPrompt(t *testing.T) {
+	if shouldBypassIntentCorrection("Research and compare vector databases with tradeoff analysis") {
+		t.Fatal("expected complex prompt to keep intent correction enabled")
+	}
+}
+
+func TestHasVisibleToken(t *testing.T) {
+	if hasVisibleToken("   ") {
+		t.Fatal("expected whitespace-only content to not count as visible token")
+	}
+	if !hasVisibleToken("hello") {
+		t.Fatal("expected non-empty content to count as visible token")
 	}
 }

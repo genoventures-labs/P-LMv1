@@ -162,7 +162,7 @@ func IndexURLs(mm *memory.MemoryManager, seedURLs []string, opts RemoteIndexOpti
 			emitRemoteEvent(opts, RemoteEvent{Source: raw, Outcome: "invalid-url", Detail: err.Error(), ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
 			continue
 		}
-		if !urlAllowedByExtension(n, opts.URLAllowedExts) {
+		if !urlAllowedForFetch(n, opts.URLAllowedExts) {
 			stats.SkippedUnsupported++
 			emitRemoteEvent(opts, RemoteEvent{Source: n, Outcome: "skipped-extension", Detail: "URL extension not in allowlist", ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
 			continue
@@ -185,6 +185,11 @@ func IndexURLs(mm *memory.MemoryManager, seedURLs []string, opts RemoteIndexOpti
 		}
 		item := queue[0]
 		queue = queue[1:]
+		if !urlAllowedForFetch(item.URL, opts.URLAllowedExts) {
+			stats.SkippedUnsupported++
+			emitRemoteEvent(opts, RemoteEvent{Source: item.URL, Outcome: "skipped-extension", Detail: "URL extension not in allowlist", ItemsFetched: stats.ItemsFetched, ItemsIndexed: stats.ItemsIndexed})
+			continue
+		}
 		host := hostFromURL(item.URL)
 		if !isDomainAllowed(host, seedHosts, opts.AllowedDomains, opts.Crawl) {
 			stats.SkippedDomain++
@@ -314,7 +319,7 @@ func IndexURLs(mm *memory.MemoryManager, seedURLs []string, opts RemoteIndexOpti
 				if !isDomainAllowed(linkHost, seedHosts, opts.AllowedDomains, opts.Crawl) {
 					continue
 				}
-				if !urlAllowedByExtension(norm, opts.URLAllowedExts) {
+				if !urlAllowedForFetch(norm, opts.URLAllowedExts) {
 					continue
 				}
 				if seen[norm] {
@@ -733,6 +738,26 @@ func urlAllowedByExtension(rawURL string, allowed map[string]bool) bool {
 		return false
 	}
 	return allowed[ext]
+}
+
+func urlAllowedForFetch(rawURL string, allowed map[string]bool) bool {
+	if len(allowed) > 0 {
+		return urlAllowedByExtension(rawURL, allowed)
+	}
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	ext := strings.ToLower(strings.TrimSpace(filepath.Ext(u.Path)))
+	if ext == "" {
+		return true
+	}
+	switch ext {
+	case ".html", ".htm", ".php", ".asp", ".aspx", ".jsp", ".jspx", ".cfm", ".cgi", ".shtml", ".xhtml":
+		return true
+	default:
+		return false
+	}
 }
 
 func htmlToText(s string) string {

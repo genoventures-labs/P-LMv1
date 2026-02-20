@@ -67,3 +67,32 @@ func TestLearnCommandHasVerboseFlag(t *testing.T) {
 		t.Fatal("expected --verbose flag to be registered on learn command")
 	}
 }
+
+func TestFormatRemoteLearnEventLineFriendlySuppressesSafetyNoise(t *testing.T) {
+	line, ok := formatRemoteLearnEventLine(rag.RemoteEvent{
+		Outcome:      "safety-cache-hit",
+		Source:       "https://example.com",
+		ItemsFetched: 1,
+		ItemsIndexed: 1,
+	}, false)
+	if ok || line != "" {
+		t.Fatalf("expected safety cache event suppressed in friendly mode, got ok=%t line=%q", ok, line)
+	}
+}
+
+func TestFormatRemoteLearnEventLineFriendlyKeepsIndexedPage(t *testing.T) {
+	line, ok := formatRemoteLearnEventLine(rag.RemoteEvent{
+		Outcome:      "indexed",
+		Source:       "https://example.com/news",
+		ItemsFetched: 3,
+		ItemsIndexed: 2,
+	}, false)
+	if !ok {
+		t.Fatal("expected indexed event to render in friendly mode")
+	}
+	for _, token := range []string{"Indexed page:", "https://example.com/news", "3 fetched", "2 indexed"} {
+		if !strings.Contains(line, token) {
+			t.Fatalf("expected token %q in line: %s", token, line)
+		}
+	}
+}
