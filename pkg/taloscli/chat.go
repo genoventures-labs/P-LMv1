@@ -253,6 +253,7 @@ var chatTimeoutProfile string
 var chatWarmup bool
 var chatCognitionMode string
 var chatDomain string
+var chatNamespace string
 
 func debugPrintf(format string, args ...any) {
 	if !chatVerbose {
@@ -270,6 +271,9 @@ func debugPrintln(args ...any) {
 
 func resolveChatDomain() string {
 	if v := strings.TrimSpace(chatDomain); v != "" {
+		return strings.ToLower(v)
+	}
+	if v := strings.TrimSpace(chatNamespace); v != "" {
 		return strings.ToLower(v)
 	}
 	return strings.ToLower(strings.TrimSpace(os.Getenv("PLM_CHAT_DOMAIN")))
@@ -7001,5 +7005,6 @@ func init() {
 	chatCmd.Flags().BoolVar(&chatWarmup, "warmup", boolFromEnv("PLM_CHAT_WARMUP", true), "Run one-time Ollama warmup ping before first chat inference")
 	chatCmd.Flags().StringVar(&chatCognitionMode, "cognition", "", "Cognition orchestration mode: auto|minimal|balanced|deep (default from PLM_COGNITION_MODE or auto)")
 	chatCmd.Flags().StringVar(&chatDomain, "domain", "", "Pin chat to a memory domain namespace (falls back to PLM_CHAT_DOMAIN)")
+	chatCmd.Flags().StringVar(&chatNamespace, "namespace", "", "Alias of --domain for chat namespace pinning")
 	rootCmd.AddCommand(chatCmd)
 }

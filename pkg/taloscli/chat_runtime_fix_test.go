@@ -159,13 +159,29 @@ func TestChatCommandHasDomainFlag(t *testing.T) {
 	}
 }
 
+func TestChatCommandHasNamespaceFlag(t *testing.T) {
+	f := chatCmd.Flags().Lookup("namespace")
+	if f == nil {
+		t.Fatal("expected --namespace flag on chat command")
+	}
+}
+
 func TestResolveChatDomainPrefersFlagThenEnv(t *testing.T) {
 	prev := chatDomain
-	defer func() { chatDomain = prev }()
+	prevNs := chatNamespace
+	defer func() {
+		chatDomain = prev
+		chatNamespace = prevNs
+	}()
 	t.Setenv("PLM_CHAT_DOMAIN", "ops")
 	chatDomain = ""
+	chatNamespace = ""
 	if got := resolveChatDomain(); got != "ops" {
 		t.Fatalf("expected env fallback domain ops, got %q", got)
+	}
+	chatNamespace = "runtime-ns"
+	if got := resolveChatDomain(); got != "runtime-ns" {
+		t.Fatalf("expected namespace alias runtime-ns, got %q", got)
 	}
 	chatDomain = "talos-runtime"
 	if got := resolveChatDomain(); got != "talos-runtime" {
