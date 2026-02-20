@@ -41,7 +41,7 @@ var chatCmd = &cobra.Command{
 	Long: `This command starts an interactive chat session if no prompt is provided. If a prompt is provided as an argument, it sends it to the LLM, prints the response, and exits.
 
 Use --domain <namespace> (or PLM_CHAT_DOMAIN) to pin retrieval to a work domain namespace for strict zero-trust context isolation.
-Use --text-gen talos-native to run an experimental TALOS-owned text generator path (no Ollama calls in that mode).`,
+Use --text-gen (no value) to run an experimental TALOS-owned text generator path (no Ollama calls in that mode).`,
 	Run: func(cmd *cobra.Command, args []string) {
 		textGenMode, err := resolveChatTextGenMode(chatTextGen)
 		if err != nil {
@@ -7171,6 +7171,9 @@ func init() {
 	chatCmd.Flags().StringVar(&chatCognitionMode, "cognition", "", "Cognition orchestration mode: auto|minimal|balanced|deep (default from PLM_COGNITION_MODE or auto)")
 	chatCmd.Flags().StringVar(&chatDomain, "domain", "", "Pin chat to a memory domain namespace (falls back to PLM_CHAT_DOMAIN)")
 	chatCmd.Flags().StringVar(&chatNamespace, "namespace", "", "Alias of --domain for chat namespace pinning")
-	chatCmd.Flags().StringVar(&chatTextGen, "text-gen", "", "Text generation runtime: ollama|talos-native (default from PLM_CHAT_TEXT_GEN or ollama)")
+	chatCmd.Flags().StringVar(&chatTextGen, "text-gen", "", "Text generation runtime: ollama|talos-native (use --text-gen with no value to select talos-native)")
+	if f := chatCmd.Flags().Lookup("text-gen"); f != nil {
+		f.NoOptDefVal = chatTextGenModeTalosNative
+	}
 	rootCmd.AddCommand(chatCmd)
 }

@@ -171,6 +171,9 @@ func TestChatCommandHasTextGenFlag(t *testing.T) {
 	if f == nil {
 		t.Fatal("expected --text-gen flag on chat command")
 	}
+	if f.NoOptDefVal != chatTextGenModeTalosNative {
+		t.Fatalf("expected --text-gen no-opt default %q, got %q", chatTextGenModeTalosNative, f.NoOptDefVal)
+	}
 }
 
 func TestResolveChatDomainPrefersFlagThenEnv(t *testing.T) {

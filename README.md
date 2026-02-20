@@ -83,7 +83,7 @@ PLM_CHAT_DOMAIN=talos-runtime talos chat "Summarize latest runtime learnings"
 Run experimental TALOS-native text generation (no Ollama calls in that mode):
 
 ```bash
-talos chat --text-gen talos-native "Summarize recent learn sessions"
+talos chat "Summarize recent learn sessions" --text-gen
 ```
 
 Recommended namespace workflow:

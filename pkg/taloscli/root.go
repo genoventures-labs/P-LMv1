@@ -69,7 +69,7 @@ It leverages the JIT model router to ensure optimal models are available.
 Use chat domain pinning (--domain / PLM_CHAT_DOMAIN) plus learn namespaces (--namespace) to isolate work domains under zero-trust retrieval.`,
 	Example: `  talos chat "Summarize latest telemetry"
    talos chat --domain talos-runtime "Summarize latest telemetry"
-   talos chat --text-gen talos-native "Summarize recent learn sessions"
+   talos chat "Summarize recent learn sessions" --text-gen
    talos chat --cognition minimal --timeout-profile quick "Online?"
   talos --skill report2markdown chat "Convert this into markdown release notes"
   talos research run "What changed in X this week?"
