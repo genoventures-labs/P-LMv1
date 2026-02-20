@@ -100,6 +100,15 @@ talos chat --domain talos-runtime "What changed in our runtime architecture?"
 # when --domain/--namespace and PLM_CHAT_DOMAIN are not provided.
 ```
 
+Global workspace switch (applies to the full command invocation):
+
+```bash
+talos --namespace talos-runtime research run "What changed in runtime policy?"
+talos --namespace talos-runtime learn --dir ./docs/runtime
+talos namespace show
+talos namespace clear
+```
+
 Learn an entire directory (all supported default document types):
 
 ```bash

@@ -305,6 +305,9 @@ func explicitChatDomain() string {
 }
 
 func resolveChatDomain(sm *state.Manager) string {
+	if v := strings.ToLower(strings.TrimSpace(requestedNamespace)); v != "" {
+		return v
+	}
 	if v := explicitChatDomain(); v != "" {
 		return v
 	}

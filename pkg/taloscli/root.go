@@ -5,10 +5,12 @@ import (
 	"os"
 	"strings"
 
+	"github.com/Thynaptic/P-LMv1/pkg/state"
 	"github.com/spf13/cobra"
 )
 
 var requestedSkill string
+var requestedNamespace string
 
 const talosHelpTemplate = `TALOS CLI
 
@@ -69,6 +71,7 @@ It leverages the JIT model router to ensure optimal models are available.
 Use chat domain pinning (--domain / --namespace / PLM_CHAT_DOMAIN) plus learn namespaces (--namespace) to isolate work domains under zero-trust retrieval.
 Explicit namespace selections are persisted and reused across later runs when not overridden.`,
 	Example: `  talos chat "Summarize latest telemetry"
+    talos --namespace talos-runtime research run "What changed in X this week?"
     talos chat --domain talos-runtime "Summarize latest telemetry"
     talos chat --namespace talos-runtime "Summarize latest telemetry"
     talos chat "Summarize recent learn sessions" --text-gen
@@ -107,8 +110,10 @@ Explicit namespace selections are persisted and reused across later runs when no
    talos learn "Store this project note"
   talos learned --last 5
   talos skills create --name report2markdown --description "Converts research reports to markdown files"
-  talos skills preflight --name report2markdown --description "Converts research reports to markdown files"
-  talos tools admin list
+   talos skills preflight --name report2markdown --description "Converts research reports to markdown files"
+   talos namespace show
+   talos namespace clear
+   talos tools admin list
   talos skills list
   talos release-check`,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -127,6 +132,17 @@ Explicit namespace selections are persisted and reused across later runs when no
 		path := strings.ToLower(strings.TrimSpace(cmd.CommandPath()))
 		if strings.Contains(path, " update") || strings.HasSuffix(path, " version") || strings.HasSuffix(path, " release-check") || strings.HasSuffix(path, " next") || strings.HasSuffix(path, " /next") {
 			return
+		}
+		if ns := strings.ToLower(strings.TrimSpace(requestedNamespace)); ns != "" {
+			if sm, err := state.NewManager(); err == nil {
+				sm.SetActiveNamespace(ns)
+				if err := sm.Save(); err != nil {
+					fmt.Fprintf(cmd.OutOrStdout(), "Warning: failed to persist namespace: %v\n", err)
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "NAMESPACE ACTIVE: %s\n", ns)
+			} else {
+				fmt.Fprintf(cmd.OutOrStdout(), "Warning: failed to initialize state manager: %v\n", err)
+			}
 		}
 		maybeAutoUpdate()
 	},
@@ -151,5 +167,6 @@ func init() {
 		defaultHelpFunc(cmd, args)
 	})
 	rootCmd.PersistentFlags().StringVar(&requestedSkill, "skill", "", "Use a specific enabled TALOS skill by ID, name, or path fragment")
+	rootCmd.PersistentFlags().StringVar(&requestedNamespace, "namespace", "", "Set and persist active workspace namespace for all commands in this run")
 	rootCmd.AddCommand(nextCmd)
 }

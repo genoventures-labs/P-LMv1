@@ -135,6 +135,7 @@ var capabilityDocs = []capabilityDoc{
 		Summary: "Primary conversational interface for interactive or one-shot prompts.",
 		Usage: []string{
 			"talos chat",
+			"talos --namespace talos-runtime chat <prompt>",
 			"talos chat <prompt>",
 			"talos --skill <skill_id|name> chat <prompt>",
 			"talos chat --domain talos-runtime <prompt>",
@@ -149,6 +150,7 @@ var capabilityDocs = []capabilityDoc{
 			"Sends a single prompt and exits when prompt args are supplied.",
 			"Uses routing, memory, and tool orchestration during response generation.",
 			"Supports explicit domain pinning via --domain (or --namespace / PLM_CHAT_DOMAIN) to scope retrieval to one work domain namespace.",
+			"Root-level --namespace takes precedence for the command run and enforces workspace scope across command flows.",
 			"Explicit --domain/--namespace selections persist as the active namespace for later runs when no override is provided.",
 			"Supports explicit skill selection with global --skill flag.",
 			"Supports experimental TALOS-native text generation via --text-gen (no value required; no Ollama calls in that mode).",
@@ -171,6 +173,7 @@ var capabilityDocs = []capabilityDoc{
 		Summary: "Ingests knowledge into TALOS memory from local sources, APIs, or live connectors.",
 		Usage: []string{
 			"talos learn <text>",
+			"talos --namespace talos-runtime learn --dir ./docs",
 			"talos learn --profile <name>",
 			"talos learn --dry-run --profile <name>",
 			"talos learn --verbose --dir <path>",
@@ -203,6 +206,7 @@ var capabilityDocs = []capabilityDoc{
 			"Supports reusable learn profiles via --profile with explicit flag overrides.",
 			"Uses compact friendly output by default; --verbose prints the detailed technical summary format.",
 			"Supports namespace tagging via --namespace so ingested knowledge can be isolated per work domain.",
+			"Root-level --namespace overrides command-level namespace and applies one workspace scope to the full command run.",
 			"Persists supplied --namespace as the active runtime namespace for subsequent chat/research retrieval.",
 			"Can auto-generate speech self-training artifacts with --self-train-speech (no output path required).",
 			"Can generate deterministic synthetic text-generation JSONL artifacts via --synthetic-text-out without indexing.",
@@ -297,6 +301,8 @@ var capabilityDocs = []capabilityDoc{
 		Summary: "Explains TALOS memory retrieval strategy and hybrid vector/BM25 tuning.",
 		Usage: []string{
 			"talos explain memory",
+			"talos namespace show",
+			"talos namespace clear",
 			"talos chat --domain talos-runtime \"...\"",
 			"talos learn --namespace talos-runtime --dir ./docs",
 			"talos research belief-audit \"STRATA architecture\" --since 2025-01-01",

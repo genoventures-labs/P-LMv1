@@ -157,19 +157,18 @@ All sources are chunked and indexed into persistent memory for future retrieval.
 			return
 		}
 		sm, _ := state.NewManager()
+		effectiveNamespace := resolveRuntimeNamespace(sm, learnNamespace)
 		explicitNamespace := strings.ToLower(strings.TrimSpace(learnNamespace))
-		if explicitNamespace != "" {
-			learnNamespace = explicitNamespace
+		if explicitNamespace != "" || strings.ToLower(strings.TrimSpace(requestedNamespace)) != "" {
+			learnNamespace = effectiveNamespace
 			if sm != nil {
 				sm.SetActiveNamespace(learnNamespace)
 				if err := sm.Save(); err != nil {
 					fmt.Printf("Warning: Failed to persist active namespace: %v\n", err)
 				}
 			}
-		} else if sm != nil {
-			if persisted := strings.ToLower(strings.TrimSpace(sm.ActiveNamespace())); persisted != "" {
-				learnNamespace = persisted
-			}
+		} else {
+			learnNamespace = effectiveNamespace
 		}
 		if learnDryRun {
 			plan, err := renderLearnDryRunPlan(args)
@@ -870,6 +869,21 @@ func annotateLearnSessionWithProfile(session *LearnSessionRecord, profileName st
 	if strings.TrimSpace(learnNamespace) != "" {
 		session.ConfigSnapshot["namespace"] = strings.TrimSpace(learnNamespace)
 	}
+}
+
+func resolveRuntimeNamespace(sm *state.Manager, explicit string) string {
+	if v := strings.ToLower(strings.TrimSpace(requestedNamespace)); v != "" {
+		return v
+	}
+	if v := strings.ToLower(strings.TrimSpace(explicit)); v != "" {
+		return v
+	}
+	if sm != nil {
+		if v := strings.ToLower(strings.TrimSpace(sm.ActiveNamespace())); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func executeLearnFromResearch(selector string, includeSummary bool, includeSources bool) error {

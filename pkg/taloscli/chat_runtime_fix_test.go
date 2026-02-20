@@ -184,13 +184,16 @@ func TestChatCommandHasTextGenFlag(t *testing.T) {
 func TestResolveChatDomainPrefersFlagThenEnv(t *testing.T) {
 	prev := chatDomain
 	prevNs := chatNamespace
+	prevRoot := requestedNamespace
 	defer func() {
 		chatDomain = prev
 		chatNamespace = prevNs
+		requestedNamespace = prevRoot
 	}()
 	t.Setenv("PLM_CHAT_DOMAIN", "ops")
 	chatDomain = ""
 	chatNamespace = ""
+	requestedNamespace = ""
 	if got := resolveChatDomain(nil); got != "ops" {
 		t.Fatalf("expected env fallback domain ops, got %q", got)
 	}
@@ -201,6 +204,10 @@ func TestResolveChatDomainPrefersFlagThenEnv(t *testing.T) {
 	chatDomain = "talos-runtime"
 	if got := resolveChatDomain(nil); got != "talos-runtime" {
 		t.Fatalf("expected flag domain talos-runtime, got %q", got)
+	}
+	requestedNamespace = "root-global"
+	if got := resolveChatDomain(nil); got != "root-global" {
+		t.Fatalf("expected root namespace precedence, got %q", got)
 	}
 }
 
