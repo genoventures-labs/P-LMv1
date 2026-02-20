@@ -59,9 +59,11 @@ func TestLearnProfilesFileRoundtrip(t *testing.T) {
 func TestResolveLearnProfileForRunRespectsExplicitFlagOverrides(t *testing.T) {
 	oldPath := learnProfilesPath
 	oldProfile := learnProfile
+	oldNamespace := learnNamespace
 	defer func() {
 		learnProfilesPath = oldPath
 		learnProfile = oldProfile
+		learnNamespace = oldNamespace
 	}()
 	learnProfilesPath = filepath.Join(t.TempDir(), "learn_profiles.json")
 
@@ -74,6 +76,7 @@ func TestResolveLearnProfileForRunRespectsExplicitFlagOverrides(t *testing.T) {
 			Config: LearnProfileConfig{
 				ChunkChars:             1200,
 				ChunkOverlap:           200,
+				Namespace:              "profile-ns",
 				MaxPages:               200,
 				RateLimit:              2.0,
 				MaxBytes:               10 * 1024 * 1024,
@@ -101,6 +104,9 @@ func TestResolveLearnProfileForRunRespectsExplicitFlagOverrides(t *testing.T) {
 	if err := cmd.Flags().Set("chunk-chars", "1500"); err != nil {
 		t.Fatalf("set explicit flag: %v", err)
 	}
+	if err := cmd.Flags().Set("namespace", "explicit-ns"); err != nil {
+		t.Fatalf("set explicit namespace flag: %v", err)
+	}
 
 	if _, err := resolveLearnProfileForRun(cmd); err != nil {
 		t.Fatalf("resolve profile: %v", err)
@@ -110,6 +116,9 @@ func TestResolveLearnProfileForRunRespectsExplicitFlagOverrides(t *testing.T) {
 	}
 	if learnChunkChars != 1500 {
 		t.Fatalf("expected explicit chunk-chars override (1500), got %d", learnChunkChars)
+	}
+	if learnNamespace != "explicit-ns" {
+		t.Fatalf("expected explicit namespace override (explicit-ns), got %q", learnNamespace)
 	}
 }
 

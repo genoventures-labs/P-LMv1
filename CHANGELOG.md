@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.7.0] - 2026-02-20
+
+### Summary
+Zero-trust domain context release: chat can now be explicitly pinned to a work domain namespace, and learn can ingest directly into that namespace for deterministic, isolated retrieval.
+
+### Highlights
+- Added `talos chat --domain <name>` with `PLM_CHAT_DOMAIN` fallback to pin retrieval/memory context to a single namespace per chat run.
+- Integrated domain pinning with strict zero-trust gating so ungrounded responses in the pinned namespace are blocked with the standard insufficiency response.
+- Added `talos learn --namespace <name>` so directory/file/url/connector ingestion can populate explicit work domains.
+- Extended learn profile serialization/apply/visited-flag restoration to include `namespace`.
+- Updated `talos explain` docs for `chat` and `learn` with domain/namespace examples and behavior notes.
+
+### Validation
+- `go test ./pkg/taloscli`
+- `go test ./cmd/... ./pkg/...`
+
 ## [v0.6.0] - 2026-02-19
 
 ### Summary

@@ -504,13 +504,7 @@ func initResearchRuntime(query string) (*researchRuntime, error) {
 		fmt.Printf("Warning: tool client unavailable: %v\n", err)
 		fmt.Println("Proceeding without external tools.")
 	}
-	sm, err := state.NewManager()
-	if err == nil {
-		_, note := applyPersistentGoalLock(sm, query, "research")
-		if strings.TrimSpace(note) != "" {
-			fmt.Printf("DEBUG: %s\n", strings.TrimSpace(note))
-		}
-	}
+	sm, _ := state.NewManager()
 	reindexer := memory.NewReindexer(mm, sm)
 	reindexer.Start()
 

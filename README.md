@@ -72,10 +72,19 @@ Use a specific skill for chat:
 talos --skill report2markdown chat "Convert this report into markdown with headings"
 ```
 
+Pin chat to a work domain namespace (zero-trust retrieval scope):
+
+```bash
+talos chat --domain talos-runtime "What changed in our toolserver policy?"
+# or set a default:
+PLM_CHAT_DOMAIN=talos-runtime talos chat "Summarize latest runtime learnings"
+```
+
 Learn an entire directory (all supported default document types):
 
 ```bash
 talos learn --dir ./docs
+talos learn --dir ./docs --namespace talos-runtime
 ```
 
 Ingest from Google Workspace (Gmail):

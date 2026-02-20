@@ -82,19 +82,28 @@ var chatCmd = &cobra.Command{
 			return
 		}
 		if selectedSkill != nil {
-			fmt.Printf("DEBUG: Active skill=%s (%s)\n", strings.TrimSpace(selectedSkill.SkillID), strings.TrimSpace(selectedSkill.Name))
+			debugPrintf("DEBUG: Active skill=%s (%s)\n", strings.TrimSpace(selectedSkill.SkillID), strings.TrimSpace(selectedSkill.Name))
 		}
 		profile := configureChatTimeouts(chatTimeoutProfile)
-		fmt.Printf("DEBUG: Timeout profile=%s first-token=%s chat=%s mcts=%s\n", profile, llmFirstTokenTimeout, llmChatTimeout, mctsTimeout)
+		debugPrintf("DEBUG: Timeout profile=%s first-token=%s chat=%s mcts=%s\n", profile, llmFirstTokenTimeout, llmChatTimeout, mctsTimeout)
 		if strings.TrimSpace(chatCognitionMode) == "" {
 			chatCognitionMode = strings.TrimSpace(os.Getenv("PLM_COGNITION_MODE"))
 		}
 		chatCognitionMode = normalizeCognitionMode(chatCognitionMode)
-		fmt.Printf("DEBUG: Cognition orchestrator default=%s\n", chatCognitionMode)
+		debugPrintf("DEBUG: Cognition orchestrator default=%s\n", chatCognitionMode)
+		if domain := resolveChatDomain(); domain != "" {
+			mm.SetActiveNamespace(domain)
+			debugPrintf("DEBUG: Domain namespace=%s\n", domain)
+		}
 
 		// Check if we have a prompt in arguments
 		if len(args) > 0 {
 			prompt := strings.Join(args, " ")
+			if handled, msg := maybeHandleBuiltInChatCommand(prompt); handled {
+				output.PrintBreathAware(msg, sm, chatRawOutput)
+				fmt.Println()
+				return
+			}
 			if msg, handled := TryHandleSelectiveInterventionApproval(prompt); handled {
 				fmt.Println(msg)
 				return
@@ -108,13 +117,6 @@ var chatCmd = &cobra.Command{
 			if clarification != "" {
 				fmt.Printf("Clarification needed: %s\n", clarification)
 				return
-			}
-			if sm != nil && strings.TrimSpace(normalized) != "" {
-				locked, note := applyPersistentGoalLock(sm, normalized, "chat")
-				normalized = locked
-				if strings.TrimSpace(note) != "" {
-					fmt.Printf("DEBUG: %s\n", strings.TrimSpace(note))
-				}
 			}
 			err := handleChatTurn(client, mm, tc, r, normalized, nil, sm, selectedSkill)
 			if err != nil {
@@ -213,6 +215,11 @@ var chatCmd = &cobra.Command{
 				fmt.Println("Exiting chat session. Goodbye!")
 				break
 			}
+			if handled, msg := maybeHandleBuiltInChatCommand(input); handled {
+				output.PrintBreathAware(msg, sm, chatRawOutput)
+				fmt.Println()
+				continue
+			}
 			if msg, handled := TryHandleSelectiveInterventionApproval(input); handled {
 				fmt.Println(msg)
 				continue
@@ -227,13 +234,6 @@ var chatCmd = &cobra.Command{
 				fmt.Printf("Clarification needed: %s\n", clarification)
 				continue
 			}
-			if sm != nil && strings.TrimSpace(normalized) != "" {
-				locked, note := applyPersistentGoalLock(sm, normalized, "chat")
-				normalized = locked
-				if strings.TrimSpace(note) != "" {
-					fmt.Printf("DEBUG: %s\n", strings.TrimSpace(note))
-				}
-			}
 			err := handleChatTurn(client, mm, tc, r, normalized, &conversationHistory, sm, selectedSkill)
 			if err != nil {
 				fmt.Printf("Error during chat: %v\n", err)
@@ -246,9 +246,32 @@ var chatCmd = &cobra.Command{
 }
 
 var chatRawOutput bool
+var chatVerbose bool
 var chatTimeoutProfile string
 var chatWarmup bool
 var chatCognitionMode string
+var chatDomain string
+
+func debugPrintf(format string, args ...any) {
+	if !chatVerbose {
+		return
+	}
+	fmt.Printf(format, args...)
+}
+
+func debugPrintln(args ...any) {
+	if !chatVerbose {
+		return
+	}
+	fmt.Println(args...)
+}
+
+func resolveChatDomain() string {
+	if v := strings.TrimSpace(chatDomain); v != "" {
+		return strings.ToLower(v)
+	}
+	return strings.ToLower(strings.TrimSpace(os.Getenv("PLM_CHAT_DOMAIN")))
+}
 
 func applyIntentCorrection(raw string, sm *state.Manager, mm *memory.MemoryManager) (string, string) {
 	env, proceed, clarification := preprocessUserIntent(raw, sm, mm, "chat")
@@ -256,7 +279,7 @@ func applyIntentCorrection(raw string, sm *state.Manager, mm *memory.MemoryManag
 		return "", clarification
 	}
 	if strings.TrimSpace(env.Normalized) != strings.TrimSpace(raw) {
-		fmt.Printf("DEBUG: Normalized intent: %s\n", strings.TrimSpace(env.Normalized))
+		debugPrintf("DEBUG: Normalized intent: %s\n", strings.TrimSpace(env.Normalized))
 	}
 	return strings.TrimSpace(env.Normalized), ""
 }
@@ -467,6 +490,7 @@ const systemPrompt = `You are a helpful Personal AI Assistant. You have access t
 - Keep reasoning private: do not expose internal thoughts, chain-of-thought, or scratchpad text.
 - Return only the final answer (or a tool call when needed).
 - Never expose secrets (api keys/tokens). If internal provisioning is used, keep credentials internal only.
+- Never guess or fabricate facts. If evidence is insufficient, respond explicitly with: "I don't have enough knowledge to answer that reliably."
 
 Available tools:
 - web_search: Search the web for current information. Args: {"query": "search query","artifact_id":"research-...|latest","artifact_path":".memory/research_artifacts/<id>.json","reflection_audit_path":".memory/reflection_audit.jsonl","include_evidence_notes":true}
@@ -493,27 +517,29 @@ const minimalSystemPrompt = `You are TALOS, a concise production assistant.
 Rules:
 - Answer directly and briefly.
 - Do not emit tool-call JSON unless the user explicitly asks to run a tool/action.
-- Keep internal reasoning private and never expose secrets.`
+- Keep internal reasoning private and never expose secrets.
+- Never guess or fabricate facts. If evidence is insufficient, respond explicitly with: "I don't have enough knowledge to answer that reliably."`
 
 const (
-	maxToolResultChars  = 3500
-	maxToolCallsPerTurn = 4
-	mctsIterations      = 5
-	mctsBranchFactor    = 3
-	mctsRolloutDepth    = 2
-	mctsUCB1C           = 1.25
-	finalLatencyBudget  = 45000
-	telemetryFeedPath   = ".memory/telemetry_feed.jsonl"
-	reflexAlertsPath    = ".memory/reflex_alerts.jsonl"
-	toolFailuresPath    = ".memory/tool_failures.jsonl"
-	mirrorBriefsPath    = ".memory/reasoning_mirror_briefs.jsonl"
-	decisionFeedPath    = ".memory/decision_feed.jsonl"
-	archiveBriefsPath   = ".memory/archive_mirror_briefs.jsonl"
-	delegationWorkPath  = ".memory/delegation_work_orders.jsonl"
-	morningBriefState   = ".memory/morning_brief_state.json"
-	chronosStatePath    = ".memory/chronos_state.json"
-	documentaryResults  = ".memory/documentary/results"
-	labResultsPath      = ".memory/lab_assistant/results.jsonl"
+	insufficientKnowledgeResponse = "I don't have enough knowledge to answer that reliably."
+	maxToolResultChars            = 3500
+	maxToolCallsPerTurn           = 4
+	mctsIterations                = 5
+	mctsBranchFactor              = 3
+	mctsRolloutDepth              = 2
+	mctsUCB1C                     = 1.25
+	finalLatencyBudget            = 45000
+	telemetryFeedPath             = ".memory/telemetry_feed.jsonl"
+	reflexAlertsPath              = ".memory/reflex_alerts.jsonl"
+	toolFailuresPath              = ".memory/tool_failures.jsonl"
+	mirrorBriefsPath              = ".memory/reasoning_mirror_briefs.jsonl"
+	decisionFeedPath              = ".memory/decision_feed.jsonl"
+	archiveBriefsPath             = ".memory/archive_mirror_briefs.jsonl"
+	delegationWorkPath            = ".memory/delegation_work_orders.jsonl"
+	morningBriefState             = ".memory/morning_brief_state.json"
+	chronosStatePath              = ".memory/chronos_state.json"
+	documentaryResults            = ".memory/documentary/results"
+	labResultsPath                = ".memory/lab_assistant/results.jsonl"
 )
 
 var (
@@ -524,6 +550,7 @@ var (
 	mctsCallTimeout      = 15 * time.Second
 	chatModelKeepAlive   = durationFromEnv("PLM_CHAT_MODEL_KEEPALIVE", 30*time.Minute)
 	chatWarmupTimeout    = durationFromEnv("PLM_CHAT_WARMUP_TIMEOUT", 3*time.Second)
+	chatZeroTrustGating  = boolFromEnv("PLM_CHAT_ZERO_TRUST_GATING", true)
 	chatWarmupOnce       sync.Once
 	subAgentCredMu       sync.Mutex
 	subAgentCredCache    = map[string]tools.ProvisionedSubAgent{}
@@ -535,6 +562,8 @@ var (
 	delegationJobSerial  int64
 	workspaceMentalMapMu sync.RWMutex
 	workspaceMentalMap   skills.WorkspaceContext
+	aboutSubjectPattern  = regexp.MustCompile(`(?i)\babout\s+(.+)$`)
+	groundingTokenRE     = regexp.MustCompile(`[a-z0-9]{4,}`)
 )
 
 type timeoutProfileDurations struct {
@@ -659,10 +688,10 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 		selectedSkill = drafted
 		chainedSkills = chain
 		if strings.TrimSpace(note) != "" {
-			fmt.Printf("DEBUG: %s\n", note)
+			debugPrintf("DEBUG: %s\n", note)
 		}
 	}
-	fmt.Printf("DEBUG: Cognition mode=%s score=%d thoughtgraph=%t tot=%t mcts=%t context=(h:%d,k:%d)\n",
+	debugPrintf("DEBUG: Cognition mode=%s score=%d thoughtgraph=%t tot=%t mcts=%t context=(h:%d,k:%d)\n",
 		cognitionPlan.Mode,
 		cognitionPlan.ComplexityScore,
 		cognitionPlan.UseThoughtGraph,
@@ -671,7 +700,7 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 		cognitionPlan.HistoryTopK,
 		cognitionPlan.KnowledgeTopK,
 	)
-	fmt.Printf("DEBUG: Modulation entropy=%s load=%.2f persistence=%.2f density=%.2f branches=%d prune=%.2f\n",
+	debugPrintf("DEBUG: Modulation entropy=%s load=%.2f persistence=%.2f density=%.2f branches=%d prune=%.2f\n",
 		modulation.Entropy.Mode,
 		modulation.EmotionPressure,
 		modulation.GoalPersistence,
@@ -680,7 +709,7 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 		modulation.PruneThreshold,
 	)
 	if strings.TrimSpace(modulation.PredictiveIntervention) != "" {
-		fmt.Printf("DEBUG: Predictive Intervention=%s trend=%.2f volatility=%.2f\n",
+		debugPrintf("DEBUG: Predictive Intervention=%s trend=%.2f volatility=%.2f\n",
 			modulation.PredictiveIntervention,
 			modulation.EmotionTrend,
 			modulation.EmotionVolatility,
@@ -703,19 +732,37 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 	if len(modelCandidates) == 0 {
 		return fmt.Errorf("no candidate models available")
 	}
-	fmt.Printf("DEBUG: Selected model: %s\n", modelCandidates[0])
+	debugPrintf("DEBUG: Selected model: %s\n", modelCandidates[0])
 	if chatWarmup {
 		chatWarmupOnce.Do(func() {
 			if err := warmupOllamaEndpoint(chatWarmupTimeout); err != nil {
-				fmt.Printf("DEBUG: Warmup ping failed: %v\n", err)
+				debugPrintf("DEBUG: Warmup ping failed: %v\n", err)
 				return
 			}
-			fmt.Printf("DEBUG: Warmup ping OK (%s).\n", ollamaHostForChat())
+			debugPrintf("DEBUG: Warmup ping OK (%s).\n", ollamaHostForChat())
 		})
+	}
+	if shouldBlockUngroundedChatTurn(mm, requestQuery, cognitionPlan) {
+		msg := insufficientKnowledgeResponse
+		if history == nil {
+			fmt.Print("LLM Response: ")
+		} else {
+			fmt.Print("<<< LLM: ")
+		}
+		output.PrintBreathAware(msg, sm, chatRawOutput)
+		fmt.Println()
+		if err := mm.AddMessage("assistant", msg); err != nil {
+			fmt.Printf("Warning: Error adding assistant message to memory: %v\n", err)
+		}
+		if history != nil {
+			*history = append(*history, api.Message{Role: "user", Content: input})
+			*history = append(*history, api.Message{Role: "assistant", Content: msg})
+		}
+		return nil
 	}
 
 	if cognitionPlan.UseThoughtGraph && shouldUseThoughtGraph(requestQuery) {
-		fmt.Println("DEBUG: Complex query detected. Using ThoughtGraph orchestration.")
+		debugPrintln("DEBUG: Complex query detected. Using ThoughtGraph orchestration.")
 		if err := executeThoughtGraphTurn(client, mm, tc, r, modelCandidates, requestQuery, history, sm, modulation, styleProfile); err == nil {
 			return nil
 		} else {
@@ -724,7 +771,10 @@ func handleChatTurn(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMT
 	}
 
 	// 1. Retrieve context from memory (memory-anchored reasoning).
-	historyContext, knowledgeContext := resolveAnchoredTurnContext(mm, requestQuery, cognitionPlan.HistoryTopK, cognitionPlan.KnowledgeTopK)
+	var historyContext, knowledgeContext []string
+	if cognitionPlan.HistoryTopK > 0 || cognitionPlan.KnowledgeTopK > 0 {
+		historyContext, knowledgeContext = resolveAnchoredTurnContext(mm, requestQuery, cognitionPlan.HistoryTopK, cognitionPlan.KnowledgeTopK)
+	}
 
 	// 2. Build the context-enriched message
 	var contextParts []string
@@ -809,7 +859,7 @@ func resolveAnchoredTurnContext(mm *memory.MemoryManager, query string, historyK
 		}
 		return truncateContextEntries(historyContext, maxHistoryContextChars, maxHistoryTotalChars), truncateContextEntries(knowledgeContext, maxKnowledgeContextChars, maxKnowledgeTotalChars)
 	}
-	if ctx.Policy.StatusReport {
+	if chatVerbose && ctx.Policy.StatusReport {
 		fmt.Print(ctx.AnchoredStatusReport())
 	}
 	return truncateContextEntries(ctx.History, maxHistoryContextChars, maxHistoryTotalChars), truncateContextEntries(ctx.Knowledge, maxKnowledgeContextChars, maxKnowledgeTotalChars)
@@ -1036,13 +1086,13 @@ func maybeProvisionSubAgentClient(tc *tools.GLMToolClient, taskQuery string) *to
 
 	prov, err := tools.ProvisionSubAgent(taskQuery)
 	if err != nil {
-		fmt.Printf("DEBUG: Sub-agent provisioning skipped: %v\n", err)
+		debugPrintf("DEBUG: Sub-agent provisioning skipped: %v\n", err)
 		return tc
 	}
 	subAgentCredMu.Lock()
 	subAgentCredCache[taskKey] = prov
 	subAgentCredMu.Unlock()
-	fmt.Printf("DEBUG: Provisioned task-scoped sub-agent credentials for background daemon mission (%s).\n", prov.ClientID)
+	debugPrintf("DEBUG: Provisioned task-scoped sub-agent credentials for background daemon mission (%s).\n", prov.ClientID)
 	return tc.WithCredentials(prov.ClientID, prov.APIKey)
 }
 
@@ -1128,10 +1178,10 @@ func executeThoughtGraphTurn(client *api.Client, mm *memory.MemoryManager, tc *t
 		_ = sm.Save()
 	}
 	if truthShiftSeverity > 0 || truthShiftDetected {
-		fmt.Printf("DEBUG: Reasoning geometry truth-shift severity=%.2f detected=%t reason=%s\n",
+		debugPrintf("DEBUG: Reasoning geometry truth-shift severity=%.2f detected=%t reason=%s\n",
 			truthShiftSeverity, truthShiftDetected, summarizePlanStep(truthShiftReason, 140))
 	}
-	fmt.Printf("DEBUG: Selected topology: %s\n", topology)
+	debugPrintf("DEBUG: Selected topology: %s\n", topology)
 	_ = orchestration.AppendDecisionFeed(decisionFeedPath, orchestration.DecisionRecord{
 		Timestamp:  time.Now().UTC(),
 		Query:      strings.TrimSpace(input),
@@ -1172,6 +1222,7 @@ func executeThoughtGraphTurn(client *api.Client, mm *memory.MemoryManager, tc *t
 		}
 	}
 	finalOutput = sanitizeModelOutput(finalOutput)
+	finalOutput = normalizeInsufficientKnowledgeResponse(finalOutput)
 	if notes := reflection.PredictiveNotices(); len(notes) > 0 {
 		finalOutput = strings.TrimSpace(finalOutput) + "\n\nProactive Interventions:\n- " + strings.Join(notes, "\n- ")
 	}
@@ -3117,6 +3168,7 @@ Return only the corrected answer text.`
 		return "", err
 	}
 	out := sanitizeModelOutput(resp)
+	out = normalizeInsufficientKnowledgeResponse(out)
 	if cognition.DetectRefusal(out) {
 		delta := cognition.GenerateReframingDelta(goal, query)
 		reframedUser := cognition.ApplyReframingDelta(user, delta)
@@ -3126,6 +3178,7 @@ Return only the corrected answer text.`
 		})
 		if err2 == nil {
 			out2 := sanitizeModelOutput(resp2)
+			out2 = normalizeInsufficientKnowledgeResponse(out2)
 			if strings.TrimSpace(out2) != "" {
 				out = out2
 			}
@@ -3201,6 +3254,7 @@ Do not include chain-of-thought.` + func() string {
 		return "", "", err
 	}
 	out := sanitizeModelOutput(resp)
+	out = normalizeInsufficientKnowledgeResponse(out)
 	if strings.TrimSpace(out) == "" {
 		return "", usedModel, fmt.Errorf("empty draft answer")
 	}
@@ -3257,6 +3311,131 @@ Return JSON only:
 	return score, nil
 }
 
+func normalizeInsufficientKnowledgeResponse(out string) string {
+	trimmed := strings.TrimSpace(out)
+	if trimmed == "" {
+		return trimmed
+	}
+	idx := strings.Index(strings.ToLower(trimmed), strings.ToLower(insufficientKnowledgeResponse))
+	if idx < 0 {
+		return trimmed
+	}
+	before := strings.TrimSpace(trimmed[:idx])
+	after := strings.TrimSpace(trimmed[idx+len(insufficientKnowledgeResponse):])
+	if before != "" || after != "" {
+		return insufficientKnowledgeResponse
+	}
+	return trimmed
+}
+
+func shouldRequireGroundedLearningEvidence(query string) bool {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return false
+	}
+	return strings.Contains(q, "recent training") ||
+		strings.Contains(q, "recent learning") ||
+		strings.Contains(q, "last learning") ||
+		strings.Contains(q, "from training") ||
+		strings.Contains(q, "from recent")
+}
+
+func extractGroundedLearningSubject(query string) string {
+	match := aboutSubjectPattern.FindStringSubmatch(strings.TrimSpace(query))
+	if len(match) < 2 {
+		return ""
+	}
+	subject := strings.TrimSpace(match[1])
+	for _, delimiter := range []string{",", " from ", " during ", " in "} {
+		lower := strings.ToLower(subject)
+		if idx := strings.Index(lower, delimiter); idx >= 0 {
+			subject = strings.TrimSpace(subject[:idx])
+		}
+	}
+	subject = strings.Trim(subject, " .?!;:\"'")
+	return strings.ToLower(subject)
+}
+
+func hasGroundedLearningEvidence(subject string, knowledgeContext []string) bool {
+	if len(knowledgeContext) == 0 {
+		return false
+	}
+	if strings.TrimSpace(subject) == "" {
+		return true
+	}
+	for _, entry := range knowledgeContext {
+		if strings.Contains(strings.ToLower(entry), subject) {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldBlockUngroundedFromKnowledge(query string, knowledgeContext []string) bool {
+	if !chatZeroTrustGating {
+		return false
+	}
+	if shouldRequireGroundedLearningEvidence(query) {
+		subject := extractGroundedLearningSubject(query)
+		return !hasGroundedLearningEvidence(subject, knowledgeContext)
+	}
+	return !hasQueryGroundingEvidence(query, knowledgeContext)
+}
+
+func shouldBlockUngroundedChatTurn(mm *memory.MemoryManager, query string, budget cognitionBudget) bool {
+	if !chatZeroTrustGating || mm == nil {
+		return false
+	}
+	knowledgeK := budget.KnowledgeTopK
+	if knowledgeK < 3 {
+		knowledgeK = 3
+	}
+	_, knowledgeContext := resolveAnchoredTurnContext(mm, query, 0, knowledgeK)
+	return shouldBlockUngroundedFromKnowledge(query, knowledgeContext)
+}
+
+func hasQueryGroundingEvidence(query string, knowledgeContext []string) bool {
+	if len(knowledgeContext) == 0 {
+		return false
+	}
+	keywords := extractGroundingKeywords(query)
+	if len(keywords) == 0 {
+		return true
+	}
+	for _, entry := range knowledgeContext {
+		lower := strings.ToLower(entry)
+		for _, kw := range keywords {
+			if strings.Contains(lower, kw) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func extractGroundingKeywords(query string) []string {
+	stop := map[string]bool{
+		"what": true, "when": true, "where": true, "which": true, "who": true, "whom": true,
+		"this": true, "that": true, "with": true, "from": true, "have": true, "your": true,
+		"about": true, "tell": true, "show": true, "last": true, "recent": true, "training": true,
+		"learning": true, "please": true,
+	}
+	matches := groundingTokenRE.FindAllString(strings.ToLower(strings.TrimSpace(query)), -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(matches))
+	for _, tok := range matches {
+		if stop[tok] || seen[tok] {
+			continue
+		}
+		seen[tok] = true
+		out = append(out, tok)
+	}
+	return out
+}
+
 func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tools.GLMToolClient, modelCandidates []string, modelIndex int, taskQuery string, messages []api.Message, history *[]api.Message, depth int, sm *state.Manager, budget cognitionBudget, modulation cognition.ReasoningModulationProfile, styleProfile cognition.StyleProfile) error {
 	turnStarted := time.Now()
 	if depth > 5 {
@@ -3272,7 +3451,7 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 			_ = sm.Save()
 		}
 		if _, err := state.NewTraitMiner().MineTraits(); err != nil {
-			fmt.Printf("DEBUG: Trait mining skipped: %v\n", err)
+			debugPrintf("DEBUG: Trait mining skipped: %v\n", err)
 		}
 	}
 	resolvedCandidates := modelCandidates
@@ -3291,7 +3470,7 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 	}
 	modelName := resolvedCandidates[modelIndex]
 
-	fmt.Printf("DEBUG: Calling LLM (%s) with %d messages (depth %d)...\n", modelName, len(messages), depth)
+	debugPrintf("DEBUG: Calling LLM (%s) with %d messages (depth %d)...\n", modelName, len(messages), depth)
 
 	req := &api.ChatRequest{
 		Model:    modelName,
@@ -3310,14 +3489,14 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 				"temperature": entropy.Temperature,
 				"top_p":       entropy.TopP,
 			}
-			fmt.Printf("DEBUG: Entropy mode=%s temperature=%.2f top_p=%.2f\n", entropy.Mode, entropy.Temperature, entropy.TopP)
+			debugPrintf("DEBUG: Entropy mode=%s temperature=%.2f top_p=%.2f\n", entropy.Mode, entropy.Temperature, entropy.TopP)
 		} else {
 			entropy := state.DetermineEntropy(snapshot, taskQuery)
 			req.Options = map[string]any{
 				"temperature": entropy.Temperature,
 				"top_p":       entropy.TopP,
 			}
-			fmt.Printf("DEBUG: Entropy mode=%s temperature=%.2f top_p=%.2f\n", entropy.Mode, entropy.Temperature, entropy.TopP)
+			debugPrintf("DEBUG: Entropy mode=%s temperature=%.2f top_p=%.2f\n", entropy.Mode, entropy.Temperature, entropy.TopP)
 		}
 	}
 	if depth == 0 && strings.EqualFold(strings.TrimSpace(budget.Mode), "minimal") {
@@ -3336,6 +3515,8 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 	}
 
 	var responseContent strings.Builder
+	streamingMinimal := shouldStreamTopLevelMinimal(budget, depth) && !chatZeroTrustGating
+	var streamedOutput atomic.Bool
 	totalCtx, totalCancel := context.WithTimeout(context.Background(), llmChatTimeout)
 	defer totalCancel()
 	ctx, cancel := context.WithCancel(totalCtx)
@@ -3367,7 +3548,7 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 					if sawFirstToken.Load() {
 						return
 					}
-					fmt.Printf("\nDEBUG: Waiting for first token from %s...\n", modelName)
+					debugPrintf("\nDEBUG: Waiting for first token from %s...\n", modelName)
 				}
 			}
 		}()
@@ -3378,6 +3559,10 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 		if !sawFirstToken.Load() && hasVisibleToken(resp.Message.Content) {
 			sawFirstToken.Store(true)
 			firstTokenTimer.Stop()
+		}
+		if streamingMinimal && resp.Message.Content != "" {
+			fmt.Print(resp.Message.Content)
+			streamedOutput.Store(true)
 		}
 		responseContent.WriteString(resp.Message.Content)
 		return nil
@@ -3390,11 +3575,11 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 		if (isTotalTimeout || isFirstTokenTimeout || isTransient) && modelIndex+1 < len(resolvedCandidates) {
 			nextModel := resolvedCandidates[modelIndex+1]
 			if isFirstTokenTimeout {
-				fmt.Printf("DEBUG: Model %s did not produce first token within %s. Falling back to %s.\n", modelName, llmFirstTokenTimeout, nextModel)
+				debugPrintf("DEBUG: Model %s did not produce first token within %s. Falling back to %s.\n", modelName, llmFirstTokenTimeout, nextModel)
 			} else if isTransient {
-				fmt.Printf("DEBUG: Model %s hit transient error (%v). Falling back to %s.\n", modelName, err, nextModel)
+				debugPrintf("DEBUG: Model %s hit transient error (%v). Falling back to %s.\n", modelName, err, nextModel)
 			} else {
-				fmt.Printf("DEBUG: Model %s timed out after %s. Falling back to %s.\n", modelName, llmChatTimeout, nextModel)
+				debugPrintf("DEBUG: Model %s timed out after %s. Falling back to %s.\n", modelName, llmChatTimeout, nextModel)
 			}
 			stopWaitLoop()
 			return performChatWithTools(client, mm, tc, resolvedCandidates, modelIndex+1, taskQuery, messages, history, depth, sm, budget, modulation, styleProfile)
@@ -3402,7 +3587,7 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 		if depth > 0 && (isTotalTimeout || isFirstTokenTimeout || isTransient) {
 			if fallbackAnswer := buildFallbackAnswerFromToolResults(messages); fallbackAnswer != "" {
 				fallbackAnswer = redactSensitiveOutput(fallbackAnswer)
-				fmt.Printf("DEBUG: Returning fallback answer from latest tool result at depth %d.\n", depth)
+				debugPrintf("DEBUG: Returning fallback answer from latest tool result at depth %d.\n", depth)
 				segments := styleOutputForCurrentState(fallbackAnswer, sm)
 				output.PrintBreathAwareStyledWithProfile(os.Stdout, fallbackAnswer, segments, sm, chatRawOutput, styleCadenceProfileFromCognition(styleProfile))
 				fmt.Println()
@@ -3432,13 +3617,13 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 	toolCalls, hasToolCalls := parseToolCalls(fullResponse)
 	if toolflowV3Enabled() || toolflowShadowEvalEnabled() {
 		if v3Calls, v3Has, deprecations, v3Err := parseToolCallsV3Aware(fullResponse); v3Err != nil {
-			fmt.Printf("DEBUG: Toolflow parser warning: %v\n", v3Err)
+			debugPrintf("DEBUG: Toolflow parser warning: %v\n", v3Err)
 		} else if v3Has {
 			toolCalls = v3Calls
 			hasToolCalls = true
 			if toolflowDeprecationsEnabled() {
 				for _, note := range deprecations {
-					fmt.Printf("DEBUG: Toolflow deprecation: %s\n", note)
+					debugPrintf("DEBUG: Toolflow deprecation: %s\n", note)
 				}
 			}
 		}
@@ -3455,6 +3640,7 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 			}
 		}
 		finalOutput := sanitizeModelOutput(fullResponse)
+		finalOutput = normalizeInsufficientKnowledgeResponse(finalOutput)
 		if strings.TrimSpace(finalOutput) != "" {
 			if telemetrySummary != "" {
 				finalOutput = "State Summary: " + telemetrySummary + "\n\n" + finalOutput
@@ -3462,11 +3648,13 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 			finalOutput = withStrategicProposal(finalOutput, mm, sm, taskQuery)
 			finalOutput = withAgencyPendingPrompt(finalOutput)
 			finalOutput = redactSensitiveOutput(finalOutput)
-			if glimpse := consumeLogicGlimpse(); strings.TrimSpace(glimpse) != "" {
-				output.PrintReasoningMirrorLine(os.Stdout, "Logic Glimpse: "+glimpse, sm, chatRawOutput)
+			if !(streamingMinimal && streamedOutput.Load()) {
+				if glimpse := consumeLogicGlimpse(); strings.TrimSpace(glimpse) != "" {
+					output.PrintReasoningMirrorLine(os.Stdout, "Logic Glimpse: "+glimpse, sm, chatRawOutput)
+				}
+				segments := styleOutputForCurrentState(finalOutput, sm)
+				output.PrintBreathAwareStyledWithProfile(os.Stdout, finalOutput, segments, sm, chatRawOutput, styleCadenceProfileFromCognition(styleProfile))
 			}
-			segments := styleOutputForCurrentState(finalOutput, sm)
-			output.PrintBreathAwareStyledWithProfile(os.Stdout, finalOutput, segments, sm, chatRawOutput, styleCadenceProfileFromCognition(styleProfile))
 			recordInferenceAndTelemetryFeed(turnStarted, finalOutput)
 		}
 		fmt.Println()
@@ -3475,7 +3663,7 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 	}
 	if hasToolCalls && tc != nil {
 		if len(toolCalls) > maxToolCallsPerTurn {
-			fmt.Printf("DEBUG: Received %d tool calls, limiting to %d this turn.\n", len(toolCalls), maxToolCallsPerTurn)
+			debugPrintf("DEBUG: Received %d tool calls, limiting to %d this turn.\n", len(toolCalls), maxToolCallsPerTurn)
 			toolCalls = toolCalls[:maxToolCallsPerTurn]
 		}
 
@@ -3505,11 +3693,11 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 					recordInferenceAndTelemetryFeed(turnStarted, msg)
 					return nil
 				}
-				fmt.Printf("DEBUG: Toolflow V3 failed (fallback to legacy): %v\n", err)
+				debugPrintf("DEBUG: Toolflow V3 failed (fallback to legacy): %v\n", err)
 			} else {
 				if toolflowDeprecationsEnabled() {
 					for _, note := range depNotes {
-						fmt.Printf("DEBUG: Toolflow deprecation: %s\n", note)
+						debugPrintf("DEBUG: Toolflow deprecation: %s\n", note)
 					}
 				}
 				if toolflowTraceEnabled() {
@@ -3556,7 +3744,7 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 						*history = append(*history, toolResultMsg)
 					}
 				}
-				fmt.Printf("DEBUG: Requesting next step/final answer with %d total messages...\n", len(messages))
+				debugPrintf("DEBUG: Requesting next step/final answer with %d total messages...\n", len(messages))
 				return performChatWithTools(client, mm, tc, modelCandidates, modelIndex, taskQuery, messages, history, depth+1, sm, budget, modulation, styleProfile)
 			}
 		}
@@ -3565,9 +3753,9 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 			call, arbitrationNote := arbitrateToolCall(rawCall, taskQuery)
 			fmt.Printf("\n[LLM tool step %d/%d: %s]\n", i+1, len(toolCalls), call.Tool)
 			if arbitrationNote != "" {
-				fmt.Printf("DEBUG: Tool arbitration: %s\n", arbitrationNote)
+				debugPrintf("DEBUG: Tool arbitration: %s\n", arbitrationNote)
 			}
-			fmt.Printf("DEBUG: Executing tool: %s with args: %v\n", call.Tool, call.Args)
+			debugPrintf("DEBUG: Executing tool: %s with args: %v\n", call.Tool, call.Args)
 
 			toolResult, toolErr := executeToolCall(tc, call)
 			if toolErr != nil {
@@ -3592,12 +3780,12 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 				toolResult = fmt.Sprintf("Error executing tool: %v", toolErr)
 			}
 			toolResult = redactSensitiveOutput(toolResult)
-			fmt.Printf("DEBUG: Tool Result Received (%d chars)\n", len(toolResult))
+			debugPrintf("DEBUG: Tool Result Received (%d chars)\n", len(toolResult))
 
 			toolResultForModel := toolResult
 			if len(toolResultForModel) > maxToolResultChars {
 				toolResultForModel = toolResultForModel[:maxToolResultChars] + "\n...(truncated for context size)"
-				fmt.Printf("DEBUG: Tool Result truncated to %d chars for follow-up prompt\n", len(toolResultForModel))
+				debugPrintf("DEBUG: Tool Result truncated to %d chars for follow-up prompt\n", len(toolResultForModel))
 			}
 
 			header := fmt.Sprintf("Tool result (%s)", call.Tool)
@@ -3620,7 +3808,7 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 			}
 		}
 
-		fmt.Printf("DEBUG: Requesting next step/final answer with %d total messages...\n", len(messages))
+		debugPrintf("DEBUG: Requesting next step/final answer with %d total messages...\n", len(messages))
 		return performChatWithTools(client, mm, tc, modelCandidates, modelIndex, taskQuery, messages, history, depth+1, sm, budget, modulation, styleProfile)
 	}
 	if hasToolCalls && tc == nil {
@@ -3635,7 +3823,7 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 			}
 			return nil
 		}
-		fmt.Println("DEBUG: Tool calls requested but tool client unavailable; requesting direct answer without tools.")
+		debugPrintln("DEBUG: Tool calls requested but tool client unavailable; requesting direct answer without tools.")
 		messages = append(messages,
 			api.Message{Role: "assistant", Content: fullResponse},
 			api.Message{Role: "user", Content: "Tools are unavailable in this session. Do not emit tool calls. Provide a direct final answer now."},
@@ -3666,6 +3854,10 @@ func performChatWithTools(client *api.Client, mm *memory.MemoryManager, tc *tool
 
 func hasVisibleToken(content string) bool {
 	return strings.TrimSpace(content) != ""
+}
+
+func shouldStreamTopLevelMinimal(budget cognitionBudget, depth int) bool {
+	return depth == 0 && strings.EqualFold(strings.TrimSpace(budget.Mode), "minimal")
 }
 
 func styleOutputForCurrentState(text string, sm *state.Manager) []output.TonalSegment {
@@ -5765,6 +5957,39 @@ func maybePrintMorningBrief(sm *state.Manager) {
 	_ = saveBriefState(morningBriefState, briefState{LastShown: time.Now().UTC()})
 }
 
+func maybeHandleBuiltInChatCommand(input string) (bool, string) {
+	cmd := strings.ToLower(strings.TrimSpace(input))
+	switch cmd {
+	case "scout status":
+		since := time.Now().UTC().Add(-24 * time.Hour)
+		scoutBriefs := loadMirrorBriefsSince(mirrorBriefsPath, since, 6, func(b mirrorBrief) bool {
+			src := strings.ToLower(strings.TrimSpace(b.Source))
+			return strings.Contains(src, "scout")
+		})
+		critical := selectCriticalScoutAnomaly(scoutBriefs)
+		var b strings.Builder
+		b.WriteString("SCOUT STATUS\n\n")
+		b.WriteString(fmt.Sprintf("briefs_24h: %d\n", len(scoutBriefs)))
+		if strings.TrimSpace(critical) == "" {
+			b.WriteString("high_confidence_anomaly: none\n")
+			b.WriteString("recommendation: no urgent anomaly workflow required\n")
+		} else {
+			b.WriteString("high_confidence_anomaly: detected\n")
+			b.WriteString("anomaly: " + strings.TrimSpace(critical) + "\n")
+			b.WriteString("recommendation: investigate anomaly with source evidence\n")
+		}
+		if len(scoutBriefs) > 0 {
+			latest := strings.TrimSpace(scoutBriefs[len(scoutBriefs)-1].Message)
+			if latest != "" {
+				b.WriteString("latest_brief: " + latest + "\n")
+			}
+		}
+		return true, strings.TrimSpace(b.String())
+	default:
+		return false, ""
+	}
+}
+
 func maybeRunChronosSmokingGun(sm *state.Manager) {
 	cs := loadChronosState(chronosStatePath)
 	if !cs.LastEscalatedAt.IsZero() && time.Since(cs.LastEscalatedAt) < 2*time.Minute {
@@ -6769,8 +6994,10 @@ func getArgSpatialElements(args map[string]interface{}, key string) []skills.Spa
 
 func init() {
 	chatCmd.Flags().BoolVarP(&chatRawOutput, "raw", "r", false, "Bypass breath-aware output cadence and print responses immediately")
+	chatCmd.Flags().BoolVarP(&chatVerbose, "verbose", "v", false, "Show detailed chat runtime diagnostics (legacy debug output)")
 	chatCmd.Flags().StringVar(&chatTimeoutProfile, "timeout-profile", "", "Timeout profile: quick|normal|deep (default from PLM_CHAT_TIMEOUT_PROFILE or normal)")
 	chatCmd.Flags().BoolVar(&chatWarmup, "warmup", boolFromEnv("PLM_CHAT_WARMUP", true), "Run one-time Ollama warmup ping before first chat inference")
 	chatCmd.Flags().StringVar(&chatCognitionMode, "cognition", "", "Cognition orchestration mode: auto|minimal|balanced|deep (default from PLM_COGNITION_MODE or auto)")
+	chatCmd.Flags().StringVar(&chatDomain, "domain", "", "Pin chat to a memory domain namespace (falls back to PLM_CHAT_DOMAIN)")
 	rootCmd.AddCommand(chatCmd)
 }

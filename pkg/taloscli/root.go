@@ -66,7 +66,8 @@ var rootCmd = &cobra.Command{
 	Long: `talos is a CLI tool to interact with your personal LLM hosted on an Ollama VPS.
 It leverages the JIT model router to ensure optimal models are available.`,
 	Example: `  talos chat "Summarize latest telemetry"
-  talos chat --cognition minimal --timeout-profile quick "Online?"
+   talos chat --domain talos-runtime "Summarize latest telemetry"
+   talos chat --cognition minimal --timeout-profile quick "Online?"
   talos --skill report2markdown chat "Convert this into markdown release notes"
   talos research run "What changed in X this week?"
   talos research run --profile market-scan "What changed in X this week?"
@@ -93,8 +94,9 @@ It leverages the JIT model router to ensure optimal models are available.`,
   talos pipeline "research run 'What changed in X this week?' ; learn --from-research latest"
   talos "research run 'What changed in X this week?' ; learn --from-research latest"
   talos learn profile create --name hf-train-default --hf-dataset TeichAI/claude-4.5-opus-high-reasoning-250x --hf-config default --hf-split train
-  talos learn --profile hf-train-default
-  talos learn "Store this project note"
+   talos learn --profile hf-train-default
+   talos learn --dir ./docs --namespace talos-runtime
+   talos learn "Store this project note"
   talos learned --last 5
   talos skills create --name report2markdown --description "Converts research reports to markdown files"
   talos skills preflight --name report2markdown --description "Converts research reports to markdown files"

@@ -66,3 +66,20 @@ func TestApplyPersistentGoalLockAcceptsExplicitOverride(t *testing.T) {
 		t.Fatalf("expected new primary goal, got %q", got)
 	}
 }
+
+func TestApplyPersistentGoalLockBypassesStandaloneQuestion(t *testing.T) {
+	sm, err := state.NewManagerWithPath(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	sm.SetPrimaryGoal("Summarize last learning run")
+	_ = sm.Save()
+
+	out, note := applyPersistentGoalLock(sm, "What's Thynaptic?", "chat")
+	if out != "What's Thynaptic?" {
+		t.Fatalf("expected standalone question passthrough, got %q", out)
+	}
+	if !strings.Contains(strings.ToLower(note), "bypassed") {
+		t.Fatalf("expected bypass note, got %q", note)
+	}
+}

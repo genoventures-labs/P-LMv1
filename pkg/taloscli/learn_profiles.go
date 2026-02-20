@@ -41,6 +41,7 @@ var (
 type LearnProfileConfig struct {
 	File                   string   `json:"file,omitempty"`
 	Dir                    string   `json:"dir,omitempty"`
+	Namespace              string   `json:"namespace,omitempty"`
 	Recursive              bool     `json:"recursive"`
 	Extensions             string   `json:"extensions,omitempty"`
 	Types                  []string `json:"types,omitempty"`
@@ -127,6 +128,7 @@ type learnProfilesFile struct {
 type learnRuntimeSnapshot struct {
 	learnFile                   string
 	learnDir                    string
+	learnNamespace              string
 	learnRecursive              bool
 	learnExtensions             string
 	learnTypes                  []string
@@ -547,6 +549,7 @@ func currentLearnProfileConfigFromGlobals() LearnProfileConfig {
 	return LearnProfileConfig{
 		File:                   strings.TrimSpace(learnFile),
 		Dir:                    strings.TrimSpace(learnDir),
+		Namespace:              strings.TrimSpace(learnNamespace),
 		Recursive:              learnRecursive,
 		Extensions:             strings.TrimSpace(learnExtensions),
 		Types:                  append([]string(nil), learnTypes...),
@@ -609,6 +612,7 @@ func currentLearnProfileConfigFromGlobals() LearnProfileConfig {
 func applyLearnProfileConfig(cfg LearnProfileConfig) {
 	learnFile = strings.TrimSpace(cfg.File)
 	learnDir = strings.TrimSpace(cfg.Dir)
+	learnNamespace = strings.TrimSpace(cfg.Namespace)
 	learnRecursive = cfg.Recursive
 	learnExtensions = strings.TrimSpace(cfg.Extensions)
 	learnTypes = append([]string(nil), cfg.Types...)
@@ -811,6 +815,7 @@ func captureLearnRuntimeSnapshot() learnRuntimeSnapshot {
 	return learnRuntimeSnapshot{
 		learnFile:                   learnFile,
 		learnDir:                    learnDir,
+		learnNamespace:              learnNamespace,
 		learnRecursive:              learnRecursive,
 		learnExtensions:             learnExtensions,
 		learnTypes:                  append([]string(nil), learnTypes...),
@@ -883,6 +888,9 @@ func restoreVisitedLearnFlags(cmd *cobra.Command, snap learnRuntimeSnapshot) {
 	}
 	if visited["dir"] {
 		learnDir = snap.learnDir
+	}
+	if visited["namespace"] {
+		learnNamespace = snap.learnNamespace
 	}
 	if visited["recursive"] {
 		learnRecursive = snap.learnRecursive
@@ -1065,6 +1073,9 @@ func patchLearnProfileFromVisited(cmd *cobra.Command, p *LearnProfile) {
 	}
 	if visited["dir"] {
 		cfg.Dir = strings.TrimSpace(learnDir)
+	}
+	if visited["namespace"] {
+		cfg.Namespace = strings.TrimSpace(learnNamespace)
 	}
 	if visited["recursive"] {
 		cfg.Recursive = learnRecursive

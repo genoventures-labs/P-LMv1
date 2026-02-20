@@ -22,6 +22,9 @@ func applyPersistentGoalLock(sm *state.Manager, normalized string, module string
 	if sm == nil || normalized == "" {
 		return normalized, ""
 	}
+	if shouldBypassGoalLock(normalized, module) {
+		return normalized, "goal lock bypassed for standalone user query"
+	}
 	snap := sm.GetSnapshot()
 	currentGoal := strings.TrimSpace(snap.PrimaryGoal)
 	if currentGoal == "" {
@@ -140,6 +143,34 @@ func tokenizeGoal(s string) map[string]bool {
 
 func wordCountGoal(s string) int {
 	return len(strings.Fields(strings.TrimSpace(s)))
+}
+
+func shouldBypassGoalLock(normalized string, module string) bool {
+	if !strings.EqualFold(strings.TrimSpace(module), "chat") {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(normalized))
+	if lower == "" {
+		return false
+	}
+	if strings.HasPrefix(lower, "new goal:") ||
+		strings.Contains(lower, "switch goal") ||
+		strings.Contains(lower, "override goal") ||
+		strings.Contains(lower, "change objective") {
+		return false
+	}
+	if strings.HasSuffix(lower, "?") {
+		return true
+	}
+	for _, prefix := range []string{
+		"what ", "what's ", "who ", "who's ", "when ", "where ", "why ", "how ",
+		"can you ", "could you ", "would you ",
+	} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func floatEnvGoal(key string, fallback float64) float64 {

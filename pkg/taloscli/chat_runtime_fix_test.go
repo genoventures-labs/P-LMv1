@@ -128,3 +128,124 @@ func TestHasVisibleToken(t *testing.T) {
 		t.Fatal("expected non-empty content to count as visible token")
 	}
 }
+
+func TestPlanCognitionBudgetMinimalDisablesAnchoredContext(t *testing.T) {
+	b := planCognitionBudget("Summarize last learning run", nil, "minimal")
+	if b.HistoryTopK != 0 || b.KnowledgeTopK != 0 {
+		t.Fatalf("expected minimal mode to disable anchored context, got h=%d k=%d", b.HistoryTopK, b.KnowledgeTopK)
+	}
+}
+
+func TestShouldStreamTopLevelMinimal(t *testing.T) {
+	if !shouldStreamTopLevelMinimal(cognitionBudget{Mode: "minimal"}, 0) {
+		t.Fatal("expected top-level minimal mode to stream output")
+	}
+	if shouldStreamTopLevelMinimal(cognitionBudget{Mode: "balanced"}, 0) {
+		t.Fatal("expected non-minimal mode not to force streaming")
+	}
+}
+
+func TestChatCommandHasVerboseFlag(t *testing.T) {
+	f := chatCmd.Flags().Lookup("verbose")
+	if f == nil {
+		t.Fatal("expected --verbose flag on chat command")
+	}
+}
+
+func TestChatCommandHasDomainFlag(t *testing.T) {
+	f := chatCmd.Flags().Lookup("domain")
+	if f == nil {
+		t.Fatal("expected --domain flag on chat command")
+	}
+}
+
+func TestResolveChatDomainPrefersFlagThenEnv(t *testing.T) {
+	prev := chatDomain
+	defer func() { chatDomain = prev }()
+	t.Setenv("PLM_CHAT_DOMAIN", "ops")
+	chatDomain = ""
+	if got := resolveChatDomain(); got != "ops" {
+		t.Fatalf("expected env fallback domain ops, got %q", got)
+	}
+	chatDomain = "talos-runtime"
+	if got := resolveChatDomain(); got != "talos-runtime" {
+		t.Fatalf("expected flag domain talos-runtime, got %q", got)
+	}
+}
+
+func TestSystemPromptsEnforceInsufficientKnowledgeResponse(t *testing.T) {
+	required := `I don't have enough knowledge to answer that reliably.`
+	if !strings.Contains(systemPrompt, required) {
+		t.Fatal("expected primary system prompt to include strict insufficient-knowledge response policy")
+	}
+	if !strings.Contains(minimalSystemPrompt, required) {
+		t.Fatal("expected minimal system prompt to include strict insufficient-knowledge response policy")
+	}
+}
+
+func TestMaybeHandleBuiltInChatCommandScoutStatus(t *testing.T) {
+	handled, out := maybeHandleBuiltInChatCommand("scout status")
+	if !handled {
+		t.Fatal("expected scout status built-in command to be handled")
+	}
+	for _, token := range []string{"SCOUT STATUS", "briefs_24h:", "recommendation:"} {
+		if !strings.Contains(out, token) {
+			t.Fatalf("expected token %q in output: %s", token, out)
+		}
+	}
+}
+
+func TestNormalizeInsufficientKnowledgeResponseCollapsesMixedOutput(t *testing.T) {
+	in := "Some speculative answer.\n\n" + insufficientKnowledgeResponse
+	got := normalizeInsufficientKnowledgeResponse(in)
+	if got != insufficientKnowledgeResponse {
+		t.Fatalf("expected strict insufficient-knowledge response, got %q", got)
+	}
+}
+
+func TestExtractGroundedLearningSubject(t *testing.T) {
+	got := extractGroundedLearningSubject("What have you learned about Anthropic, from recent training?")
+	if got != "anthropic" {
+		t.Fatalf("expected extracted subject anthropic, got %q", got)
+	}
+}
+
+func TestHasGroundedLearningEvidence(t *testing.T) {
+	knowledge := []string{"Anthropic announced updates in recent notes."}
+	if !hasGroundedLearningEvidence("anthropic", knowledge) {
+		t.Fatal("expected grounded evidence to match subject in knowledge context")
+	}
+	if hasGroundedLearningEvidence("openai", knowledge) {
+		t.Fatal("expected no grounded evidence for unmatched subject")
+	}
+}
+
+func TestShouldBlockUngroundedFromKnowledge(t *testing.T) {
+	prev := chatZeroTrustGating
+	chatZeroTrustGating = true
+	defer func() { chatZeroTrustGating = prev }()
+
+	if !shouldBlockUngroundedFromKnowledge("What's Thynaptic?", nil) {
+		t.Fatal("expected zero-trust gate to block when no knowledge exists")
+	}
+	if shouldBlockUngroundedFromKnowledge("What's Thynaptic?", []string{"Thynaptic is a local-first runtime."}) {
+		t.Fatal("expected zero-trust gate to allow when knowledge exists")
+	}
+	if !shouldBlockUngroundedFromKnowledge("What's Thynaptic?", []string{"alignment_audit session_state"}) {
+		t.Fatal("expected gate to block when namespace knowledge is irrelevant to query")
+	}
+	if !shouldBlockUngroundedFromKnowledge("What have you learned about Anthropic, from recent training?", []string{"General AI note"}) {
+		t.Fatal("expected subject-aware gate to block when knowledge misses the requested subject")
+	}
+}
+
+func TestExtractGroundingKeywords(t *testing.T) {
+	got := extractGroundingKeywords("What is GLM in TALOS runtime?")
+	if len(got) == 0 {
+		t.Fatal("expected non-empty grounding keywords")
+	}
+	if got[0] != "talos" && got[0] != "runtime" {
+		// keyword order is deterministic by query order; ensure stop words were removed.
+		t.Fatalf("unexpected first grounding keyword: %q", got[0])
+	}
+}

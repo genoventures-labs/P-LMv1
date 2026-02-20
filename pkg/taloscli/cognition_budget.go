@@ -44,8 +44,8 @@ func planCognitionBudget(taskQuery string, sm *state.Manager, modeOverride strin
 			UseThoughtGraph:  false,
 			UseTreeOfThought: false,
 			UseMCTS:          false,
-			HistoryTopK:      1,
-			KnowledgeTopK:    1,
+			HistoryTopK:      0,
+			KnowledgeTopK:    0,
 			MaxLinearModels:  2,
 		}
 	case "deep":
@@ -135,8 +135,12 @@ func applyReasoningModulationBudget(base cognitionBudget, mod cognition.Reasonin
 	if scale <= 0 {
 		scale = 1.0
 	}
-	out.HistoryTopK = clampIntBudget(int(float64(out.HistoryTopK)*scale), 1, 6)
-	out.KnowledgeTopK = clampIntBudget(int(float64(out.KnowledgeTopK)*scale), 1, 8)
+	lowBound := 1
+	if out.Mode == "minimal" {
+		lowBound = 0
+	}
+	out.HistoryTopK = clampIntBudget(int(float64(out.HistoryTopK)*scale), lowBound, 6)
+	out.KnowledgeTopK = clampIntBudget(int(float64(out.KnowledgeTopK)*scale), lowBound, 8)
 	if mod.EmotionPressure >= 0.65 {
 		out.UseTreeOfThought = true
 	}

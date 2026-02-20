@@ -65,6 +65,7 @@ var learnTitleMaxChars int
 var learnTitleModel string
 var learnIncremental bool
 var learnIncrementalManifest string
+var learnNamespace string
 var learnDryRun bool
 var learnVerbose bool
 
@@ -99,6 +100,7 @@ LOCAL SOURCES
   talos learn "some text"
   talos learn --file ./notes.md
   talos learn --dir ./docs --extensions .md,.txt
+  talos learn --dir ./docs --namespace talos-runtime
   talos learn --url https://example.com/page --crawl --crawl-depth 1
   talos learn --url https://example.com/page --crawl --extensions .html,.md
   talos learn --from-research latest
@@ -166,6 +168,9 @@ All sources are chunked and indexed into persistent memory for future retrieval.
 		if err != nil {
 			fmt.Printf("Error initializing memory manager: %v\n", err)
 			return
+		}
+		if ns := strings.TrimSpace(learnNamespace); ns != "" {
+			mm.SetActiveNamespace(ns)
 		}
 
 		// Chain dispatch — runs before all individual source checks.
@@ -599,6 +604,7 @@ func init() {
 func bindLearnConfigFlags(fs *pflag.FlagSet) {
 	fs.StringVarP(&learnFile, "file", "f", "", "Path to a file to learn from")
 	fs.StringVarP(&learnDir, "dir", "d", "", "Path to a directory of documents to index")
+	fs.StringVar(&learnNamespace, "namespace", "", "Optional memory namespace for all ingested records in this run")
 	fs.BoolVarP(&learnRecursive, "recursive", "r", true, "Recursively index subdirectories when using --dir")
 	fs.IntVar(&learnChunkChars, "chunk-chars", 1200, "Maximum characters per indexed chunk when using --dir")
 	fs.IntVar(&learnChunkOverlap, "chunk-overlap", 200, "Overlap between chunks when using --dir")
@@ -683,13 +689,18 @@ func summaryConfigFromLearnFlags() memory.SourceSummaryConfig {
 }
 
 func annotateLearnSessionWithProfile(session *LearnSessionRecord, profileName string) {
-	if session == nil || strings.TrimSpace(profileName) == "" {
+	if session == nil {
 		return
 	}
 	if session.ConfigSnapshot == nil {
 		session.ConfigSnapshot = map[string]string{}
 	}
-	session.ConfigSnapshot["profile_name"] = strings.TrimSpace(profileName)
+	if strings.TrimSpace(profileName) != "" {
+		session.ConfigSnapshot["profile_name"] = strings.TrimSpace(profileName)
+	}
+	if strings.TrimSpace(learnNamespace) != "" {
+		session.ConfigSnapshot["namespace"] = strings.TrimSpace(learnNamespace)
+	}
 }
 
 func executeLearnFromResearch(selector string, includeSummary bool, includeSources bool) error {
@@ -707,6 +718,9 @@ func executeLearnFromResearch(selector string, includeSummary bool, includeSourc
 	mm, err := memory.NewMemoryManager()
 	if err != nil {
 		return err
+	}
+	if ns := strings.TrimSpace(learnNamespace); ns != "" {
+		mm.SetActiveNamespace(ns)
 	}
 
 	session := newLearnSession("RESEARCH_CHAIN", artifactID, artifact.Sources, map[string]string{
