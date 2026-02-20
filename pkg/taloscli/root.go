@@ -99,6 +99,7 @@ Use chat domain pinning (--domain / PLM_CHAT_DOMAIN) plus learn namespaces (--na
   talos learn profile create --name hf-train-default --hf-dataset TeichAI/claude-4.5-opus-high-reasoning-250x --hf-config default --hf-split train
    talos learn --profile hf-train-default
    talos learn --dir ./docs --namespace talos-runtime
+   talos learn --self-train-speech "Capture my concise ops tone"
    talos learn --synthetic-text-out .memory/synthetic/train.jsonl "Capture stable native text-gen examples"
    talos learn "Store this project note"
   talos learned --last 5

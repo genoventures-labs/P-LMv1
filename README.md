@@ -168,6 +168,13 @@ talos learn --synthetic-text-out .memory/synthetic/train.jsonl "Capture stable r
 talos learn --file ./docs/ops.md --synthetic-text-out .memory/synthetic/ops.jsonl
 ```
 
+Self-train speech style during learn without specifying an output path:
+
+```bash
+talos learn --self-train-speech "Write with concise operational tone and clear status summaries"
+# artifacts append to .memory/synthetic/speech_self_train.jsonl
+```
+
 Chain multiple training sources in a fixed order:
 
 ```bash

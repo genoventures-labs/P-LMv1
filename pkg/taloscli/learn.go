@@ -70,6 +70,7 @@ var learnNamespace string
 var learnDryRun bool
 var learnVerbose bool
 var learnSyntheticTextOut string
+var learnSelfTrainSpeech bool
 
 // Google Workspace + Notion connector flags
 var learnGmailQuery string
@@ -100,6 +101,7 @@ var learnCmd = &cobra.Command{
 
 LOCAL SOURCES
   talos learn "some text"
+  talos learn --self-train-speech "some text"
   talos learn --file ./notes.md
   talos learn --dir ./docs --extensions .md,.txt
   talos learn --dir ./docs --namespace talos-runtime
@@ -575,7 +577,11 @@ All sources are chunked and indexed into persistent memory for future retrieval.
 		err = mm.AddKnowledge(content, nil)
 		if err != nil {
 			fmt.Printf("Error adding knowledge to memory: %v\n", err)
-			session := newLearnSession(mode, target, []string{target}, nil)
+			sessionCfg := map[string]string{}
+			if learnSelfTrainSpeech {
+				sessionCfg["self_train_speech"] = "true"
+			}
+			session := newLearnSession(mode, target, []string{target}, sessionCfg)
 			annotateLearnSessionWithProfile(&session, learnProfileApplied)
 			session.finish("FAILED", "Inline/file learning failed.", err.Error(), map[string]int64{"items_indexed": 0, "errors": 1})
 			if logErr := appendLearnSessionRecord(session); logErr != nil {
@@ -583,9 +589,29 @@ All sources are chunked and indexed into persistent memory for future retrieval.
 			}
 			return
 		}
-		session := newLearnSession(mode, target, []string{target}, nil)
+		status := "SUCCESS"
+		summary := "Inline/file learning completed successfully."
+		failureReason := ""
+		metrics := map[string]int64{"items_indexed": 1, "chunks_indexed": 1}
+		sessionCfg := map[string]string{}
+		if learnSelfTrainSpeech {
+			sessionCfg["self_train_speech"] = "true"
+			selfTrainPath := resolveLearnSelfTrainSpeechOutPath()
+			chunksWritten, synthErr := appendSyntheticTextArtifacts(content, target, selfTrainPath, learnChunkChars)
+			if synthErr != nil {
+				status = "PARTIAL"
+				failureReason = "speech self-train generation failed: " + synthErr.Error()
+				summary = "Inline/file learning completed; speech self-training artifact generation failed."
+				metrics["errors"] = 1
+			} else {
+				sessionCfg["self_train_out"] = selfTrainPath
+				metrics["self_train_chunks"] = int64(chunksWritten)
+				fmt.Printf("Speech self-training artifacts updated: %s (%d chunks)\n", selfTrainPath, chunksWritten)
+			}
+		}
+		session := newLearnSession(mode, target, []string{target}, sessionCfg)
 		annotateLearnSessionWithProfile(&session, learnProfileApplied)
-		session.finish("SUCCESS", "Inline/file learning completed successfully.", "", map[string]int64{"items_indexed": 1, "chunks_indexed": 1})
+		session.finish(status, summary, failureReason, metrics)
 		if logErr := appendLearnSessionRecord(session); logErr != nil {
 			fmt.Printf("Warning: Failed to write learn session log: %v\n", logErr)
 		}
@@ -613,6 +639,7 @@ func init() {
 func bindLearnConfigFlags(fs *pflag.FlagSet) {
 	fs.StringVarP(&learnFile, "file", "f", "", "Path to a file to learn from")
 	fs.StringVar(&learnSyntheticTextOut, "synthetic-text-out", "", "Write deterministic synthetic text-generation artifacts (JSONL) and skip indexing")
+	fs.BoolVar(&learnSelfTrainSpeech, "self-train-speech", false, "After inline/file learn, auto-generate speech self-training artifacts to default synthetic path")
 	fs.StringVarP(&learnDir, "dir", "d", "", "Path to a directory of documents to index")
 	fs.StringVar(&learnNamespace, "namespace", "", "Optional memory namespace for all ingested records in this run")
 	fs.BoolVarP(&learnRecursive, "recursive", "r", true, "Recursively index subdirectories when using --dir")
@@ -767,6 +794,34 @@ func buildSyntheticTextJSONLLines(content, source string, chunkChars int) []stri
 		lines = append(lines, string(b))
 	}
 	return lines
+}
+
+func resolveLearnSelfTrainSpeechOutPath() string {
+	if env := strings.TrimSpace(os.Getenv("TALOS_LEARN_SELF_TRAIN_SPEECH_OUT")); env != "" {
+		return env
+	}
+	return filepath.Join(".memory", "synthetic", "speech_self_train.jsonl")
+}
+
+func appendSyntheticTextArtifacts(content, source, outPath string, chunkChars int) (int, error) {
+	lines := buildSyntheticTextJSONLLines(content, source, chunkChars)
+	if len(lines) == 0 {
+		return 0, fmt.Errorf("no synthetic artifacts produced from input")
+	}
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+		return 0, err
+	}
+	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	for _, line := range lines {
+		if _, err := f.WriteString(line + "\n"); err != nil {
+			return 0, err
+		}
+	}
+	return len(lines), nil
 }
 
 func summaryConfigFromLearnFlags() memory.SourceSummaryConfig {
