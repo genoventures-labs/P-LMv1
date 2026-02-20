@@ -142,6 +142,7 @@ URL CRAWL RULES
   - If --extensions is set, URL mode switches to strict extension matching.
   - In strict mode, only matching URL path extensions are crawled/indexed; extensionless URLs are skipped.
   - Use --verbose to show the current detailed technical learn summary output.
+  - Use --namespace to write all ingested records into an isolated memory domain namespace.
 
 All sources are chunked and indexed into persistent memory for future retrieval.`,
 	Run: func(cmd *cobra.Command, args []string) {

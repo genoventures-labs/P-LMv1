@@ -38,7 +38,9 @@ import (
 var chatCmd = &cobra.Command{
 	Use:   "chat [prompt]",
 	Short: "Start a chat session or send a single prompt to your personal LLM.",
-	Long:  `This command starts an interactive chat session if no prompt is provided. If a prompt is provided as an argument, it sends it to the LLM, prints the response, and exits.`,
+	Long: `This command starts an interactive chat session if no prompt is provided. If a prompt is provided as an argument, it sends it to the LLM, prints the response, and exits.
+
+Use --domain <namespace> (or PLM_CHAT_DOMAIN) to pin retrieval to a work domain namespace for strict zero-trust context isolation.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		// Initialize router from live VPS model discovery.
 		r, err := router.NewRouter()

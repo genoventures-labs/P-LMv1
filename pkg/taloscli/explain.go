@@ -153,6 +153,8 @@ var capabilityDocs = []capabilityDoc{
 		},
 		Examples: []string{
 			`talos chat "Draft a release note from recent commits"`,
+			`talos chat --domain talos-runtime "Summarize latest runtime learnings"`,
+			`PLM_CHAT_DOMAIN=talos-runtime talos chat "What changed this week?"`,
 			`talos --skill report2markdown chat "Convert this report into markdown with headings"`,
 			"talos chat",
 		},
@@ -245,6 +247,7 @@ var capabilityDocs = []capabilityDoc{
 		},
 		Abilities: []string{
 			"Saves reusable learn configurations including HF dataset args, URL crawl settings, chunking options, and connector flags (Gmail/Drive/Notion).",
+			"Persists namespace scope via --namespace so profile-driven runs can ingest into a consistent work domain.",
 			"Generates domain-specific profile baselines via `talos learn profile-gen <domain>`.",
 			"Supports default profile auto-apply when learn runs without --profile.",
 			"Applies explicit CLI flags as runtime overrides on top of profile values.",
@@ -253,6 +256,7 @@ var capabilityDocs = []capabilityDoc{
 		},
 		Examples: []string{
 			`talos learn profile create --name hf-train-default --hf-dataset TeichAI/claude-4.5-opus-high-reasoning-250x --hf-config default --hf-split train`,
+			"talos learn profile create --name runtime-domain --namespace talos-runtime --dir ./docs",
 			"talos learn profile-gen security --set-default",
 			"talos learn profile set-default --name hf-train-default",
 			"talos learn --profile hf-train-default --hf-max-records 250",
@@ -282,6 +286,8 @@ var capabilityDocs = []capabilityDoc{
 		Summary: "Explains TALOS memory retrieval strategy and hybrid vector/BM25 tuning.",
 		Usage: []string{
 			"talos explain memory",
+			"talos chat --domain talos-runtime \"...\"",
+			"talos learn --namespace talos-runtime --dir ./docs",
 			"talos research belief-audit \"STRATA architecture\" --since 2025-01-01",
 			"TALOS_MEMORY_RETRIEVAL_MODE=hybrid talos chat \"...\"",
 			"TALOS_RETRIEVAL_CANDIDATE_WEIGHTS=0.6,0.4 talos chat \"...\"",
@@ -308,6 +314,7 @@ var capabilityDocs = []capabilityDoc{
 		},
 		Abilities: []string{
 			"Memory retrieval is hybrid by default: semantic vector recall + lexical BM25 recall.",
+			"Memory supports namespace scoping; chat can pin namespace with --domain (or PLM_CHAT_DOMAIN), and learn can ingest with --namespace.",
 			"TALOS_MEMORY_RETRIEVAL_MODE controls retrieval path: hybrid (default), semantic, or lexical.",
 			"TALOS_RETRIEVAL_CANDIDATE_WEIGHTS sets semantic,lexical fusion for initial candidate ranking (default: 0.60,0.40).",
 			"TALOS_RETRIEVAL_DYNAMIC_WEIGHTS sets semantic,lexical,importance,freshness for chat context ranking (default: 0.40,0.20,0.25,0.15).",

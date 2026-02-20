@@ -80,6 +80,16 @@ talos chat --domain talos-runtime "What changed in our toolserver policy?"
 PLM_CHAT_DOMAIN=talos-runtime talos chat "Summarize latest runtime learnings"
 ```
 
+Recommended namespace workflow:
+
+```bash
+# 1) Ingest domain knowledge into a namespace
+talos learn --dir ./docs/runtime --namespace talos-runtime
+
+# 2) Pin chat to that same namespace
+talos chat --domain talos-runtime "What changed in our runtime architecture?"
+```
+
 Learn an entire directory (all supported default document types):
 
 ```bash
@@ -157,6 +167,7 @@ Create and use a reusable learn profile:
 talos learn profile create --name hf-train-default --hf-dataset TeichAI/claude-4.5-opus-high-reasoning-250x --hf-config default --hf-split train
 talos learn profile set-default --name hf-train-default
 talos learn --profile hf-train-default
+talos learn profile create --name runtime-domain --namespace talos-runtime --dir ./docs/runtime
 ```
 
 Export and import unified learn/research profile bundles:
