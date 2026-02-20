@@ -40,7 +40,7 @@ var chatCmd = &cobra.Command{
 	Short: "Start a chat session or send a single prompt to your personal LLM.",
 	Long: `This command starts an interactive chat session if no prompt is provided. If a prompt is provided as an argument, it sends it to the LLM, prints the response, and exits.
 
-Use --domain <namespace> (or PLM_CHAT_DOMAIN) to pin retrieval to a work domain namespace for strict zero-trust context isolation.
+Use --domain <namespace> (or --namespace / PLM_CHAT_DOMAIN) to pin retrieval to a work domain namespace for strict zero-trust context isolation.
 Use --text-gen (no value) to run an experimental TALOS-owned text generator path (no Ollama calls in that mode).`,
 	Run: func(cmd *cobra.Command, args []string) {
 		textGenMode, err := resolveChatTextGenMode(chatTextGen)
