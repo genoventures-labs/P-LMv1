@@ -30,6 +30,7 @@ import (
 	"github.com/Thynaptic/P-LMv1/pkg/router"
 	"github.com/Thynaptic/P-LMv1/pkg/skills"
 	"github.com/Thynaptic/P-LMv1/pkg/state"
+	"github.com/Thynaptic/P-LMv1/pkg/toolflow"
 	"github.com/Thynaptic/P-LMv1/pkg/tools"
 	"github.com/ollama/ollama/api"
 	"github.com/spf13/cobra"
@@ -5359,7 +5360,7 @@ func parseToolCalls(fullResponse string) ([]toolInvocation, bool) {
 
 	var alt map[string]interface{}
 	if err := json.Unmarshal([]byte(trimmed), &alt); err == nil {
-		for _, candidate := range []string{"web_search", "fetch_url", "http_request", "vector_retrieve", "execute_code", "sys_exec", "capture_screen", "watch_terminal", "draw_box", "draw_war_room", "analyze_visual_target", "doc_search", "multimodal_tool", "auto_tool", "provision_client", "rotate_client_key", "revoke_client", "admin_list_clients", "admin_create_client", "admin_rotate_client", "admin_delete_client"} {
+		for _, candidate := range toolflow.BuiltinToolNames() {
 			if args, found := alt[candidate]; found {
 				if m, ok := args.(map[string]interface{}); ok {
 					calls := sanitizeToolCalls([]toolInvocation{{Tool: candidate, Args: m}})
@@ -6989,14 +6990,12 @@ func normalizeToolName(name string) string {
 }
 
 func isSupportedTool(tool string) bool {
-	switch tool {
-	case "web_search", "fetch_url", "http_request", "vector_retrieve", "execute_code", "sys_exec", "capture_screen", "watch_terminal", "draw_box", "draw_war_room", "analyze_visual_target", "doc_search", "multimodal_tool", "auto_tool",
-		"provision_client", "rotate_client_key", "revoke_client",
-		"admin_list_clients", "admin_create_client", "admin_rotate_client", "admin_delete_client":
-		return true
-	default:
-		return false
+	for _, n := range toolflow.BuiltinToolNames() {
+		if n == tool {
+			return true
+		}
 	}
+	return false
 }
 
 func getArgString(args map[string]interface{}, key, fallback string) string {

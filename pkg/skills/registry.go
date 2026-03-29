@@ -2,12 +2,14 @@ package skills
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/Thynaptic/P-LMv1/pkg/toolflow"
 	"github.com/Thynaptic/P-LMv1/pkg/tools"
 )
 
@@ -140,6 +142,22 @@ func (r *SkillRegistry) Upsert(record SkillRecord) error {
 	if record.SkillID == "" || record.RootDir == "" || record.SourcePath == "" || record.ManifestPath == "" {
 		return os.ErrInvalid
 	}
+
+	// Validate allowed tools against builtin catalog
+	if len(record.AllowedTools) > 0 {
+		catalog := toolflow.BuiltinToolNames()
+		validTools := make(map[string]bool, len(catalog))
+		for _, t := range catalog {
+			validTools[strings.ToLower(strings.TrimSpace(t))] = true
+		}
+		for _, t := range record.AllowedTools {
+			k := strings.ToLower(strings.TrimSpace(t))
+			if !validTools[k] && k != "" {
+				return fmt.Errorf("upsert rejected: skill declares unknown tool %q", t)
+			}
+		}
+	}
+
 	if record.Version == "" {
 		record.Version = "0.1.0"
 	}

@@ -1,0 +1,33 @@
+# Walkthrough: VULN Initial Implementation
+
+I have successfully bootstrapped the Vulnerability Assessment Suite (VULN) with a high-performance Go backend and a premium NextJS frontend.
+
+## Accomplishments
+
+- **Core Scanner Engine**: Implemented a regex-based SAST engine in Go that identifies OWASP vulnerabilities (SQLi, XSS, Hardcoded Secrets) in local source code.
+- **REST API**: Built a Go/Chi API with a `/api/scan` endpoint to trigger analysis.
+- **Premium UI**: Designed a modern, dark-themed dashboard using NextJS and Vanilla CSS, featuring glassmorphism and real-time scan results.
+- **AI & DB Integrations**: Connected the scanner to external OpenAI-compatible APIs for vulnerability analysis and Pocketbase for automated data persistence.
+- **Ease of Configuration**: Set up environment variable support with a direct `.env.example` template for easy setup.
+
+## Proof of Work
+
+### Scanner Verification
+The scanner logic has been verified with unit tests covering several OWASP categories.
+
+```bash
+go test ./internal/scanner/...
+ok      github.com/user/azimuthal-belt/backend/internal/scanner 0.320s
+```
+
+### Dashboard Interface
+The dashboard allows users to enter a directory path and view findings in a structured, color-coded table. When AI is enabled, the suite automatically queries the configured OpenAI-compatible API to provide detailed analysis and remediation steps for each finding.
+
+## Configuration
+
+To finish the setup, copy `.env.example` to `.env` and fill in your credentials:
+
+- `AI_BASE_URL`: The URL of your OpenAI-compatible API.
+- `AI_API_KEY`: Your API key.
+- `POCKETBASE_URL`: Your Pocketbase instance URL.
+- `POCKETBASE_TOKEN`: (Optional) Your Pocketbase auth token.

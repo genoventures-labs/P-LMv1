@@ -286,3 +286,19 @@ func normalizeIntValue(v interface{}, fallback int) int {
 		return fallback
 	}
 }
+
+// BuiltinToolNames returns the canonical list of built-in TALOS tool names extracted from DefaultToolSpecs.
+func BuiltinToolNames() []string {
+	return ToolNamesFromSpecs(DefaultToolSpecs())
+}
+
+// ToolNamesFromSpecs extracts valid non-empty tool names from a list of ToolSpecs.
+func ToolNamesFromSpecs(specs []ToolSpec) []string {
+	names := make([]string, 0, len(specs))
+	for _, s := range specs {
+		if t := strings.TrimSpace(s.Name); t != "" {
+			names = append(names, t)
+		}
+	}
+	return names
+}
