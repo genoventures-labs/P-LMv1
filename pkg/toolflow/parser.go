@@ -102,7 +102,7 @@ func parseInvocationsPayload(payload string, normalizeName func(string) string, 
 
 	var alt map[string]interface{}
 	if err := json.Unmarshal([]byte(payload), &alt); err == nil {
-		for _, candidate := range []string{"web_search", "fetch_url", "http_request", "vector_retrieve", "execute_code", "sys_exec", "capture_screen", "watch_terminal", "draw_box", "draw_war_room", "analyze_visual_target", "doc_search", "multimodal_tool", "auto_tool", "provision_client", "rotate_client_key", "revoke_client", "admin_list_clients", "admin_create_client", "admin_rotate_client", "admin_delete_client"} {
+		for _, candidate := range BuiltinToolNames() {
 			if args, found := alt[candidate]; found {
 				if m, ok := args.(map[string]interface{}); ok {
 					out := sanitizeInvocations([]Invocation{{Tool: candidate, Args: m}}, normalizeName, isSupported)

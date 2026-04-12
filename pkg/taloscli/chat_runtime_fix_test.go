@@ -1,8 +1,13 @@
 package taloscli
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Thynaptic/P-LMv1/pkg/state"
 )
 
 func TestIsTrivialPrompt(t *testing.T) {
@@ -166,26 +171,66 @@ func TestChatCommandHasNamespaceFlag(t *testing.T) {
 	}
 }
 
+func TestChatCommandHasTextGenFlag(t *testing.T) {
+	f := chatCmd.Flags().Lookup("text-gen")
+	if f == nil {
+		t.Fatal("expected --text-gen flag on chat command")
+	}
+	if f.NoOptDefVal != chatTextGenModeTalosNative {
+		t.Fatalf("expected --text-gen no-opt default %q, got %q", chatTextGenModeTalosNative, f.NoOptDefVal)
+	}
+}
+
 func TestResolveChatDomainPrefersFlagThenEnv(t *testing.T) {
+	prev := chatDomain
+	prevNs := chatNamespace
+	prevRoot := requestedNamespace
+	defer func() {
+		chatDomain = prev
+		chatNamespace = prevNs
+		requestedNamespace = prevRoot
+	}()
+	t.Setenv("PLM_CHAT_DOMAIN", "ops")
+	chatDomain = ""
+	chatNamespace = ""
+	requestedNamespace = ""
+	if got := resolveChatDomain(nil); got != "ops" {
+		t.Fatalf("expected env fallback domain ops, got %q", got)
+	}
+	chatNamespace = "runtime-ns"
+	if got := resolveChatDomain(nil); got != "runtime-ns" {
+		t.Fatalf("expected namespace alias runtime-ns, got %q", got)
+	}
+	chatDomain = "talos-runtime"
+	if got := resolveChatDomain(nil); got != "talos-runtime" {
+		t.Fatalf("expected flag domain talos-runtime, got %q", got)
+	}
+	requestedNamespace = "root-global"
+	if got := resolveChatDomain(nil); got != "root-global" {
+		t.Fatalf("expected root namespace precedence, got %q", got)
+	}
+}
+
+func TestResolveChatDomainFallsBackToPersistedState(t *testing.T) {
 	prev := chatDomain
 	prevNs := chatNamespace
 	defer func() {
 		chatDomain = prev
 		chatNamespace = prevNs
 	}()
-	t.Setenv("PLM_CHAT_DOMAIN", "ops")
+	t.Setenv("PLM_CHAT_DOMAIN", "")
 	chatDomain = ""
 	chatNamespace = ""
-	if got := resolveChatDomain(); got != "ops" {
-		t.Fatalf("expected env fallback domain ops, got %q", got)
+	sm, err := state.NewManagerWithPath(filepath.Join(t.TempDir(), "session_state.json"))
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
 	}
-	chatNamespace = "runtime-ns"
-	if got := resolveChatDomain(); got != "runtime-ns" {
-		t.Fatalf("expected namespace alias runtime-ns, got %q", got)
+	sm.SetActiveNamespace("persisted-runtime")
+	if err := sm.Save(); err != nil {
+		t.Fatalf("save state: %v", err)
 	}
-	chatDomain = "talos-runtime"
-	if got := resolveChatDomain(); got != "talos-runtime" {
-		t.Fatalf("expected flag domain talos-runtime, got %q", got)
+	if got := resolveChatDomain(sm); got != "persisted-runtime" {
+		t.Fatalf("expected persisted namespace fallback, got %q", got)
 	}
 }
 
@@ -196,6 +241,87 @@ func TestSystemPromptsEnforceInsufficientKnowledgeResponse(t *testing.T) {
 	}
 	if !strings.Contains(minimalSystemPrompt, required) {
 		t.Fatal("expected minimal system prompt to include strict insufficient-knowledge response policy")
+	}
+}
+
+func TestResolveChatTextGenModeDefaultsToOllama(t *testing.T) {
+	prev := chatTextGen
+	defer func() { chatTextGen = prev }()
+	t.Setenv("PLM_CHAT_TEXT_GEN", "")
+	t.Setenv("PLM_CHAT_TEXT_GEN_PRIMARY", "")
+	got, err := resolveChatTextGenMode("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != chatTextGenModeOllama {
+		t.Fatalf("expected default ollama mode, got %q", got)
+	}
+}
+
+func TestResolveChatTextGenModePrimaryEnvDefaultsToNative(t *testing.T) {
+	t.Setenv("PLM_CHAT_TEXT_GEN", "")
+	t.Setenv("PLM_CHAT_TEXT_GEN_PRIMARY", "1")
+	got, err := resolveChatTextGenMode("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != chatTextGenModeTalosNative {
+		t.Fatalf("expected primary env to default native mode, got %q", got)
+	}
+}
+
+func TestResolveChatTextGenModeTalosNativeAliases(t *testing.T) {
+	for _, in := range []string{"talos-native", "talos", "native"} {
+		got, err := resolveChatTextGenMode(in)
+		if err != nil {
+			t.Fatalf("unexpected error for %q: %v", in, err)
+		}
+		if got != chatTextGenModeTalosNative {
+			t.Fatalf("expected talos-native for %q, got %q", in, got)
+		}
+	}
+}
+
+func TestResolveChatTextGenModeRejectsUnknown(t *testing.T) {
+	if _, err := resolveChatTextGenMode("unknown-runtime"); err == nil {
+		t.Fatal("expected unknown text-gen mode to error")
+	}
+}
+
+func TestComposeNativeTextGenResponseUsesContext(t *testing.T) {
+	out := composeNativeTextGenResponse("summarize telemetry", []string{"first context", "second context"})
+	for _, token := range []string{"TALOS-native experimental response", "first context", "Requested focus: summarize telemetry"} {
+		if !strings.Contains(out, token) {
+			t.Fatalf("expected token %q in output: %s", token, out)
+		}
+	}
+}
+
+func TestCollectNativeMemoryContextUsesGroundingRecords(t *testing.T) {
+	orig := nativeGroundingPath
+	nativeGroundingPath = filepath.Join(t.TempDir(), "native_grounding.jsonl")
+	t.Cleanup(func() { nativeGroundingPath = orig })
+	recs := []NativeGroundingRecord{
+		{SessionID: "1", Summary: "Runtime telemetry update for sandbox", QueryOrTarget: "runtime telemetry", CapturedAt: "2026-01-01T00:00:00Z"},
+		{SessionID: "2", Summary: "Marketing notes only", QueryOrTarget: "branding", CapturedAt: "2026-01-02T00:00:00Z"},
+	}
+	var lines []string
+	for _, r := range recs {
+		b, err := json.Marshal(r)
+		if err != nil {
+			t.Fatalf("marshal record: %v", err)
+		}
+		lines = append(lines, string(b))
+	}
+	if err := os.WriteFile(nativeGroundingPath, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write grounding file: %v", err)
+	}
+	ctx := collectNativeMemoryContext("telemetry runtime", 2)
+	if len(ctx) == 0 {
+		t.Fatal("expected native context results")
+	}
+	if !strings.Contains(strings.ToLower(ctx[0]), "telemetry") {
+		t.Fatalf("expected telemetry-grounded result first, got %q", ctx[0])
 	}
 }
 

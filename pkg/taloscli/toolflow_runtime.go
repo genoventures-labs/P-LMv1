@@ -173,11 +173,7 @@ func runToolflowV3Observed(tc *tools.GLMToolClient, taskQuery string, calls []to
 	}
 	policy := toolflow.NewStrictPolicy(toolflow.DefaultToolSpecs())
 	reg := toolflow.NewRegistry()
-	for _, toolName := range []string{
-		"web_search", "fetch_url", "http_request", "vector_retrieve", "execute_code", "sys_exec", "capture_screen", "watch_terminal", "draw_box", "draw_war_room",
-		"analyze_visual_target", "doc_search", "multimodal_tool", "auto_tool",
-		"provision_client", "rotate_client_key", "revoke_client", "admin_list_clients", "admin_create_client", "admin_rotate_client", "admin_delete_client",
-	} {
+	for _, toolName := range toolflow.BuiltinToolNames() {
 		name := toolName
 		err := reg.Register(name, func(ctx context.Context, args map[string]interface{}) (string, error) {
 			return executeToolCall(tc, toolInvocation{Tool: name, Args: args})

@@ -30,6 +30,7 @@ import (
 	"github.com/Thynaptic/P-LMv1/pkg/router"
 	"github.com/Thynaptic/P-LMv1/pkg/skills"
 	"github.com/Thynaptic/P-LMv1/pkg/state"
+	"github.com/Thynaptic/P-LMv1/pkg/toolflow"
 	"github.com/Thynaptic/P-LMv1/pkg/tools"
 	"github.com/ollama/ollama/api"
 	"github.com/spf13/cobra"
@@ -40,8 +41,20 @@ var chatCmd = &cobra.Command{
 	Short: "Start a chat session or send a single prompt to your personal LLM.",
 	Long: `This command starts an interactive chat session if no prompt is provided. If a prompt is provided as an argument, it sends it to the LLM, prints the response, and exits.
 
-Use --domain <namespace> (or PLM_CHAT_DOMAIN) to pin retrieval to a work domain namespace for strict zero-trust context isolation.`,
+Use --domain <namespace> (or --namespace / PLM_CHAT_DOMAIN) to pin retrieval to a work domain namespace for strict zero-trust context isolation.
+When set explicitly, the active namespace is persisted and reused by later runs when flags/env are unset.
+Use --text-gen (no value) to run an experimental TALOS-owned text generator path (no Ollama calls in that mode).`,
 	Run: func(cmd *cobra.Command, args []string) {
+		textGenMode, err := resolveChatTextGenMode(chatTextGen)
+		if err != nil {
+			fmt.Printf("Error resolving --text-gen mode: %v\n", err)
+			return
+		}
+		if textGenMode == chatTextGenModeTalosNative {
+			runNativeTextGenChat(args)
+			return
+		}
+
 		// Initialize router from live VPS model discovery.
 		r, err := router.NewRouter()
 		if err != nil {
@@ -93,9 +106,16 @@ Use --domain <namespace> (or PLM_CHAT_DOMAIN) to pin retrieval to a work domain 
 		}
 		chatCognitionMode = normalizeCognitionMode(chatCognitionMode)
 		debugPrintf("DEBUG: Cognition orchestrator default=%s\n", chatCognitionMode)
-		if domain := resolveChatDomain(); domain != "" {
+		explicitDomain := explicitChatDomain()
+		if domain := resolveChatDomain(sm); domain != "" {
 			mm.SetActiveNamespace(domain)
 			debugPrintf("DEBUG: Domain namespace=%s\n", domain)
+			if explicitDomain != "" && sm != nil {
+				sm.SetActiveNamespace(domain)
+				if err := sm.Save(); err != nil {
+					debugPrintf("DEBUG: Failed to persist active namespace: %v\n", err)
+				}
+			}
 		}
 
 		// Check if we have a prompt in arguments
@@ -254,6 +274,12 @@ var chatWarmup bool
 var chatCognitionMode string
 var chatDomain string
 var chatNamespace string
+var chatTextGen string
+
+const (
+	chatTextGenModeOllama      = "ollama"
+	chatTextGenModeTalosNative = "talos-native"
+)
 
 func debugPrintf(format string, args ...any) {
 	if !chatVerbose {
@@ -269,14 +295,183 @@ func debugPrintln(args ...any) {
 	fmt.Println(args...)
 }
 
-func resolveChatDomain() string {
+func explicitChatDomain() string {
 	if v := strings.TrimSpace(chatDomain); v != "" {
 		return strings.ToLower(v)
 	}
 	if v := strings.TrimSpace(chatNamespace); v != "" {
 		return strings.ToLower(v)
 	}
-	return strings.ToLower(strings.TrimSpace(os.Getenv("PLM_CHAT_DOMAIN")))
+	return ""
+}
+
+func resolveChatDomain(sm *state.Manager) string {
+	if v := strings.ToLower(strings.TrimSpace(requestedNamespace)); v != "" {
+		return v
+	}
+	if v := explicitChatDomain(); v != "" {
+		return v
+	}
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("PLM_CHAT_DOMAIN"))); v != "" {
+		return v
+	}
+	if sm != nil {
+		if v := strings.ToLower(strings.TrimSpace(sm.ActiveNamespace())); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func resolveChatTextGenMode(raw string) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(raw))
+	if mode == "" {
+		mode = strings.ToLower(strings.TrimSpace(os.Getenv("PLM_CHAT_TEXT_GEN")))
+	}
+	if mode == "" {
+		if boolFromEnv("PLM_CHAT_TEXT_GEN_PRIMARY", false) {
+			return chatTextGenModeTalosNative, nil
+		}
+		return chatTextGenModeOllama, nil
+	}
+	switch mode {
+	case chatTextGenModeOllama:
+		return chatTextGenModeOllama, nil
+	case "talos", "native", chatTextGenModeTalosNative:
+		return chatTextGenModeTalosNative, nil
+	default:
+		return "", fmt.Errorf("unsupported mode %q (supported: %s, %s)", mode, chatTextGenModeOllama, chatTextGenModeTalosNative)
+	}
+}
+
+func runNativeTextGenChat(args []string) {
+	sm, err := state.NewManager()
+	if err != nil {
+		fmt.Printf("Warning: Error initializing state manager: %v\n", err)
+	}
+	if len(args) > 0 {
+		prompt := strings.Join(args, " ")
+		if strings.TrimSpace(prompt) == "" {
+			fmt.Println(insufficientKnowledgeResponse)
+			return
+		}
+		answer := nativeTextGenAnswer(prompt)
+		output.PrintBreathAware(answer, sm, chatRawOutput)
+		fmt.Println()
+		return
+	}
+
+	fmt.Println("Entering chat mode (TALOS-native text-gen experimental, no Ollama). Type '/bye' to exit.")
+	scanner := bufio.NewScanner(os.Stdin)
+	for {
+		fmt.Print(">>> You: ")
+		if !scanner.Scan() {
+			break
+		}
+		input := strings.TrimSpace(scanner.Text())
+		if input == "" {
+			continue
+		}
+		lower := strings.ToLower(input)
+		if lower == "/bye" || lower == "exit" || lower == "quit" {
+			fmt.Println("Exiting chat.")
+			break
+		}
+		answer := nativeTextGenAnswer(input)
+		fmt.Print("<<< LLM: ")
+		output.PrintBreathAware(answer, sm, chatRawOutput)
+		fmt.Println()
+	}
+	if err := scanner.Err(); err != nil {
+		fmt.Printf("Error reading input: %v\n", err)
+	}
+}
+
+func nativeTextGenAnswer(query string) string {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return insufficientKnowledgeResponse
+	}
+	context := collectNativeMemoryContext(query, 3)
+	if len(context) == 0 {
+		return insufficientKnowledgeResponse
+	}
+	return composeNativeTextGenResponse(query, context)
+}
+
+func collectNativeMemoryContext(query string, limit int) []string {
+	records, _, err := readNativeGroundingRecords()
+	if err != nil || len(records) == 0 {
+		return nil
+	}
+	tokens := tokenizeNativeQuery(query)
+	rank := func(rec NativeGroundingRecord) int {
+		score := 0
+		blob := strings.ToLower(strings.TrimSpace(rec.QueryOrTarget + " " + rec.Summary + " " + strings.Join(rec.Sources, " ")))
+		for _, t := range tokens {
+			if strings.Contains(blob, t) {
+				score++
+			}
+		}
+		return score
+	}
+	sort.SliceStable(records, func(i, j int) bool {
+		si, sj := rank(records[i]), rank(records[j])
+		if si == sj {
+			return records[i].CapturedAt > records[j].CapturedAt
+		}
+		return si > sj
+	})
+	out := make([]string, 0, limit)
+	for _, rec := range records {
+		if len(out) >= limit {
+			break
+		}
+		if strings.TrimSpace(rec.Summary) == "" {
+			continue
+		}
+		out = append(out, strings.TrimSpace(rec.Summary))
+	}
+	return out
+}
+
+func tokenizeNativeQuery(query string) []string {
+	lower := strings.ToLower(strings.TrimSpace(query))
+	if lower == "" {
+		return nil
+	}
+	raw := strings.Fields(lower)
+	out := make([]string, 0, len(raw))
+	seen := map[string]bool{}
+	for _, tok := range raw {
+		tok = strings.Trim(tok, ".,!?;:\"'`()[]{}")
+		if len(tok) < 3 || seen[tok] {
+			continue
+		}
+		seen[tok] = true
+		out = append(out, tok)
+	}
+	return out
+}
+
+func composeNativeTextGenResponse(query string, context []string) string {
+	if strings.TrimSpace(query) == "" || len(context) == 0 {
+		return insufficientKnowledgeResponse
+	}
+	var b strings.Builder
+	b.WriteString("TALOS-native experimental response\n")
+	b.WriteString("Grounded from learned context:\n")
+	for i, c := range context {
+		if i >= 3 {
+			break
+		}
+		b.WriteString("- ")
+		b.WriteString(strings.TrimSpace(c))
+		b.WriteString("\n")
+	}
+	b.WriteString("Requested focus: ")
+	b.WriteString(strings.TrimSpace(query))
+	return strings.TrimSpace(b.String())
 }
 
 func applyIntentCorrection(raw string, sm *state.Manager, mm *memory.MemoryManager) (string, string) {
@@ -5165,7 +5360,7 @@ func parseToolCalls(fullResponse string) ([]toolInvocation, bool) {
 
 	var alt map[string]interface{}
 	if err := json.Unmarshal([]byte(trimmed), &alt); err == nil {
-		for _, candidate := range []string{"web_search", "fetch_url", "http_request", "vector_retrieve", "execute_code", "sys_exec", "capture_screen", "watch_terminal", "draw_box", "draw_war_room", "analyze_visual_target", "doc_search", "multimodal_tool", "auto_tool", "provision_client", "rotate_client_key", "revoke_client", "admin_list_clients", "admin_create_client", "admin_rotate_client", "admin_delete_client"} {
+		for _, candidate := range toolflow.BuiltinToolNames() {
 			if args, found := alt[candidate]; found {
 				if m, ok := args.(map[string]interface{}); ok {
 					calls := sanitizeToolCalls([]toolInvocation{{Tool: candidate, Args: m}})
@@ -6795,14 +6990,12 @@ func normalizeToolName(name string) string {
 }
 
 func isSupportedTool(tool string) bool {
-	switch tool {
-	case "web_search", "fetch_url", "http_request", "vector_retrieve", "execute_code", "sys_exec", "capture_screen", "watch_terminal", "draw_box", "draw_war_room", "analyze_visual_target", "doc_search", "multimodal_tool", "auto_tool",
-		"provision_client", "rotate_client_key", "revoke_client",
-		"admin_list_clients", "admin_create_client", "admin_rotate_client", "admin_delete_client":
-		return true
-	default:
-		return false
+	for _, n := range toolflow.BuiltinToolNames() {
+		if n == tool {
+			return true
+		}
 	}
+	return false
 }
 
 func getArgString(args map[string]interface{}, key, fallback string) string {
@@ -7006,5 +7199,9 @@ func init() {
 	chatCmd.Flags().StringVar(&chatCognitionMode, "cognition", "", "Cognition orchestration mode: auto|minimal|balanced|deep (default from PLM_COGNITION_MODE or auto)")
 	chatCmd.Flags().StringVar(&chatDomain, "domain", "", "Pin chat to a memory domain namespace (falls back to PLM_CHAT_DOMAIN)")
 	chatCmd.Flags().StringVar(&chatNamespace, "namespace", "", "Alias of --domain for chat namespace pinning")
+	chatCmd.Flags().StringVar(&chatTextGen, "text-gen", "", "Text generation runtime: ollama|talos-native (use --text-gen with no value to select talos-native; PLM_CHAT_TEXT_GEN_PRIMARY=1 makes native default)")
+	if f := chatCmd.Flags().Lookup("text-gen"); f != nil {
+		f.NoOptDefVal = chatTextGenModeTalosNative
+	}
 	rootCmd.AddCommand(chatCmd)
 }

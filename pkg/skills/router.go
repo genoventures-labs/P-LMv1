@@ -1,3 +1,16 @@
+// Note: This file handles backend skill selection (Router) and execution.
+// This is distinct from UI overlays (like overlay_policy.go) which handle war room highlight boxes.
+//
+// Router Scoring Weights:
+// - Explicit Hint Match:  +0.35
+// - Task Type Match:      +0.20
+// - Reasoning Tier Match: +0.10
+// - Name query reference: +0.15
+// - Intent Token Overlap: up to +0.25
+// - Active Revision:      +0.05
+// - Val/Active Status:    +0.05
+//
+// Minimum confidence threshold is configured via TALOS_SKILLS_ROUTER_MIN_CONFIDENCE (default 0.45).
 package skills
 
 import (

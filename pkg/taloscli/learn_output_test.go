@@ -68,6 +68,13 @@ func TestLearnCommandHasVerboseFlag(t *testing.T) {
 	}
 }
 
+func TestLearnCommandHasSelfTrainSpeechFlag(t *testing.T) {
+	f := learnCmd.Flags().Lookup("self-train-speech")
+	if f == nil {
+		t.Fatal("expected --self-train-speech flag to be registered on learn command")
+	}
+}
+
 func TestFormatRemoteLearnEventLineFriendlySuppressesSafetyNoise(t *testing.T) {
 	line, ok := formatRemoteLearnEventLine(rag.RemoteEvent{
 		Outcome:      "safety-cache-hit",

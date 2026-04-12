@@ -8,6 +8,10 @@ import (
 	"github.com/Thynaptic/P-LMv1/pkg/tools"
 )
 
+// EnsurePreflightAllowed checks with STRATA if the requested tool/skill is permitted.
+// Preflight semantics: If required=true, skill creation or execution will fail natively
+// if STRATA denies the request or if STRATA is completely unavailable. If required=false,
+// preflight is bypassed. This gate is typically required for higher-tier capabilities.
 func EnsurePreflightAllowed(ctx context.Context, tc *tools.GLMToolClient, req tools.SkillPreflightRequest, required bool) (tools.SkillPreflightResponse, error) {
 	if !required {
 		return tools.SkillPreflightResponse{}, nil

@@ -80,6 +80,13 @@ talos chat --domain talos-runtime "What changed in our toolserver policy?"
 PLM_CHAT_DOMAIN=talos-runtime talos chat "Summarize latest runtime learnings"
 ```
 
+Run experimental TALOS-native text generation (no Ollama calls in that mode):
+
+```bash
+talos chat "Summarize recent learn sessions" --text-gen
+PLM_CHAT_TEXT_GEN_PRIMARY=1 talos chat "Summarize recent learn sessions"
+```
+
 Recommended namespace workflow:
 
 ```bash
@@ -88,6 +95,18 @@ talos learn --dir ./docs/runtime --namespace talos-runtime
 
 # 2) Pin chat to that same namespace
 talos chat --domain talos-runtime "What changed in our runtime architecture?"
+
+# Namespace pins are persisted as active runtime scope for future chat/research runs
+# when --domain/--namespace and PLM_CHAT_DOMAIN are not provided.
+```
+
+Global workspace switch (applies to the full command invocation):
+
+```bash
+talos --namespace talos-runtime research run "What changed in runtime policy?"
+talos --namespace talos-runtime learn --dir ./docs/runtime
+talos namespace show
+talos namespace clear
 ```
 
 Learn an entire directory (all supported default document types):
@@ -153,6 +172,20 @@ Learn from a Kaggle dataset:
 
 ```bash
 KAGGLE_USERNAME=your_user KAGGLE_KEY=your_key talos learn --kaggle-dataset zillow/zecon --kaggle-max-records 100
+```
+
+Generate deterministic synthetic text artifacts (JSONL) from inline/file input:
+
+```bash
+talos learn --synthetic-text-out .memory/synthetic/train.jsonl "Capture stable response examples for native text-gen"
+talos learn --file ./docs/ops.md --synthetic-text-out .memory/synthetic/ops.jsonl
+```
+
+Self-train speech style during learn without specifying an output path:
+
+```bash
+talos learn --self-train-speech "Write with concise operational tone and clear status summaries"
+# artifacts append to .memory/synthetic/speech_self_train.jsonl
 ```
 
 Chain multiple training sources in a fixed order:

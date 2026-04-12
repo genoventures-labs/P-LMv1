@@ -43,6 +43,7 @@ type SessionState struct {
 	Subtext     []string   `json:"subtext_markers,omitempty"`
 
 	PrimaryGoal     string    `json:"primary_goal"`
+	ActiveNamespace string    `json:"active_namespace,omitempty"`
 	GoalPersistence float64   `json:"goal_persistence"`
 	LastUpdate      time.Time `json:"last_update"`
 }
@@ -88,6 +89,22 @@ func (m *Manager) SetPrimaryGoal(goal string) {
 	m.decayLocked(time.Now())
 	m.state.PrimaryGoal = strings.TrimSpace(goal)
 	m.state.LastUpdate = time.Now().UTC()
+}
+
+// SetActiveNamespace updates the persisted active namespace for memory-scoped runtime flows.
+func (m *Manager) SetActiveNamespace(namespace string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.decayLocked(time.Now())
+	m.state.ActiveNamespace = strings.ToLower(strings.TrimSpace(namespace))
+	m.state.LastUpdate = time.Now().UTC()
+}
+
+// ActiveNamespace returns the currently persisted active namespace.
+func (m *Manager) ActiveNamespace() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return strings.TrimSpace(m.state.ActiveNamespace)
 }
 
 // UpdateDelta adjusts numeric values and keeps them bounded.
@@ -293,6 +310,7 @@ func (m *Manager) Load() error {
 	loaded.ToneBias = clampSigned(loaded.ToneBias)
 	loaded.MoodHistory = sanitizeMoodHistory(loaded.MoodHistory)
 	loaded.Subtext = sanitizeSubtextMarkers(loaded.Subtext)
+	loaded.ActiveNamespace = strings.ToLower(strings.TrimSpace(loaded.ActiveNamespace))
 	loaded.GoalPersistence = clamp01(loaded.GoalPersistence)
 	if loaded.LastUpdate.IsZero() {
 		loaded.LastUpdate = time.Now().UTC()

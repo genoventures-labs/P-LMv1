@@ -1,3 +1,5 @@
+// Note: The components in this file govern visual UI overlays (war room boxes).
+// This is distinct from the Skill Router (router.go), which handles AI skill selection.
 package skills
 
 import (

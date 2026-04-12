@@ -505,6 +505,11 @@ func initResearchRuntime(query string) (*researchRuntime, error) {
 		fmt.Println("Proceeding without external tools.")
 	}
 	sm, _ := state.NewManager()
+	if sm != nil {
+		if ns := strings.ToLower(strings.TrimSpace(sm.ActiveNamespace())); ns != "" {
+			mm.SetActiveNamespace(ns)
+		}
+	}
 	reindexer := memory.NewReindexer(mm, sm)
 	reindexer.Start()
 
